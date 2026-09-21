@@ -32,6 +32,21 @@ OBSERVER_HEIGHT_M = 0.0
 EDGE_PIXELS = 2                             # bilinear needs a neighbour beyond the last sample
 
 
+def crs_sphere_radius(path):
+    """Sphere radius declared by the raster's own CRS.
+
+    The radius must be traceable to the data, not only to this file. Check 1c
+    compares the model against an independent march, but it is only a factor
+    of 1.8 sensitive to a 1 km radius error, so a smaller one would pass it
+    silently. Reading the radius back out of the DEM closes that gap: the
+    number cannot drift from what the product declares.
+    """
+    with rasterio.open(path) as ds:
+        d = ds.crs.to_dict()
+    assert "R" in d, f"{Path(path).name}: CRS is not spherical, got {d}"
+    return float(d["R"])
+
+
 def arc_to_map(arc_m, radius=RADIUS_M):
     """Map radius corresponding to an arc distance. On this projection
     r = 2R tan(theta/2), so 238 km of arc is 238.4 km of map."""
@@ -92,6 +107,13 @@ def main():
         ("near", DATA / "lola" / "LDEM_80S_20MPP_ADJ.TIF", near_map, 20.0),
         ("far", DATA / "lola" / "LDEM_80S_80MPP_ADJ.TIF", far_map, 80.0),
     ]
+    for label, src, _, _ in specs:
+        r_crs = crs_sphere_radius(src)
+        assert r_crs == RADIUS_M, (
+            f"{src.name}: CRS sphere radius {r_crs!r} does not equal the radius "
+            f"this run uses, {RADIUS_M!r}")
+        print(f"{label} DEM CRS sphere radius {r_crs:.1f} m, equals the run radius")
+
     written = {}
     for label, src, reach_map, px in specs:
         pad = reach_map + EDGE_PIXELS * px
