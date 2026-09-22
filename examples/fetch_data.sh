@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 
 PGDA=https://pgda.gsfc.nasa.gov/data/LOLA_20mpp
 NAIF=https://naif.jpl.nasa.gov/pub/naif/generic_kernels
+NAIF_LRO=https://naif.jpl.nasa.gov/pub/naif/pds/data/lro-l-spice-6-v1.0/lrosp_1000/data/sclk
 
 mkdir -p data/lola data/nac data/kernels
 
@@ -34,6 +35,15 @@ fetch "$NAIF/spk/planets/de421.bsp" data/kernels \
     || fetch "$NAIF/spk/planets/a_old_versions/de421.bsp" data/kernels
 fetch "$NAIF/fk/satellites/moon_080317.tf" data/kernels \
     || fetch "$NAIF/fk/satellites/a_old_versions/moon_080317.tf" data/kernels
+
+# LRO spacecraft clock. The nine digits of a NAC product ID are the spacecraft
+# clock count at image start, so this is what converts M139729686LE to an epoch,
+# via scs2e with spacecraft ID -85 and the leapseconds kernel above. These
+# kernels are cumulative, so this one file supersedes every earlier
+# lro_clkcor_*; a new release appears in the same directory roughly quarterly.
+# The version is pinned rather than tracking the newest, so that the epoch a run
+# reports is reproducible from the repository alone.
+fetch "$NAIF_LRO/lro_clkcor_2026167_v00.tsc" data/kernels
 
 echo "done"
 ls -la data/lola data/nac data/kernels

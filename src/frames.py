@@ -62,6 +62,24 @@ def cell_position(x, y, height, radius=MOON_RADIUS_M, observer_height=0.0):
     return up * scale[..., None]
 
 
+def azimuth_elevation_from_frame(target, origin, up, east, north):
+    """Azimuth and elevation of a Moon-fixed point, given a precomputed frame.
+
+    This is the one implementation of the convention; azimuth_elevation below
+    is the same call with the frame built on the spot. Anything that evaluates
+    many epochs against fixed cells hoists the frame and calls this, so there
+    is never a second copy of the decomposition to drift out of step.
+    """
+    d = np.asarray(target, dtype=float) - origin
+    d = d / np.linalg.norm(d, axis=-1, keepdims=True)
+    d_east = np.sum(d * east, axis=-1)
+    d_north = np.sum(d * north, axis=-1)
+    d_up = np.sum(d * up, axis=-1)
+    azimuth = np.degrees(np.arctan2(d_east, d_north)) % 360.0
+    elevation = np.degrees(np.arcsin(np.clip(d_up, -1.0, 1.0)))
+    return azimuth, elevation
+
+
 def azimuth_elevation(target, x, y, height, radius=MOON_RADIUS_M, observer_height=0.0):
     """Azimuth and elevation, in degrees, of a Moon-fixed point seen from a cell.
 
@@ -71,14 +89,7 @@ def azimuth_elevation(target, x, y, height, radius=MOON_RADIUS_M, observer_heigh
     """
     up, east, north = local_frame(x, y, radius)
     origin = cell_position(x, y, height, radius, observer_height)
-    d = np.asarray(target, dtype=float) - origin
-    d = d / np.linalg.norm(d, axis=-1, keepdims=True)
-    d_east = np.sum(d * east, axis=-1)
-    d_north = np.sum(d * north, axis=-1)
-    d_up = np.sum(d * up, axis=-1)
-    azimuth = np.degrees(np.arctan2(d_east, d_north)) % 360.0
-    elevation = np.degrees(np.arcsin(np.clip(d_up, -1.0, 1.0)))
-    return azimuth, elevation
+    return azimuth_elevation_from_frame(target, origin, up, east, north)
 
 
 def horizon_lookup(profile, azimuth_deg):
