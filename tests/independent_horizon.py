@@ -64,21 +64,22 @@ def unit_from_map(x, y, radius):
     theta = 2.0 * np.arctan2(r, 2.0 * radius)
     lam = np.arctan2(x, y)
     st, ct = np.sin(theta), np.cos(theta)
-    return np.array([st * np.sin(lam), st * np.cos(lam), -ct]), theta, lam
+    # Snyder south polar aspect: the cosine of the longitude goes with x.
+    return np.array([st * np.cos(lam), st * np.sin(lam), -ct]), theta, lam
 
 
 def frame_from_map(x, y, radius):
     """(up, east, north) in closed form.
 
-    east = normalize(z_axis x up). With up = (sin t sin l, sin t cos l, -cos t)
-    the cross product is (-sin t cos l, sin t sin l, 0), whose norm is sin t, so
-    east = (-cos l, sin l, 0). north = up x east works out to
-    (cos t sin l, cos t cos l, sin t).
+    east = normalize(z_axis x up). With up = (sin t cos l, sin t sin l, -cos t)
+    the cross product is (-sin t sin l, sin t cos l, 0), whose norm is sin t, so
+    east = (-sin l, cos l, 0). north = up x east works out to
+    (cos t cos l, cos t sin l, sin t). These are the textbook local frame.
     """
     up, theta, lam = unit_from_map(x, y, radius)
     sl, cl = np.sin(lam), np.cos(lam)
-    east = np.array([-cl, sl, 0.0])
-    north = np.array([np.cos(theta) * sl, np.cos(theta) * cl, np.sin(theta)])
+    east = np.array([-sl, cl, 0.0])
+    north = np.array([np.cos(theta) * cl, np.cos(theta) * sl, np.sin(theta)])
     # internal consistency of the closed forms, not a second implementation
     assert abs(up @ east) < 1e-12 and abs(up @ north) < 1e-12 and abs(east @ north) < 1e-12
     assert np.allclose(np.cross(up, east), north, atol=1e-12)
@@ -97,7 +98,7 @@ def map_from_unit(d, radius):
     remaining a different route from x = 2R dx / (1 - dz).
     """
     theta = np.arctan2(np.hypot(d[0], d[1]), -d[2])
-    lam = np.arctan2(d[0], d[1])
+    lam = np.arctan2(d[1], d[0])          # LON from the 3D y and x components
     r = 2.0 * radius * np.tan(0.5 * theta)
     return r * np.sin(lam), r * np.cos(lam)
 

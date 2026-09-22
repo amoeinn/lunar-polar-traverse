@@ -25,9 +25,14 @@ def map_to_unit(x, y, radius=MOON_RADIUS_M):
     sin_theta = 2.0 * t / den
     cos_theta = (1.0 - t * t) / den
     safe = np.where(r > 0.0, r, 1.0)
-    sin_lam = np.where(r > 0.0, x / safe, 0.0)
-    cos_lam = np.where(r > 0.0, y / safe, 1.0)
-    return np.stack([sin_theta * sin_lam, sin_theta * cos_lam, -cos_theta], axis=-1)
+    sin_lam = np.where(r > 0.0, x / safe, 0.0)      # sin(LON), since LON = atan2(x, y)
+    cos_lam = np.where(r > 0.0, y / safe, 1.0)      # cos(LON)
+    # Snyder's south polar aspect is x = rho sin(LON), y = rho cos(LON), so the
+    # Moon-fixed vector is (cos p cos L, cos p sin L, sin p) with cos p = sin t.
+    # The cosine goes with the x component. Interchanging the two is a
+    # reflection about the L = 45 deg meridian plane, not a rotation, and it
+    # passes every check internal to this project; see PLAN.md, 2026-09-22.
+    return np.stack([sin_theta * cos_lam, sin_theta * sin_lam, -cos_theta], axis=-1)
 
 
 def unit_to_map(d, radius=MOON_RADIUS_M):
@@ -35,7 +40,9 @@ def unit_to_map(d, radius=MOON_RADIUS_M):
     x = 2R dx / (1 - dz), which needs no trigonometry."""
     d = np.asarray(d, dtype=float)
     inv = 2.0 * radius / (1.0 - d[..., 2])
-    return d[..., 0] * inv, d[..., 1] * inv
+    # x = rho sin(LON) and sin(LON) = dy / sin(t), so x comes from the y
+    # component and y from the x component. The inverse of map_to_unit above.
+    return d[..., 1] * inv, d[..., 0] * inv
 
 
 def local_frame(x, y, radius=MOON_RADIUS_M):

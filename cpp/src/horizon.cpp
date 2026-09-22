@@ -79,9 +79,11 @@ inline Vector3d map_to_unit(double x, double y, double R) {
     const double den = 1.0 + t * t;
     const double sin_theta = 2.0 * t / den;
     const double cos_theta = (1.0 - t * t) / den;
-    const double sl = (r > 0.0) ? x / r : 0.0;   // sin(lambda)
-    const double cl = (r > 0.0) ? y / r : 1.0;   // cos(lambda)
-    return Vector3d(sin_theta * sl, sin_theta * cl, -cos_theta);
+    const double sl = (r > 0.0) ? x / r : 0.0;   // sin(LON), LON = atan2(x, y)
+    const double cl = (r > 0.0) ? y / r : 1.0;   // cos(LON)
+    // Snyder south polar aspect: x = rho sin(LON), y = rho cos(LON), so the
+    // cosine goes with the x component. See PLAN.md, 2026-09-22.
+    return Vector3d(sin_theta * cl, sin_theta * sl, -cos_theta);
 }
 
 }  // namespace
@@ -186,8 +188,10 @@ int main(int argc, char** argv) {
                     const double y = roy - (r + 0.5) * rpx;
                     const Vector3d u = map_to_unit(x, y, R);
                     const double rr = std::hypot(x, y);
-                    // east = normalize(z_axis x up) = (-y, x, 0)/|(x, y)|
-                    const Vector3d e = (rr > 0.0) ? Vector3d(-y / rr, x / rr, 0.0)
+                    // east = normalize(z_axis x up). With up = (sin t cos L,
+                    // sin t sin L, -cos t) that is (-sin L, cos L, 0), and
+                    // sin L = x/r, cos L = y/r, so east = (-x, y, 0)/|(x, y)|.
+                    const Vector3d e = (rr > 0.0) ? Vector3d(-x / rr, y / rr, 0.0)
                                                   : Vector3d(1.0, 0.0, 0.0);
                     up[m] = u;
                     east[m] = e;
@@ -218,7 +222,9 @@ int main(int argc, char** argv) {
                         const double inv = two_R / (1.0 - dz);
                         double h;
                         const Grid& g = use_far[k] ? far_grid : near_grid;
-                        if (!g.sample(dx * inv, dy * inv, h)) { ++misses; continue; }
+                        // map x comes from the 3D y component and vice versa,
+                        // the inverse of map_to_unit above.
+                        if (!g.sample(dy * inv, dx * inv, h)) { ++misses; continue; }
                         const double Rh = R + h;
                         const double A = (h - h_eye) - 2.0 * Rh * shalf2[k];
                         const double B = Rh * sp;
@@ -249,6 +255,7 @@ int main(int argc, char** argv) {
           "from local north, positive toward local east, in each cell's own local "
           "tangent frame; ray k is exactly k degrees, k = 0..n_azimuth-1");
     w.add("array_layout", "float32, C order, (region_ny, region_nx, n_azimuth)");
+    w.add("projection", "Snyder south polar: x = rho sin(LON), y = rho cos(LON)");
     w.add("horizon_units", "degrees");
     w.add("horizon_dist_units", "metres of arc along the ray");
     w.add("radius_m", R);

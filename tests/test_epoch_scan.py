@@ -71,9 +71,9 @@ def reference_mask(x, y, height, sun_position, profiles, radius=MOON_RADIUS_M):
     den = 1.0 + t * t
     st, ct = 2.0 * t / den, (1.0 - t * t) / den
     sl, cl = x / r, y / r
-    up = np.stack([st * sl, st * cl, -ct], axis=-1)
-    east = np.stack([-cl, sl, np.zeros_like(cl)], axis=-1)
-    north = np.stack([ct * sl, ct * cl, st], axis=-1)
+    up = np.stack([st * cl, st * sl, -ct], axis=-1)
+    east = np.stack([-sl, cl, np.zeros_like(cl)], axis=-1)
+    north = np.stack([ct * cl, ct * sl, st], axis=-1)
     d = np.asarray(sun_position, float) - up * (radius + height)[:, None]
     d = d / np.linalg.norm(d, axis=-1, keepdims=True)
     azimuth = np.degrees(np.arctan2(np.sum(d * east, -1), np.sum(d * north, -1))) % 360.0
