@@ -140,6 +140,23 @@ class LitIntervals:
         iv.save(cache)
         return iv, False
 
+    def lit_fraction(self):
+        """Fraction of the horizon each cell is lit, exactly, from the transitions.
+
+        The mean-map baseline needs this per cell. Sampling it would cost a
+        rebuild; the transition times already carry it, so it is a sum of
+        interval lengths rather than 2880 shadow masks.
+        """
+        n = self.offsets.size - 1
+        out = np.empty(n, dtype=float)
+        for c in range(n):
+            tr = self.transitions(c)
+            edges = np.concatenate(([0.0], tr, [self.horizon_h]))
+            spans = np.diff(edges)
+            lit = spans[0::2] if self.lit0[c] else spans[1::2]
+            out[c] = lit.sum() / self.horizon_h
+        return out
+
     def transitions(self, cell):
         return self.times[self.offsets[cell]:self.offsets[cell + 1]]
 

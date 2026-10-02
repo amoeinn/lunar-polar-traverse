@@ -77,7 +77,7 @@ def sun_table(horizon_h, cadence_h=0.25):
 
 def run_cpp(graph, intervals, pairs, tol, t_start, horizon_h, limit_s, work,
             components=None, positions=None, v_cap=None, shadow_grid_h=0.0,
-            relax_dominance=False, want_paths=False):
+            relax_dominance=False, want_paths=False, defer=False):
     """Write the binary inputs, run cpp/build/planner, read the results back."""
     work.mkdir(parents=True, exist_ok=True)
     files = {
@@ -113,8 +113,16 @@ def run_cpp(graph, intervals, pairs, tol, t_start, horizon_h, limit_s, work,
     for k in keys:
         params[f"out_{k}"] = str(work / f"out_{k}.bin")
     (work / "planner_params.json").write_text(json.dumps(params, indent=2))
+    if defer:
+        return [str(ROOT / "cpp" / "build" / "planner"),
+                str(work / "planner_params.json")], params
     subprocess.run([str(ROOT / "cpp" / "build" / "planner"),
                     str(work / "planner_params.json")], check=True)
+    return read_cpp(params, want_paths)
+
+
+def read_cpp(params, want_paths=False):
+    """Read back what the planner binary wrote."""
     return dict(
         arrival=np.fromfile(params["out_arrival"], dtype=np.float64),
         seconds=np.fromfile(params["out_seconds"], dtype=np.float64),
