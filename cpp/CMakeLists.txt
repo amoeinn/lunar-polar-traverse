@@ -30,3 +30,9 @@ target_include_directories(edges PRIVATE ${EIGEN3_INCLUDE_DIR} src)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(edges PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+add_executable(planner src/planner.cpp)
+target_include_directories(planner PRIVATE src)
+
+add_executable(replay src/replay.cpp)
+target_include_directories(replay PRIVATE src)
