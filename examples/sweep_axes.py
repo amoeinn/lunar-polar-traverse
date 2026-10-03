@@ -7,6 +7,9 @@ epoch, 160 instances per point.
 
 Eight points: rates 20, 100, 200 m/hr; tolerances 0.5, 6, 24 h; limit pairs
 (15, 10) and (25, 20). Run one axis at a time, which is the registered split.
+A ninth, --axis rate_core, is the core configuration on this draw: P7's
+intersection rule needs all four rates on one instance set and the core sweep's
+50 m/hr point was drawn differently.
 
 Scores nothing. Every plan is judged twice, at the registered 3.206 deg pitch
 and roll tolerance and at zero.
@@ -46,6 +49,12 @@ AXES = {
     "tolerance": [dict(CORE, tol=s, label=f"tol {s:g} h") for s in (0.5, 6.0, 24.0)],
     "limits": [dict(CORE, pitch_max=a, roll_max=b, label=f"limits ({a:.0f},{b:.0f})")
                for a, b in ((15.0, 10.0), (25.0, 20.0))],
+    # The core configuration itself, on the axis draw. P7's registered
+    # intersection rule needs all four rates on one instance set, and the core
+    # sweep's 50 m/hr point is a different draw: the per-epoch random key is the
+    # epoch's index in its own list, 0, 1, 2, 3 here against 0, 4, 8, 11 there,
+    # so the two coincide at 2028-02-15_p0 and share nothing at the other three.
+    "rate_core": [dict(CORE, label="rate 50")],
 }
 
 
