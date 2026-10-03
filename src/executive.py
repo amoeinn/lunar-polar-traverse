@@ -108,7 +108,8 @@ def simulate(replay_template, plan, start_h, waits, work):
 
 
 def run_leg(planner_template, graph_paths, plan, plan_times, holds, world, work,
-            budget_h, replan_limit, replan_cap_s, replans_so_far):
+            budget_h, replan_limit, replan_cap_s, replans_so_far,
+            contra_bounded=True, contra_horizon_h=0.7250):
     """One pass of the tree over one world."""
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
@@ -123,6 +124,8 @@ def run_leg(planner_template, graph_paths, plan, plan_times, holds, world, work,
         shadow_tol_h=budget_h, replan_limit=replan_limit,
         replan_cap_s=replan_cap_s, replans_so_far=replans_so_far,
         vis_cadence_h=1.0 / 60.0,
+        contradiction_bounded=1.0 if contra_bounded else 0.0,
+        contradiction_horizon_h=contra_horizon_h,
         planner_bin=str(PLANNER_BIN), scratch_dir=str(work),
         template_planner_params=str(planner_template),
         plan_path=str(work / "plan.bin"),
@@ -158,7 +161,8 @@ def run_leg(planner_template, graph_paths, plan, plan_times, holds, world, work,
 
 
 def run_instance(planner_template, replay_template, graph_paths, plan, plan_times,
-                 work, budget_h, replan_limit=2, replan_cap_s=30.0):
+                 work, budget_h, replan_limit=2, replan_cap_s=30.0,
+                 contra_bounded=True, contra_horizon_h=0.7250):
     """Every leg of one instance, chaining after each adopted replan."""
     work = Path(work)
     indptr = np.fromfile(graph_paths["indptr_path"], np.int64)
@@ -174,7 +178,7 @@ def run_instance(planner_template, replay_template, graph_paths, plan, plan_time
                          work / f"leg{i}_world")
         leg = run_leg(planner_template, graph_paths, cur_plan, cur_times, waits,
                       world, work / f"leg{i}_exec", budget_h, replan_limit,
-                      replan_cap_s, replans)
+                      replan_cap_s, replans, contra_bounded, contra_horizon_h)
         legs.append(leg)
         if leg.outcome != "fired_replanned" or leg.new_plan.size < 2:
             break

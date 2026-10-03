@@ -33,6 +33,8 @@ DECL_CAP_S = 300.0          # the bounded measurement's cap, registered, for the
 BAR_MISSES = 0
 BAR_UNNECESSARY = 0.25
 BAR_MCC = 0.5
+CONTRA_HORIZON_H = 0.7250   # registered, the held-out p99 of the disagreements
+RULES = (("unbounded", False), ("bounded", True))
 
 
 def sample():
@@ -65,13 +67,15 @@ def sample():
     return out
 
 
-def one(rec):
-    """Run every leg of one instance and audit each against the counterfactual."""
-    work = OUT / rec["tag"] / f"plan{rec['plan_index']:03d}"
+def one(arg):
+    """Run every leg of one instance under one contradiction rule, and audit it."""
+    rec, rule, bounded = arg
+    work = OUT / rule / rec["tag"] / f"plan{rec['plan_index']:03d}"
     plan = np.array(rec["plan"], np.int32)
     times = np.array(rec["times"], np.float64)
     legs = run_instance(rec["planner_params"], rec["replay_params"], rec["graph"],
-                        plan, times, work, BUDGET_H, REPLAN_LIMIT, REPLAN_CAP_S)
+                        plan, times, work, BUDGET_H, REPLAN_LIMIT, REPLAN_CAP_S,
+                        bounded, CONTRA_HORIZON_H)
     audits, fired_any, fired_warranted = [], False, False
     drift_max, ticks = 0.0, 0
     for n, leg in enumerate(legs):
@@ -99,7 +103,7 @@ def one(rec):
                            if leg.log["index"].size else -1,
                            drift_max=float(a["drift"].max()) if a["drift"].size else 0.0,
                            replans=leg.replans))
-    return dict(rec, legs=audits, fired=fired_any,
+    return dict(rec, rule=rule, legs=audits, fired=fired_any,
                 fired_warranted=fired_warranted, drift_max=drift_max,
                 ticks=ticks, work=str(work))
 
@@ -119,13 +123,70 @@ def main():
     print(f"sample: {len(mon)} monitored, {len(ctl)} controls, "
           f"{sum(r['busted'] for r in mon)} busting; budget {BUDGET_H} h, "
           f"k={REPLAN_LIMIT}, replan cap {REPLAN_CAP_S:.0f} s, "
-          f"declaration audit at {DECL_CAP_S:.0f} s capped at d={DECL_CAP}", flush=True)
+          f"declaration audit at {DECL_CAP_S:.0f} s capped at d={DECL_CAP}")
+    print(f"two contradiction rules from one binary and one sample: the first "
+          f"rule, projecting to the model's next transition, and its registered "
+          f"replacement at a {CONTRA_HORIZON_H:.4f} h horizon", flush=True)
     OUT.mkdir(parents=True, exist_ok=True)
+    jobs = [(r, rule, b) for rule, b in RULES for r in recs]
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
-        results = list(ex.map(one, recs))
-    (OUT / "results.json").write_text(json.dumps(results, indent=1, default=str))
-    report(results)
+        allres = list(ex.map(one, jobs))
+    (OUT / "results.json").write_text(json.dumps(allres, indent=1, default=str))
+    by_rule = {rule: [r for r in allres if r["rule"] == rule] for rule, _ in RULES}
+    for rule, _ in RULES:
+        print(f"\n{'='*72}\n{rule.upper()} contradiction rule"
+              + (f", horizon {CONTRA_HORIZON_H:.4f} h" if rule == "bounded"
+                 else ", projecting to the model's next transition")
+              + f"\n{'='*72}")
+        report(by_rule[rule])
+    side_by_side(by_rule)
     return 0
+
+
+def side_by_side(by_rule):
+    """Both verdicts in one table, scored against the identical bars."""
+    print(f"\n{'='*72}\nBOTH RULES, the same 45 monitored plans and 142 "
+          f"controls, the same bars\n{'='*72}")
+    hdr = f"  {'':<34}" + "".join(f"{r:>16}" for r, _ in RULES)
+    print(hdr)
+    cells = {}
+    for rule, _ in RULES:
+        res = by_rule[rule]
+        mon = [r for r in res if r["monitored"]]
+        ctl = [r for r in res if not r["monitored"]]
+        fired = np.array([r["fired"] for r in mon], bool)
+        busted = np.array([r["busted"] for r in mon], bool)
+        tp, fp, fn, tn = A.contingency(fired, busted)
+        unnec = fp / (fp + tn) if (fp + tn) else float("nan")
+        cells[rule] = dict(tp=tp, fp=fp, fn=fn, tn=tn, unnec=unnec,
+                           mcc=A.mcc(tp, fp, fn, tn), j=A.youden(tp, fp, fn, tn),
+                           ctl=sum(r["fired"] for r in ctl),
+                           fires=int(fired.sum()))
+    rows = [
+        ("fired and would have busted", lambda c: f"{c['tp']} of 4"),
+        ("missed a bust", lambda c: f"{c['fn']}"),
+        ("fired, would not have busted", lambda c: f"{c['fp']} of 41"),
+        ("correctly quiet", lambda c: f"{c['tn']} of 41"),
+        ("control firings", lambda c: f"{c['ctl']} of 142"),
+        ("", lambda c: ""),
+        (f"bar 1  misses == {BAR_MISSES}",
+         lambda c: f"{c['fn']}  {'PASS' if c['fn'] <= BAR_MISSES else 'FAIL'}"),
+        (f"bar 2  unnecessary <= {BAR_UNNECESSARY:.2f}",
+         lambda c: f"{c['unnec']:.4f}  {'PASS' if c['unnec'] <= BAR_UNNECESSARY else 'FAIL'}"),
+        (f"bar 3  Matthews >= {BAR_MCC:.2f}",
+         lambda c: f"{c['mcc']:+.4f}  {'PASS' if c['mcc'] >= BAR_MCC else 'FAIL'}"),
+        ("       Youden J, reported", lambda c: f"{c['j']:+.4f}"),
+    ]
+    for label, f in rows:
+        print(f"  {label:<34}" + "".join(f"{f(cells[r]):>16}" for r, _ in RULES))
+    for rule, _ in RULES:
+        c = cells[rule]
+        ok = (c["fn"] <= BAR_MISSES and c["unnec"] <= BAR_UNNECESSARY
+              and c["mcc"] >= BAR_MCC and c["ctl"] == 0)
+        name = "P8" if rule == "bounded" else "the first rule"
+        print(f"\n  {name}: {'PASS' if ok else 'FAIL'} "
+              f"(all three bars required; misses {c['fn']}, unnecessary "
+              f"{c['unnec']:.4f}, Matthews {c['mcc']:+.4f})")
 
 
 def report(results):

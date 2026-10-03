@@ -89,6 +89,10 @@ struct Ctx {
     std::vector<Tick> world;
     double budget = 0.0;
     double vis_cadence_h = 1.0 / 60.0;
+    // The contradiction rule, selectable so both the first rule and its
+    // registered replacement come from one binary and one sample.
+    bool contra_bounded = true;
+    double contra_horizon_h = 0.7250;   // registered, the held-out p99
     int replan_limit = 2;
     double replan_cap_s = 30.0;
     std::string planner_bin, scratch, tmpl_params;
@@ -130,8 +134,17 @@ double predict_max_shadow(const Ctx& c) {
     // the model's next transition for the cell the rover is on rather than
     // believing a model the observation has just contradicted.
     if (!c.lit_now && c.pos < n && c.iv.is_lit(c.plan[c.pos], t)) {
-        const double until = std::max(c.iv.next_change(c.plan[c.pos], t),
-                                      t + c.vis_cadence_h);
+        const double next = c.iv.next_change(c.plan[c.pos], t);
+        // Unbounded: carry the darkness to the model's next transition. When
+        // the model believes the cell is lit that is the next modelled sunset,
+        // days away on this terrain, which is what made the first rule fire on
+        // 23 of 26 survivable plans with a median forecast of 139.8 h.
+        // Bounded: carry it for at most the registered horizon, measured as
+        // the p99 of how long these disagreements actually last.
+        const double until = c.contra_bounded
+                                 ? std::max(std::min(next, t + c.contra_horizon_h),
+                                            t + c.vis_cadence_h)
+                                 : std::max(next, t + c.vis_cadence_h);
         s += until - t;
         s_max = std::max(s_max, s);
     }
@@ -228,6 +241,8 @@ int main(int argc, char** argv) {
     c.replan_limit = static_cast<int>(p.num("replan_limit", 2.0));
     c.replan_cap_s = p.num("replan_cap_s", 30.0);
     c.vis_cadence_h = p.num("vis_cadence_h", 1.0 / 60.0);
+    c.contra_bounded = p.num("contradiction_bounded", 1.0) != 0.0;
+    c.contra_horizon_h = p.num("contradiction_horizon_h", 0.7250);
     c.planner_bin = p.str("planner_bin");
     c.scratch = p.str("scratch_dir");
     c.tmpl_params = p.str("template_planner_params");

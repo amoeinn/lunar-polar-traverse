@@ -110,7 +110,7 @@ def corridor_with_annex(td, annex=1200, edge_h=EDGE_H, annex_edge_h=0.01):
 
 
 def run(td, graph, iv, wrld, plan, times, holds=None, budget=1.0,
-        replan_limit=2, replan_cap_s=30.0):
+        replan_limit=2, replan_cap_s=30.0, bounded=True, horizon=0.7250):
     holds = np.zeros(len(plan)) if holds is None else holds
     (td / "plan.bin").write_bytes(np.array(plan, np.int32).tobytes())
     (td / "plan_times.bin").write_bytes(np.array(times, np.float64).tobytes())
@@ -134,7 +134,9 @@ def run(td, graph, iv, wrld, plan, times, holds=None, budget=1.0,
              template_planner_params=str(td / "tmpl.json"),
              plan_path=str(td / "plan.bin"),
              plan_times_path=str(td / "plan_times.bin"),
-             plan_holds_path=str(td / "plan_holds.bin"))
+             plan_holds_path=str(td / "plan_holds.bin"),
+             contradiction_bounded=1.0 if bounded else 0.0,
+             contradiction_horizon_h=horizon)
     for name in ("tick", "t", "s_exec", "s_world", "s_pred", "index", "kind",
                  "lit", "fired"):
         p[f"out_log_{name}"] = str(td / f"log_{name}.bin")
@@ -333,3 +335,94 @@ def test_the_forecast_follows_the_plan_including_its_planned_holds(tmp_path):
     s = run(tmp_path, g, iv, w, list(range(N)), times, holds=holds, budget=1.0)
     assert s["outcome"] == "ran_to_end", s
     assert s["log"]["s_pred"].max() <= 1.0, s["log"]["s_pred"]
+
+
+def test_disagreement_episodes_are_measured_at_their_true_length():
+    """Protects the measurement the replacement rule's horizon is set from.
+
+    A horizon justified by a distribution is only as good as the distribution,
+    so the run-length measurement is asserted against a case whose answer is
+    known by construction: the model says lit throughout, the world is dark for
+    exactly five samples, then two, with agreement in between. The episodes must
+    come back as five and two cadences, in that order, and the opposite
+    direction must come back empty.
+    """
+    from src.disagree import episodes
+    cad = 0.25
+    model = np.ones(14, bool)                      # the model says lit all along
+    world = np.ones(14, bool)
+    world[2:7] = False                             # dark for five samples
+    world[10:12] = False                           # and for two
+    got = episodes(world, model, cadence_h=cad)
+    # The size is asserted before the values, because np.allclose against an
+    # empty array is True: a mutation that dropped every episode passed this
+    # test until the count was checked. The assertion has to be able to fail.
+    assert got.size == 2, got
+    assert np.allclose(got, [5 * cad, 2 * cad]), got
+    # the other direction, world lit where the model says dark, is empty here
+    assert episodes(world, model, cadence_h=cad, world_dark_only=False).size == 0
+    # and a run that reaches the end of the series is not dropped
+    w2 = np.ones(5, bool); w2[3:] = False
+    tail = episodes(w2, np.ones(5, bool), cadence_h=cad)
+    assert tail.size == 1, tail
+    assert np.allclose(tail, [2 * cad]), tail
+
+
+def test_the_sampling_grid_follows_the_world_between_ticks():
+    """Protects the piecewise-constant reading of the world's lit state.
+
+    The checker re-reads visibility on its cadence and emits a tick when the
+    state changes, so between two ticks the world's state is the earlier tick's
+    and not the later one's. Reading it the other way round would shift every
+    disagreement by one tick interval and would misdate the episodes the
+    horizon is measured from.
+    """
+    from src.disagree import sample_states
+
+    class AllLit:
+        def is_lit(self, cell, t):
+            return True
+
+    # dark is declared at t=1 and the next tick at t=3 says lit again
+    grid, world, model = sample_states([0.0, 1.0, 3.0], [1, 0, 1], [0, 1, 2],
+                                       [0, 1, 2], AllLit(), cadence_h=0.5)
+    assert grid.tolist() == [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+    assert world.tolist() == [True, True, False, False, False, False]
+    assert model.all()
+
+
+def test_the_contradiction_horizon_bounds_what_an_observation_projects(tmp_path):
+    """Protects the registered replacement rule, against the rule it replaces.
+
+    Where the world says dark and the model says lit, the observation wins. How
+    far it is carried is the whole difference between the two rules, and this
+    fixture separates them by construction: the model has no transitions at
+    all, so its next change is the table's horizon, 100 h away. The first rule
+    carries the darkness there and predicts tens of hours against a 1 h budget,
+    so it fires. The replacement carries it 0.25 h and does not.
+
+    The ticks are 0.1 h apart for a measured reason. At one hour apart the
+    rover's own observed darkness reached the 1 h budget by the second tick, so
+    both rules fired and the fixture could not tell them apart: it was testing
+    the accumulator rather than the projection. Short steps keep the observed
+    part small so the only thing that differs is the forecast.
+    """
+    g = line_graph(tmp_path)
+    iv = intervals(tmp_path, lit0={c: True for c in range(N)}, transitions={})
+    dt = 0.1
+    ticks = [(0.0, 0.0, 0, 0, 1)] + [(i * dt, 0.0, i, 1, 0) for i in range(1, N)]
+    w = world(tmp_path, ticks)
+    plan, times = list(range(N)), [i * dt for i in range(N)]
+
+    (tmp_path / "a").mkdir()
+    unbounded = run(tmp_path / "a", g, iv, w, plan, times, budget=1.0,
+                    bounded=False)
+    assert unbounded["log"]["s_pred"].max() > 50.0, unbounded["log"]["s_pred"]
+    assert unbounded["outcome"] != "ran_to_end", unbounded
+
+    (tmp_path / "b").mkdir()
+    bounded = run(tmp_path / "b", g, iv, w, plan, times, budget=1.0,
+                  bounded=True, horizon=0.25)
+    assert bounded["log"]["s_pred"].max() < 1.0, bounded["log"]["s_pred"]
+    assert bounded["outcome"] == "ran_to_end", bounded
+    assert bounded["log"]["fired"].sum() == 0
