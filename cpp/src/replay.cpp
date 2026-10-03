@@ -245,6 +245,26 @@ int main(int argc, char** argv) {
     std::vector<int32_t> out_illegal(n_plans);
     std::vector<float> step_pitch, step_roll, step_pitch_mean, step_roll_mean;
     std::vector<int64_t> step_off(n_plans + 1, 0);
+    // Optional trajectory dump, written only when the caller asks for it. The
+    // executive of phase 6 consumes this as its world: it is the checker's own
+    // integration of where the rover actually is and whether it is lit, which
+    // is the one execution-time source in this project that does not share the
+    // planner's time model. Kinds: 0 departure, 1 cell arrival, 2 lit/dark
+    // transition seen during an edge or a hold, 3 end of a planned hold.
+    const bool want_traj = p.strings.count("out_traj_t") > 0;
+    std::vector<double> traj_t, traj_shadow;
+    std::vector<int32_t> traj_index;
+    std::vector<uint8_t> traj_kind, traj_lit;
+    std::vector<int64_t> traj_off(n_plans + 1, 0);
+    const auto emit = [&](double tt, double sh, int32_t idx, uint8_t kind,
+                          bool lit) {
+        if (!want_traj) return;
+        traj_t.push_back(tt);
+        traj_shadow.push_back(sh);
+        traj_index.push_back(idx);
+        traj_kind.push_back(kind);
+        traj_lit.push_back(lit ? 1 : 0);
+    };
     const auto wall0 = std::chrono::steady_clock::now();
 
     for (int q = 0; q < n_plans; ++q) {
@@ -253,6 +273,18 @@ int main(int argc, char** argv) {
         int illegal = 0;
         double next_vis = t;
         bool lit_now = true;
+        // Transition emission needs a previous state to compare against, and
+        // lit_now starts at a placeholder that the first visibility check
+        // always overwrites. This flag says when a real previous state exists,
+        // so a transition on the very first edge is emitted like any other
+        // while the placeholder never produces a spurious one.
+        bool traj_have_lit = false;
+        if (want_traj && hi > lo) {
+            double sx, sy, sh0;
+            cell_xy(cells[lo], sx, sy);
+            const bool oks = near_g.at(sx, sy, sh0);
+            emit(t, 0.0, 0, 0, oks ? lit_at(sx, sy, sh0, t) : true);
+        }
         for (int64_t k = lo; k + 1 < hi; ++k) {
             double x0, y0, x1, y1;
             cell_xy(cells[k], x0, y0);
@@ -287,8 +319,12 @@ int main(int argc, char** argv) {
                 const double v = rover.speed(pitch, roll);
                 const double dt = (seg / nsub) / v;
                 if (t >= next_vis) {
+                    const bool was = lit_now;
                     lit_now = lit_at(x, y, h0, t);
                     next_vis = t + vis_cadence_h;
+                    if (want_traj && traj_have_lit && lit_now != was)
+                        emit(t, shadow, static_cast<int32_t>(k - lo), 2, lit_now);
+                    traj_have_lit = true;
                 }
                 if (lit_now) shadow = 0.0;
                 else { shadow += dt; shadow_max = std::max(shadow_max, shadow); }
@@ -300,6 +336,7 @@ int main(int argc, char** argv) {
             step_roll_mean.push_back(static_cast<float>(counted ? sum_roll / counted : 0.0));
             // hold here for as long as the planner's schedule says, accruing
             // shadow by the checker's own visibility rather than the planner's
+            emit(t, shadow, static_cast<int32_t>(k + 1 - lo), 1, lit_now);
             if (have_waits && waits[k + 1] > 0.0) {
                 const double hold_end = t + waits[k + 1];
                 double hx, hy;
@@ -308,15 +345,21 @@ int main(int argc, char** argv) {
                 const bool okh = near_g.at(hx, hy, hh);
                 while (t < hold_end) {
                     const double dt = std::min(vis_cadence_h, hold_end - t);
+                    const bool was = lit_now;
                     if (okh) lit_now = lit_at(hx, hy, hh, t);
+                    if (want_traj && traj_have_lit && lit_now != was)
+                        emit(t, shadow, static_cast<int32_t>(k + 1 - lo), 2,
+                             lit_now);
                     if (lit_now) shadow = 0.0;
                     else { shadow += dt; shadow_max = std::max(shadow_max, shadow); }
                     t += dt;
                 }
                 next_vis = t;
+                emit(t, shadow, static_cast<int32_t>(k + 1 - lo), 3, lit_now);
             }
         }
         step_off[q + 1] = static_cast<int64_t>(step_pitch.size());
+        traj_off[q + 1] = static_cast<int64_t>(traj_t.size());
         out_arrival[q] = t;
         out_shadow[q] = shadow_max;
         out_illegal[q] = illegal;
@@ -327,6 +370,14 @@ int main(int argc, char** argv) {
     write_raw(p.str("out_shadow"), out_shadow);
     write_raw(p.str("out_verdict"), out_verdict);
     write_raw(p.str("out_illegal"), out_illegal);
+    if (want_traj) {
+        write_raw(p.str("out_traj_t"), traj_t);
+        write_raw(p.str("out_traj_shadow"), traj_shadow);
+        write_raw(p.str("out_traj_index"), traj_index);
+        write_raw(p.str("out_traj_kind"), traj_kind);
+        write_raw(p.str("out_traj_lit"), traj_lit);
+        write_raw(p.str("out_traj_offsets"), traj_off);
+    }
     write_raw(p.str("out_step_pitch"), step_pitch);
     write_raw(p.str("out_step_roll"), step_roll);
     write_raw(p.str("out_step_pitch_mean"), step_pitch_mean);
