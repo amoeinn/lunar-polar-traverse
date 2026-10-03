@@ -24,7 +24,7 @@ class ReplaySettings:
 
 
 def replay(plans, starts, grid, rover, sun_positions, sun_dt_h, shadow_tol_h,
-           work, settings=ReplaySettings(), waits=None):
+           work, settings=ReplaySettings(), waits=None, reuse=False):
     """Integrate every plan and report what the checker found.
 
     plans is a sequence of cell-index sequences; starts their departure times in
@@ -34,6 +34,15 @@ def replay(plans, starts, grid, rover, sun_positions, sun_dt_h, shadow_tol_h,
     """
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
+    out_keys = ("arrival", "shadow", "verdict", "illegal", "step_pitch",
+                "step_roll", "step_pitch_mean", "step_roll_mean", "step_offsets")
+    if reuse:
+        # A finished run left its outputs here. Reading them back rather than
+        # repeating the integration is what lets a long sweep resume after an
+        # interruption without losing what it had already done.
+        found = {f"out_{k}": str(work / f"out_{k}.bin") for k in out_keys}
+        if all(Path(v).exists() for v in found.values()):
+            return _read_outputs(found)
     offsets = np.zeros(len(plans) + 1, dtype=np.int64)
     for i, pl in enumerate(plans):
         offsets[i + 1] = offsets[i] + len(pl)
@@ -66,6 +75,11 @@ def replay(plans, starts, grid, rover, sun_positions, sun_dt_h, shadow_tol_h,
     (work / "replay_params.json").write_text(json.dumps(params, indent=2))
     subprocess.run([str(BINARY), str(work / "replay_params.json")], check=True,
                    capture_output=True)
+    return _read_outputs(params)
+
+
+def _read_outputs(params):
+    """Read the checker's outputs, whether just written or found from before."""
     return dict(
         arrival=np.fromfile(params["out_arrival"], dtype=np.float64),
         shadow=np.fromfile(params["out_shadow"], dtype=np.float64),

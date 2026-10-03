@@ -140,3 +140,40 @@ def test_the_checker_sees_the_sun_rather_than_assuming_it():
         dark = replay([plan], [0.0], grid, rover, down_s, dt, 2.0, td)
         assert lit["shadow"][0] == pytest.approx(0.0)
         assert dark["shadow"][0] > 0.1
+
+
+def test_reuse_reads_the_cached_run_and_is_keyed_on_the_work_directory_alone():
+    """Protects the sweep's resume path, and names the hazard it carries.
+
+    A sweep piece that outlives its session must not lose the plans it already
+    integrated, so replay(reuse=True) returns a finished run's outputs from its
+    work directory instead of repeating the integration. The cache is keyed on
+    that directory and on nothing else: it does not know which plans produced
+    it. So a caller that reuses a directory for a different plan gets the old
+    answer, which is why every sweep driver puts the point, the epoch, the
+    planner and the tolerance label in the path. Both halves are asserted here,
+    the second deliberately: if reuse ever started checking the plans, the
+    drivers would be relying on something the function does not promise.
+    """
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        grid = scene(td, flat())
+        suns, dt = sun_table(5.0)
+        rover = Rover(v_flat=50.0)
+        work = td / "run"
+        short = straight_plan(30, 10, 20)
+        long_ = straight_plan(30, 10, 40)
+        first = replay([short], [0.0], grid, rover, suns, dt, 2.0, work)
+        again = replay([short], [0.0], grid, rover, suns, dt, 2.0, work, reuse=True)
+        for k in ("arrival", "shadow", "verdict", "illegal", "step_offsets"):
+            assert np.array_equal(first[k], again[k]), k
+        # reuse is not the default: a different plan in the same directory is
+        # integrated afresh and gives that plan's own arrival.
+        fresh = replay([long_], [0.0], grid, rover, suns, dt, 2.0, work)
+        assert fresh["arrival"][0] > first["arrival"][0] * 1.5, (
+            fresh["arrival"][0], first["arrival"][0])
+        # and with reuse it answers from the cache, which is now the long plan
+        stale = replay([short], [0.0], grid, rover, suns, dt, 2.0, work, reuse=True)
+        assert stale["arrival"][0] == pytest.approx(fresh["arrival"][0])
