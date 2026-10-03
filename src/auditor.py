@@ -64,19 +64,21 @@ def audit_leg(leg, world, budget_h):
                 bust_any=bool(bust[0]) if bust.size else False)
 
 
-def audit_declaration(leg, planner_template, work, cap_s=300.0):
+def audit_declaration(plan, index, t_start, planner_template, work, cap_s=300.0):
     """A declaration of infeasibility, put to the exact engine at a larger cap.
 
     A different instrument from the one the executive used, which is what makes
-    this part of the audit independent of the world model as well.
+    this part of the audit independent of the world model as well as of the
+    executive. Takes the state plainly rather than a leg object so it can be run
+    from a recorded result.
     """
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
-    if leg.plan.size < 2 or leg.fired_at_tick < 0:
-        return dict(audited=False, reason="no firing state to replan from")
-    idx = int(leg.log["index"][-1])
-    idx = min(max(idx, 0), leg.plan.size - 1)
-    start, goal = int(leg.plan[idx]), int(leg.plan[-1])
+    plan = np.asarray(plan, dtype=np.int32)
+    if plan.size < 2:
+        return dict(audited=False, reason="no plan to replan from")
+    i = int(min(max(index, 0), plan.size - 1))
+    start, goal = int(plan[i]), int(plan[-1])
     if start == goal:
         return dict(audited=False, reason="already at the goal")
     p = dict(json.loads(Path(planner_template).read_text()))
@@ -84,7 +86,7 @@ def audit_declaration(leg, planner_template, work, cap_s=300.0):
         np.array([start, goal], dtype=np.int32).tobytes())
     p["pairs_path"] = str(work / "pairs.bin")
     p["n_instances"] = 1
-    p["t_start_h"] = float(leg.fired_at_t)
+    p["t_start_h"] = float(t_start)
     p["time_limit_s"] = cap_s
     for k in list(p):
         if k.startswith("out_"):
@@ -97,8 +99,8 @@ def audit_declaration(leg, planner_template, work, cap_s=300.0):
     seconds = float(np.fromfile(p["out_seconds"], np.float64)[0])
     found = (not aborted) and np.isfinite(arrival)
     return dict(audited=True, cap_s=cap_s, aborted=aborted, arrival=arrival,
-                seconds=seconds, plan_exists=bool(found),
-                start=start, goal=goal, t_start=float(leg.fired_at_t))
+                seconds=seconds, plan_exists=bool(found), start=start, goal=goal,
+                t_start=float(t_start))
 
 
 def contingency(fired, busted):
