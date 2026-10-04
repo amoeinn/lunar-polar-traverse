@@ -1,0 +1,177 @@
+<?xml version="1.0"?>
+<!--
+  Rover for the phase 7a demo. Class: VIPER, NASA's lunar south-pole
+  prospecting rover, chosen because it is the same terrain, the same latitudes
+  and the same shadowed-crater problem this planner is about.
+
+  PLAN.md's checklist item C4 requires every figure here to carry its source in
+  this file, and anything that could not be sourced to be written as a stated
+  assumption rather than given false precision. The three labels below are used
+  exactly:
+
+    SOURCE     read from the named reference
+    ASSUMPTION not sourced; the value is a placeholder and the reference that
+               would settle it is named
+    DERIVED    computed from a SOURCE figure on this page
+
+  Sourced on 2026-10-04:
+    [V]  VIPER (rover), Wikipedia, citing NASA mission material: dry mass
+         430 kg, height 2.45 m, length and width 1.53 m.
+         https://en.wikipedia.org/wiki/VIPER_(rover)
+    [M]  Maki et al., "The Mars Science Laboratory Engineering Cameras",
+         Space Science Reviews, 2012, doi 10.1007/s11214-012-9882-4:
+         Navcams on a pan/tilt mast, 45 degree square field of view,
+         0.82 mrad/pixel, 1024 x 1024 detector, 650 nm bandpass.
+         The paper body is paywalled from this machine, so figures not in its
+         public description are ASSUMPTION below, not SOURCE.
+
+  Not sourced, and labelled so:
+    the Navcam stereo baseline, the Hazcam field of view, and every LiDAR
+    figure. The LiDAR is additionally a deliberate departure from the rover
+    class: no flown lunar rover carries a scanning LiDAR of this type and a
+    terrestrial unit would not survive the thermal and vacuum environment. It
+    is here because later projects in this portfolio want a standard range
+    sensor, and it is labelled rather than passed off as VIPER-like.
+-->
+<robot name="polar_rover" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- SOURCE [V] -->
+  <xacro:property name="body_len"   value="1.53"/>
+  <xacro:property name="body_wid"   value="1.53"/>
+  <xacro:property name="total_h"    value="2.45"/>
+  <xacro:property name="mass"       value="430.0"/>
+  <!-- ASSUMPTION: the split of the 2.45 m total height between chassis and
+       mast is not stated in [V]. Chassis depth and ground clearance here are
+       placeholders; the VIPER mechanical description would settle them. -->
+  <xacro:property name="body_h"     value="0.60"/>
+  <xacro:property name="clearance"  value="0.35"/>
+  <!-- DERIVED from [V] and the two assumptions above -->
+  <xacro:property name="mast_h"     value="${total_h - clearance - body_h}"/>
+
+  <!-- SOURCE [M]: 45 deg square FOV, 1024 x 1024, 0.82 mrad/pixel -->
+  <xacro:property name="nav_fov_deg" value="45.0"/>
+  <xacro:property name="nav_px"      value="1024"/>
+  <!-- ASSUMPTION: stereo baseline. Widely quoted for MSL as about 0.42 m but
+       not in the public description of [M], so it is not claimed as sourced. -->
+  <xacro:property name="nav_baseline" value="0.42"/>
+  <!-- ASSUMPTION: Hazcam field of view, commonly quoted near 124 deg for MSL,
+       likewise not sourced here. -->
+  <xacro:property name="haz_fov_deg"  value="124.0"/>
+  <xacro:property name="haz_px"       value="1024"/>
+  <!-- ASSUMPTION, and a departure from the class: an Ouster OS1-64-class
+       scanning LiDAR. 64 channels, 45 deg vertical and 360 deg horizontal
+       field of view, 120 m range, 10 Hz. Datasheet not read from this machine. -->
+  <xacro:property name="lidar_rows"   value="64"/>
+  <xacro:property name="lidar_cols"   value="1024"/>
+  <xacro:property name="lidar_vfov"   value="45.0"/>
+  <xacro:property name="lidar_range"  value="120.0"/>
+
+  <xacro:property name="d2r" value="0.0174532925199433"/>
+
+  <link name="base_link">
+    <!-- the wheel contact plane is z = 0, so the rover's world z is the
+         terrain height plus a known constant and nothing has to be inferred -->
+    <inertial>
+      <origin xyz="0 0 ${clearance + body_h/2}"/>
+      <mass value="${mass}"/>
+      <!-- DERIVED: a uniform box of the sourced mass and footprint -->
+      <inertia
+        ixx="${mass*(body_wid*body_wid + body_h*body_h)/12.0}"
+        iyy="${mass*(body_len*body_len + body_h*body_h)/12.0}"
+        izz="${mass*(body_len*body_len + body_wid*body_wid)/12.0}"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 ${clearance + body_h/2}"/>
+      <geometry><box size="${body_len} ${body_wid} ${body_h}"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${clearance + body_h/2}"/>
+      <geometry><box size="${body_len} ${body_wid} ${body_h}"/></geometry>
+    </collision>
+  </link>
+
+  <link name="mast_link"/>
+  <joint name="mast_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="mast_link"/>
+    <origin xyz="0 0 ${clearance + body_h + mast_h}"/>
+  </joint>
+
+  <!-- the stereo pair: baseline horizontal and across the drive direction -->
+  <xacro:macro name="nav_eye" params="name y">
+    <link name="${name}_link"/>
+    <joint name="${name}_joint" type="fixed">
+      <parent link="mast_link"/>
+      <child link="${name}_link"/>
+      <origin xyz="0 ${y} 0"/>
+    </joint>
+    <gazebo reference="${name}_link">
+      <sensor name="${name}" type="camera">
+        <always_on>1</always_on>
+        <update_rate>10</update_rate>
+        <topic>rover/${name}/image</topic>
+        <camera>
+          <horizontal_fov>${nav_fov_deg * d2r}</horizontal_fov>
+          <image><width>${nav_px}</width><height>${nav_px}</height></image>
+          <clip><near>0.2</near><far>20000.0</far></clip>
+        </camera>
+      </sensor>
+    </gazebo>
+  </xacro:macro>
+  <xacro:nav_eye name="nav_left"  y="${ nav_baseline/2}"/>
+  <xacro:nav_eye name="nav_right" y="${-nav_baseline/2}"/>
+
+  <!-- hazard cameras, fore and aft at the chassis -->
+  <xacro:macro name="hazcam" params="name x yaw">
+    <link name="${name}_link"/>
+    <joint name="${name}_joint" type="fixed">
+      <parent link="base_link"/>
+      <child link="${name}_link"/>
+      <origin xyz="${x} 0 ${clearance + body_h}" rpy="0 0 ${yaw}"/>
+    </joint>
+    <gazebo reference="${name}_link">
+      <sensor name="${name}" type="camera">
+        <always_on>1</always_on>
+        <update_rate>10</update_rate>
+        <topic>rover/${name}/image</topic>
+        <camera>
+          <horizontal_fov>${haz_fov_deg * d2r}</horizontal_fov>
+          <image><width>${haz_px}</width><height>${haz_px}</height></image>
+          <clip><near>0.1</near><far>1000.0</far></clip>
+        </camera>
+      </sensor>
+    </gazebo>
+  </xacro:macro>
+  <xacro:hazcam name="haz_front" x="${ body_len/2}" yaw="0"/>
+  <xacro:hazcam name="haz_rear"  x="${-body_len/2}" yaw="3.14159265"/>
+
+  <link name="lidar_link"/>
+  <joint name="lidar_joint" type="fixed">
+    <parent link="mast_link"/>
+    <child link="lidar_link"/>
+    <origin xyz="0 0 0.15"/>
+  </joint>
+  <gazebo reference="lidar_link">
+    <sensor name="lidar" type="gpu_lidar">
+      <always_on>1</always_on>
+      <update_rate>10</update_rate>
+      <topic>rover/lidar/scan</topic>
+      <lidar>
+        <scan>
+          <horizontal>
+            <samples>${lidar_cols}</samples>
+            <min_angle>-3.14159265</min_angle>
+            <max_angle>3.14159265</max_angle>
+          </horizontal>
+          <vertical>
+            <samples>${lidar_rows}</samples>
+            <min_angle>${-lidar_vfov/2 * d2r}</min_angle>
+            <max_angle>${ lidar_vfov/2 * d2r}</max_angle>
+          </vertical>
+        </scan>
+        <range><min>0.5</min><max>${lidar_range}</max><resolution>0.01</resolution></range>
+      </lidar>
+    </sensor>
+  </gazebo>
+</robot>
