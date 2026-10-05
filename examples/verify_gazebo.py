@@ -22,6 +22,7 @@ import rasterio
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.gzmap import (HEIGHTMAP_N, PX, REGION_N, REGION_OX, REGION_OY,
+                       SAMPLING,
                        bilinear, cell_to_map, centre_map, map_to_cell,
                        map_to_world, span_m, world_to_map)
 
@@ -151,6 +152,152 @@ def make_world(probes_world, extra=()):
     cmd += list(extra)
     subprocess.run(cmd, check=True, capture_output=True)
     return WORK / "lunar_region_ours.sdf"
+
+
+def probe_bounds(h):
+    """Per-probe tolerance for L2'', derived from the DEM with no simulator.
+
+    Two named terms and no third. tri is the largest gap between the bilinear
+    reference and the 10 m triangulation Gazebo renders, over the cell holding
+    the probe. curv is the linear interpolation error at the local surface,
+    kappa d^2 / 8: interpolating the cloud is exact on a plane, so slope no
+    longer enters at first order and curvature is what is left. This is the
+    term that replaces L2's lateral quantisation, which was slope x d/sqrt(2)
+    and reached 1.615 m at p03 -- omitted from the 2.0 m bar L2' was scored
+    against, which is why P7a-1 failed.
+    """
+    d = 2.0 * RAY_ALT_M * np.tan(RAY_FOV_RAD / 2.0) / RAY_PX
+    gi, gj = np.gradient(h)
+    hii, hij = np.gradient(gi)
+    _, hjj = np.gradient(gj)
+    sub = SAMPLING
+    out = []
+    for mx, my in PROBES:
+        i, j = map_to_cell(mx, my)
+        ii, jj = int(np.floor(float(i))), int(np.floor(float(j)))
+        gx = float(bilinear(gj, i, j)) / PX
+        gy = -float(bilinear(gi, i, j)) / PX
+        slope = float(np.degrees(np.arctan(np.hypot(gx, gy))))
+        worst = 0.0
+        for du in np.linspace(0.05, 0.95, 10):
+            for dv in np.linspace(0.05, 0.95, 10):
+                I, J = ii + du, jj + dv
+                b = float(bilinear(h, I, J))
+                i0 = np.floor(I * sub) / sub
+                j0 = np.floor(J * sub) / sub
+                c00 = float(bilinear(h, i0, j0))
+                c10 = float(bilinear(h, i0 + 1.0 / sub, j0))
+                c01 = float(bilinear(h, i0, j0 + 1.0 / sub))
+                c11 = float(bilinear(h, i0 + 1.0 / sub, j0 + 1.0 / sub))
+                fu, fv = (I - i0) * sub, (J - j0) * sub
+                tri = (c00 + (c10 - c00) * fu + (c01 - c00) * fv
+                       if fu + fv <= 1.0 else
+                       c11 + (c01 - c11) * (1 - fu) + (c10 - c11) * (1 - fv))
+                worst = max(worst, abs(b - tri))
+        H = np.array([[float(bilinear(hii, i, j)), float(bilinear(hij, i, j))],
+                      [float(bilinear(hij, i, j)), float(bilinear(hjj, i, j))]])
+        kappa = float(np.abs(np.linalg.eigvalsh(H / PX ** 2)).max())
+        curv = kappa * d * d / 8.0
+        out.append(dict(slope=slope, tri=worst, curv=curv, bound=worst + curv,
+                        lateral=float(np.hypot(gx, gy) * d / np.sqrt(2.0))))
+    return out, d
+
+
+def l2pp(h):
+    """L2'': the cloud interpolated at the probe point, scored per probe."""
+    print("=== L2'': placement by interpolated ray, per-probe bounds ===")
+    bounds, d = probe_bounds(h)
+    rays = []
+    for k, (mx, my) in enumerate(PROBES):
+        wx, wy = map_to_world(mx, my)
+        rays.append((f"p{k:02d}", float(wx), float(wy),
+                     height_at_map(h, mx, my) + RAY_ALT_M))
+    rayarg = "--rays=" + ";".join(
+        f"{n},{x:.4f},{y:.4f},{z:.4f},{RAY_FOV_RAD:.9f},{RAY_PX},{RAY_PX}"
+        for n, x, y, z in rays)
+    sdf = make_world([], extra=[rayarg])
+    print(f"  ray ground sampling d = {d:.4f} m, {RAY_PX} px over "
+          f"{2*RAY_ALT_M*np.tan(RAY_FOV_RAD/2):.1f} m from {RAY_ALT_M:.0f} m up")
+    print(f"  nothing dropped and nothing settling, so no settle window")
+    _, clouds = grab_mixed(sdf, 30.0, "dynamic_pose/info",
+                           [f"/ray/{n}/depth/points" for n, _, _, _ in rays])
+    print(f"\n  {'probe':>7}{'slope':>8}{'bound':>9}{'residual':>10}"
+          f"{'nodes':>7}{'verdict':>9}")
+    ok, rs = True, []
+    for k, (nm, cwx, cwy, cwz) in enumerate(rays):
+        b = bounds[k]
+        msg = clouds.get(f"/ray/{nm}/depth/points")
+        if msg is None:
+            print(f"  {nm:>7}  MISSING from the depth topic")
+            ok = False
+            continue
+        wx, wy, wz, _l, good = cloud_to_world(msg, (cwx, cwy, cwz))
+        sel = good & (np.hypot(wx - cwx, wy - cwy) <= 3.0 * d)
+        if sel.sum() < 6:
+            print(f"  {nm:>7}  only {int(sel.sum())} nodes near the probe")
+            ok = False
+            continue
+        # plane through the local cloud, evaluated exactly at the probe point.
+        # Linear interpolation is exact on a plane, so slope leaves the error
+        # budget and curvature is what remains.
+        A = np.c_[wx[sel] - cwx, wy[sel] - cwy, np.ones(int(sel.sum()))]
+        coef, *_ = np.linalg.lstsq(A, wz[sel], rcond=None)
+        zi = float(coef[2])
+        mx, my = PROBES[k]
+        r = zi - height_at_map(h, mx, my)
+        rs.append(r)
+        good_probe = abs(r) <= b["bound"]
+        ok &= good_probe
+        print(f"  {nm:>7}{b['slope']:8.2f}{b['bound']:9.4f}{r:+10.4f}"
+              f"{int(sel.sum()):7d}{'pass' if good_probe else 'FAIL':>9}")
+    l2 = bool(ok and len(rs) == len(rays))
+    if rs:
+        a = np.array(rs)
+        print(f"\n    residuals: max |{np.abs(a).max():.4f}| m, median "
+              f"{np.median(a):+.4f} m")
+        print(f"    L2' took the nearest pixel and reached 2.610 m at p03; the "
+              f"lateral term that")
+        print(f"    caused it was up to 1.615 m and is gone from this "
+              f"instrument by construction.")
+
+    # Reported, not scored: the offset that minimises the residual per field.
+    # This is what separates a placement error from a surface-fidelity one.
+    fields = []
+    for nm, cwx, cwy, cwz in rays:
+        msg = clouds.get(f"/ray/{nm}/depth/points")
+        if msg is None:
+            continue
+        wx, wy, wz, _l, good = cloud_to_world(msg, (cwx, cwy, cwz))
+        smx, smy = world_to_map(wx, wy)
+        g = (good & (smx > REGION_OX + 100) & (smx < REGION_OX + 9900)
+             & (smy < REGION_OY - 100) & (smy > REGION_OY - 9900))
+        if g.any():
+            fields.append((smx[g], smy[g], wz[g]))
+
+    def med(dx, dy):
+        o = []
+        for smx, smy, wz in fields:
+            i, j = map_to_cell(smx + dx, smy + dy)
+            o.append(np.abs(wz - bilinear(h, i, j)))
+        return float(np.median(np.concatenate(o)))
+
+    if fields:
+        grid = [(med(dx, dy), dx, dy)
+                for dx in np.arange(-6.0, 6.1, 2.0)
+                for dy in np.arange(-6.0, 6.1, 2.0)]
+        grid.sort()
+        best, bdx, bdy = grid[0]
+        print(f"\n    reported, not scored: the shift that minimises the "
+              f"residual over all")
+        print(f"    {sum(len(f[0]) for f in fields)} field pixels is "
+              f"({bdx:+.1f}, {bdy:+.1f}) m at {best:.4f} m, against "
+              f"{med(0.0,0.0):.4f} m at zero shift.")
+        print(f"    A residual with the shift at zero is a statement about the "
+              f"rendered surface;")
+        print(f"    a shift away from zero would be a statement about the "
+              f"mapping.")
+    print(f"  L2'' -> {'PASS' if l2 else 'FAIL'}")
+    return dict(L2pp=l2)
 
 
 def c2(h):
@@ -950,7 +1097,8 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     h = dem()
     out = {}
-    for name, fn in (("c1", c1), ("c2", c2), ("c3", c3), ("c5", c5)):
+    for name, fn in (("c1", c1), ("l2pp", l2pp), ("c2", c2),
+                     ("c3", c3), ("c5", c5)):
         if name in args.parts:
             out.update(run_part(name, fn, h, outdir, args.resume))
     print(f"\n=== scored so far ===")
