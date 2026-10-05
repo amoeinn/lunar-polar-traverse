@@ -469,15 +469,18 @@ def test_no_correction_stream_is_identical_to_an_all_zero_one(tmp_path):
             f"{a['log'][k]} vs {b['log'][k]}")
 
 
-def test_the_correction_stream_actually_reaches_the_forecast(tmp_path):
-    """Asserts the stream can change the answer, so the test above can fail.
+def test_a_dark_mark_raises_the_forecast_where_the_model_says_lit(tmp_path):
+    """The code-1 direction, and the test that lets the identity test fail.
 
     Without this, a binary that parsed correction_path and threw it away would
     pass the identity test above perfectly. The fixture is a walk whose cells
     the model calls lit for all time, so the forecast is zero darkness and the
-    monitor stays quiet. Marking every step as one whose lit claim is not to be
-    believed makes the forecast four hours of darkness against a one hour
-    budget, so it must fire.
+    monitor stays quiet. Marking every step dark makes the forecast four hours
+    against a one hour budget, so it must fire.
+
+    On a model-LIT step codes 0 and 2 agree and only 1 differs, so this is the
+    test that separates code 1 from both of the others. It is what catches a
+    mutation treating 1 as 2.
     """
     g = line_graph(tmp_path)
     iv = intervals(tmp_path, lit0={c: True for c in range(N)}, transitions={})
@@ -510,3 +513,58 @@ def test_a_correction_stream_of_the_wrong_length_is_refused(tmp_path):
     out = run(tmp_path, g, iv, w, plan, times, budget=1.0,
               correction=np.ones(len(plan) - 1, np.uint8), expect_rc=2)
     assert "correction stream" in out["stderr"], out["stderr"]
+
+
+def test_a_lit_mark_lowers_the_forecast_where_the_model_says_dark(tmp_path):
+    """The code-2 direction, which is the only one that can remove a false alarm.
+
+    The first version of this stream carried code 1 alone and could only raise
+    a forecast, so it removed 0 of the executive's 17 false alarms by
+    construction. Those false alarms are forecasts that are too pessimistic, so
+    bringing one down needs a mark that says lit where the model says dark.
+
+    The fixture is the mirror of the dark-mark test: the model calls every cell
+    dark for all time while the world is observed lit, so the forecast projects
+    four hours of modelled darkness against a one hour budget and the monitor
+    fires. Marking every step lit must make it quiet.
+
+    On a model-DARK step codes 0 and 1 agree and only 2 differs, so this is the
+    test that separates code 2 from both of the others. It is what catches a
+    mutation treating 2 as 1 and a mutation treating 2 as 0, and those two
+    mutations are indistinguishable on this fixture precisely because 0 and 1
+    agree here; the test above is what tells them apart from code 1 itself.
+    """
+    g = line_graph(tmp_path)
+    iv = intervals(tmp_path, lit0={c: False for c in range(N)}, transitions={})
+    # the world is lit the whole way, so nothing is observed dark and the only
+    # thing driving the monitor is the forecast
+    w = world(tmp_path, all_lit_walk())
+    plan, times = list(range(N)), [float(i) for i in range(N)]
+
+    (tmp_path / "believe").mkdir()
+    loud = run(tmp_path / "believe", g, iv, w, plan, times, budget=1.0)
+    assert loud["log"]["s_pred"].max() > 1.0, loud["log"]["s_pred"]
+    assert loud["log"]["fired"].sum() > 0, loud
+
+    (tmp_path / "lit").mkdir()
+    quiet = run(tmp_path / "lit", g, iv, w, plan, times, budget=1.0,
+                correction=np.full(len(plan), 2, np.uint8))
+    assert quiet["log"]["s_pred"].max() < 1.0, quiet["log"]["s_pred"]
+    assert quiet["log"]["fired"].sum() == 0, quiet
+
+
+def test_a_correction_code_above_two_is_refused(tmp_path):
+    """An unknown code is a different correction, not a bigger one.
+
+    The stream is ternary. A 3 means whatever the branch chain happens to fall
+    through to, which is "believe the model", so an out-of-range code would
+    silently become no correction at all on that step.
+    """
+    g = line_graph(tmp_path)
+    iv = intervals(tmp_path, lit0={c: True for c in range(N)}, transitions={})
+    w = world(tmp_path, all_lit_walk())
+    plan, times = list(range(N)), [float(i) for i in range(N)]
+    codes = np.ones(len(plan), np.uint8); codes[2] = 3
+    out = run(tmp_path, g, iv, w, plan, times, budget=1.0,
+              correction=codes, expect_rc=2)
+    assert "not 0, 1 or 2" in out["stderr"], out["stderr"]

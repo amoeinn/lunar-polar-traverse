@@ -93,18 +93,35 @@ struct Ctx {
     // registered replacement come from one binary and one sample.
     bool contra_bounded = true;
     double contra_horizon_h = 0.7250;   // registered, the held-out p99
-    // An optional per-plan-step correction. correction[i] != 0 means "do not
-    // believe the model's lit claim on the step from plan[i] to plan[i+1]";
-    // the forecast then treats that step as dark for its whole duration.
+    // An optional per-plan-step ternary correction for the step from plan[i]
+    // to plan[i+1]:
+    //   0  believe the model's interval table, as before the stream existed
+    //   1  treat the step as dark for its whole duration
+    //   2  treat the step as lit for its whole duration
+    // A step carries one code, so the two directions cannot conflict and no
+    // conflict rule is needed.
+    //
+    // Both directions are carried because only one of them can lower a
+    // forecast. The first version of this stream carried code 1 alone, on the
+    // grounds that a monitor should not be able to make its own forecast
+    // optimistic, and that made it useless for what it was built for: the
+    // executive's false alarms are forecasts that are too pessimistic, median
+    // true maximum shadow 1.051 h against a 2 h budget, so removing one needs
+    // the forecast to come DOWN. Code 1 can only raise it. Scored on the
+    // 2026-10-05 sample, code 1 alone removed 0 of 17 false alarms, which was
+    // guaranteed by its direction rather than measured.
+    //
+    // What code 2 can do is make the forecast optimistic and hide a real bust.
+    // Nothing in this file prevents that; the registered test's zero-busts-lost
+    // condition is what guards it, and that is now the condition's job.
     //
     // Empty means absent, and absent must be bit-identical to this file before
-    // the stream existed: that is what the guard test asserts, and the full
-    // 187-plan sample was reproduced against the published P8 figures with no
-    // stream supplied before any correction was scored.
+    // the stream existed: the guard test asserts it, and the full 187-plan
+    // sample was reproduced against the published P8 figures with no stream.
     //
-    // One direction only. The registered target is the model saying lit where
-    // the world is dark, which is the direction the contradiction rule already
-    // acts on, so the stream cannot assert light where the model says dark.
+    // The observed branch below is deliberately untouched by the stream. That
+    // branch acts on what the world has just been seen to do, and a prediction
+    // does not get to overrule an observation.
     std::vector<uint8_t> correction;
     int replan_limit = 2;
     double replan_cap_s = 30.0;
@@ -180,12 +197,20 @@ double predict_max_shadow(const Ctx& c) {
     for (int i = c.pos; i + 1 < n; ++i) {
         const double tau = c.edge_travel(c.plan[i], c.plan[i + 1]) * slip;
         if (!std::isfinite(tau)) break;
-        if (!c.correction.empty() && c.correction[i]) {
-            // The correction marks this step as one where the model's lit
-            // claim is not to be believed, so the whole step accrues darkness
-            // instead of consulting the table it is correcting.
+        const uint8_t code = c.correction.empty() ? 0 : c.correction[i];
+        if (code == 1) {
+            // Dark for the whole step: darkness accrues without consulting
+            // the table this is correcting.
             s += tau;
             s_max = std::max(s_max, s);
+            t += tau;
+        } else if (code == 2) {
+            // Lit for the whole step: whatever run of darkness was
+            // accumulating ends here, so the peak is banked and the
+            // accumulator resets. This is the only branch that can lower a
+            // forecast, and so the only one that can remove a false alarm.
+            s_max = std::max(s_max, s);
+            s = 0.0;
             t += tau;
         } else {
             double s_arr = 0.0, s_mx = 0.0;
@@ -287,6 +312,14 @@ int main(int argc, char** argv) {
                          "correction stream has %zu entries for a %zu-step plan\n",
                          c.correction.size(), c.plan.size());
             return 2;
+        }
+        for (size_t q = 0; q < c.correction.size(); ++q) {
+            if (c.correction[q] > 2) {
+                std::fprintf(stderr,
+                             "correction code %u at step %zu is not 0, 1 or 2\n",
+                             static_cast<unsigned>(c.correction[q]), q);
+                return 2;
+            }
         }
     }
     const size_t nt = count_of<double>(p.str("traj_t_path"));
