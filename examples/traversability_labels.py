@@ -101,7 +101,8 @@ def main():
     suns, ivs = {}, {}
     cols = {k: [] for k in ("tag_id", "cell", "t", "world", "model",
                             "sun_el", "sun_az", "hor_el", "hor_dist",
-                            "margin", "b3a", "b3b", "plan_id", "frac")}
+                            "margin", "b3a", "b3b", "nxt_lit", "nxt_cell",
+                            "plan_id", "frac")}
     tag_ids, plans_done, bad = {}, 0, 0
     for tag, gp, plan, tt, tl, ti in src:
         if tag not in ivs:
@@ -144,11 +145,17 @@ def main():
         az2, el2 = azimuth_elevation_from_frame(
             spos, cells.origin[nxt], cells.up[nxt],
             cells.east[nxt], cells.north[nxt])
-        b3b = b3a & (el2 > horizon_lookup(horizon[nxt], az2))
+        # The next cell's own state, kept separately from the conjunction.
+        # B3b stored only b3a AND next-lit, from which the next cell's state is
+        # unrecoverable when the current cell is dark, which is precisely the
+        # population the lit direction is about.
+        nxt_lit = el2 > horizon_lookup(horizon[nxt], az2)
+        b3b = b3a & nxt_lit
         cols["sun_el"].append(el); cols["sun_az"].append(az)
         cols["hor_el"].append(he); cols["hor_dist"].append(hd.astype(float))
         cols["margin"].append(el - he)
         cols["b3a"].append(b3a); cols["b3b"].append(b3b)
+        cols["nxt_lit"].append(nxt_lit); cols["nxt_cell"].append(nxt)
         cols["cell"].append(cell); cols["t"].append(grid)
         cols["tag_id"].append(np.full(grid.size, tag_ids[tag], np.int64))
         cols["plan_id"].append(np.full(grid.size, pid, np.int64))

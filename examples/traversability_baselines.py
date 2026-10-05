@@ -107,28 +107,31 @@ def pooled(paths):
     return out
 
 
-def evaluate(d, train, test, label):
+def evaluate(d, train, test, label, direction="dark"):
+    """One split, one direction.
+
+    direction "dark": among model-lit samples, is the world dark? The condition
+      is B3b, the model calling this cell lit and the next dark.
+    direction "lit": among model-dark samples, is the world lit? The condition
+      is B3b-lit, the mirror: the model calling this cell dark and the next lit.
+    """
     w = d["world"].astype(bool); mo = d["model"].astype(bool)
-    print(f"\n----- {label} -----")
+    nl = d["nxt_lit"].astype(bool)
+    print(f"\n----- {label}  [{direction} direction] -----")
     for nm, sel0 in (("train", train), ("test", test)):
-        sel = sel0 & mo
-        y = ~w[sel]
-        if y.sum() == 0 or (~y).sum() == 0:
+        sel = sel0 & (mo if direction == "dark" else ~mo)
+        y = (~w[sel]) if direction == "dark" else w[sel]
+        if y.sum() < 10 or (~y).sum() < 10:
             print(f"  {nm}: unusable, {int(y.sum())} positives of {int(sel.sum())}")
             return None
         mg = np.abs(d["margin"][sel]); hd = d["hor_dist"][sel]
-        print(f"  {nm}: {int(sel.sum())} model-lit samples, {int(y.sum())} "
-              f"world-dark, base rate {100*y.mean():.3f}%, "
+        cond = (~nl[sel]) if direction == "dark" else nl[sel]
+        print(f"  {nm}: {int(sel.sum())} samples, {int(y.sum())} positive, "
+              f"base rate {100*y.mean():.3f}%, "
               f"{len(np.unique(d['plan_id'][sel]))} plans")
-        print(f"    B0 constant 'never disagrees'  accuracy "
+        print(f"    B0 constant                    accuracy "
               f"{100*(1-y.mean()):.3f}%  MCC 0.0000  J 0.0000  recall 0")
-        b3a = ~d["b3a"].astype(bool)[sel]
-        if b3a.sum() == 0:
-            print(f"    B3a exact-time horizon        never predicts dark "
-                  f"(0 of {b3a.size}); recovers the table, MCC undefined")
-        else:
-            report("B3a exact-time horizon", y, b3a)
-        report("B3b + next cell lit", y, ~d["b3b"].astype(bool)[sel])
+        report("B3b" if direction == "dark" else "B3b-lit", y, cond)
         if nm == "train":
             global TAU, TAU2, HMAX
             TAU = sweep_threshold(mg, y)[1]
@@ -138,13 +141,12 @@ def evaluate(d, train, test, label):
                 if m2.sum() < 200 or y[m2].sum() < 10:
                     continue
                 v, t = sweep_threshold(mg[m2], y[m2])
-                p2 = (mg <= t) & m2
-                vv = metrics(y, p2)["mcc"]
+                vv = metrics(y, (mg <= t) & m2)["mcc"]
                 if np.isfinite(vv) and vv > best[0]:
                     best = (vv, t, float(ht))
             TAU2, HMAX = best[1], best[2]
-            print(f"    thresholds fitted on train: B1 tau {TAU:.4f} deg; "
-                  f"B2 tau {TAU2:.4f} deg, horizon distance <= {HMAX:.0f} m")
+            print(f"    thresholds on train: B1 tau {TAU:.4f} deg; "
+                  f"B2 tau {TAU2:.4f} deg, dist <= {HMAX:.0f} m")
         report("B1 |margin| <= tau", y, mg <= TAU)
         report("B2 B1 & dist <= h", y, (mg <= TAU2) & (hd <= HMAX))
     return True
@@ -167,17 +169,16 @@ def main():
 
     blk = region_blocks(d["cell"].astype(int), args.n_blocks)
     ub = np.unique(blk)
-    hold = ub[::2]
-    te = np.isin(blk, hold)
-    evaluate(d, ~te, te, f"split by region: {args.n_blocks}x{args.n_blocks} "
-             f"blocks, {len(hold)} of {len(ub)} held out, no buffer")
-
-    for tag in ("2028-08-15_p2", "2028-11-15_p2", "2028-02-15_p0"):
-        if tag not in list(d["tag_names"]):
-            continue
-        tid = list(d["tag_names"]).index(tag)
-        te = d["tag_id"] == tid
-        evaluate(d, ~te, te, f"split by epoch: hold out {tag}")
+    te_r = np.isin(blk, ub[::2])
+    rlab = (f"split by region: {args.n_blocks}x{args.n_blocks} blocks, "
+            f"{len(ub[::2])} of {len(ub)} held out, no buffer")
+    for direction in ("dark", "lit"):
+        evaluate(d, ~te_r, te_r, rlab, direction)
+        for tag in ("2028-08-15_p2", "2028-11-15_p2"):
+            if tag not in list(d["tag_names"]):
+                continue
+            te = d["tag_id"] == list(d["tag_names"]).index(tag)
+            evaluate(d, ~te, te, f"split by epoch: hold out {tag}", direction)
     return 0
 
 
