@@ -30,6 +30,61 @@ from src.disagree import FlatIntervals                           # noqa: E402
 from src.executive import run_instance                           # noqa: E402
 
 OUT = ROOT / "data" / "work" / "executive_correction"
+SUNDIR = ROOT / "data" / "work" / "sunpos"
+_CTX = {}
+
+
+def feature_ctx():
+    """Cells, horizon and horizon distance, built once per process.
+
+    The monitor computes the model's features at execution time, so the
+    correction function does too rather than reading a precomputed table: a
+    replan produces a plan whose steps were never precomputed for.
+    """
+    if "cells" not in _CTX:
+        import examples.plan_pilot as P
+        from src.cost import Rover
+        _, n, px, dem, horizon, cells, gx, gy, edges, graph = P.load(
+            Rover(v_flat=50.0))
+        _CTX["cells"] = cells
+        _CTX["horizon"] = horizon.astype(np.float64).reshape(-1, 360)
+        _CTX["hdist"] = np.fromfile(
+            ROOT / "data" / "work" / "horizon_dist.f32",
+            dtype=np.float32).reshape(-1, 360)
+    return _CTX["cells"], _CTX["horizon"], _CTX["hdist"]
+
+
+def model_correction(graph, plan, times, tag):
+    """The learned model's ternary code at each plan step."""
+    import joblib
+    from src.frames import azimuth_elevation_from_frame, horizon_lookup
+    if "clf" not in _CTX:
+        b = joblib.load(ROOT / "data" / "work" / "traversability_model.joblib")
+        _CTX["clf"], _CTX["feat"] = b["model"], b["features"]
+    cells, horizon, hdist = feature_ctx()
+    if tag not in _CTX.setdefault("sun", {}):
+        _CTX["sun"][tag] = np.load(SUNDIR / f"{tag}.npy")
+    sp, cad = _CTX["sun"][tag], 1.0 / 60.0
+    iv = FlatIntervals(graph["itimes_path"], graph["ioffsets_path"],
+                       graph["ilit0_path"])
+    plan = np.asarray(plan, np.int64)
+    n = plan.size
+    cur = plan[:n]
+    nxt = plan[np.minimum(np.arange(n) + 1, n - 1)]
+    t = np.asarray(times, float)[:n]
+    k = np.clip((t / cad).astype(int), 0, sp.shape[0] - 1)
+    spos = sp[k]
+    az, el = azimuth_elevation_from_frame(
+        spos, cells.origin[cur], cells.up[cur], cells.east[cur],
+        cells.north[cur])
+    he = horizon_lookup(horizon[cur], az)
+    hd = hdist[cur, np.round(az).astype(int) % 360].astype(float)
+    mo = np.array([iv.is_lit(int(cur[i]), float(t[i])) for i in range(n)], float)
+    nl = np.array([iv.is_lit(int(nxt[i]), float(t[i])) for i in range(n)], float)
+    X = np.column_stack([mo, nl, el - he, el, he, hd])
+    code = _CTX["clf"].predict(X).astype(np.uint8)
+    code[n - 1] = 0
+    return code
 
 
 def b3b_correction(graph, plan, times, arm):
@@ -60,8 +115,12 @@ def one(arg):
     work = OUT / kind / rec["tag"] / f"plan{rec['plan_index']:03d}"
     plan = np.array(rec["plan"], np.int32)
     times = np.array(rec["times"], np.float64)
-    fn = None if kind == "none" else (
-        lambda p, t: b3b_correction(rec["graph"], p, t, kind))
+    if kind == "none":
+        fn = None
+    elif kind == "model":
+        fn = lambda p, t: model_correction(rec["graph"], p, t, rec["tag"])
+    else:
+        fn = lambda p, t: b3b_correction(rec["graph"], p, t, kind)
     legs = run_instance(rec["planner_params"], rec["replay_params"],
                         rec["graph"], plan, times, work, R.BUDGET_H,
                         R.REPLAN_LIMIT, R.REPLAN_CAP_S, True,
@@ -92,7 +151,15 @@ def main():
     args = ap.parse_args()
     recs = R.sample()
     OUT.mkdir(parents=True, exist_ok=True)
-    ARMS = ("none", "dark", "lit", "both")
+    # Sun positions cached once, so no worker pays 43200 SPICE calls per epoch.
+    SUNDIR.mkdir(parents=True, exist_ok=True)
+    from examples.build_intervals import epochs, sun_table_at
+    for tag, base, off in epochs():
+        f = SUNDIR / f"{tag}.npy"
+        if not f.exists() and any(r["tag"] == tag for r in recs):
+            np.save(f, sun_table_at(base, off, cadence_h=1.0 / 60.0).p)
+            print(f"  cached sun positions for {tag}", flush=True)
+    ARMS = ("none", "dark", "lit", "both", "model")
     jobs = [(r, k) for k in ARMS for r in recs]
     print(f"{len(recs)} instances x {len(ARMS)} arms, {args.jobs} workers", flush=True)
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
@@ -114,7 +181,8 @@ def main():
         den = np.sqrt(float((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN)))
         label = {"none": "bounded rule, no stream", "dark": "B3b dark marks only",
                  "lit": "B3b-lit lit marks only",
-                 "both": "both directions"}[nm]
+                 "both": "both directions",
+                 "model": "learned ternary model"}[nm]
         print(f"  {label:24s} TP {TP} FN {FN} FP {FP} TN {TN}  controls {cf}  "
               f"unnecessary {FP/max(FP+TN,1):.4f}  MCC "
               f"{(TP*TN-FP*FN)/den if den>0 else float('nan'):+.4f}")
@@ -123,7 +191,7 @@ def main():
           f"plans:")
     print(f"  {'arm':24s}{'b':>4}{'c':>4}{'busts lost':>12}{'ctl fires':>11}"
           f"{'p':>9}  verdict")
-    for nm in ("dark", "lit", "both"):
+    for nm in ("dark", "lit", "both", "model"):
         cand = arms[nm]
         b = sum(1 for k in nonbust if base[k]["fired"] and not cand[k]["fired"])
         c = sum(1 for k in nonbust if not base[k]["fired"] and cand[k]["fired"])
