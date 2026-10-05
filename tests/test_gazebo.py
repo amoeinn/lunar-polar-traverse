@@ -196,3 +196,45 @@ def test_bilinear_interpolates_rather_than_snapping_to_a_cell():
     assert bilinear(d, 0.5, 0.5) == pytest.approx(1.5)
     assert bilinear(d, -1.0, -1.0) == pytest.approx(0.0)
     assert bilinear(d, 9.0, 9.0) == pytest.approx(3.0)
+
+
+def test_the_gravity_element_sits_inside_the_link_where_sdformat_reads_it():
+    """Protects the C5 free fall: <gravity> placed before <link> is dropped.
+
+    <gravity> is a link element. Written as a child of <model> sdformat
+    discards it with a warning and still reports the world Valid, so the rover
+    fell with the element it needed sitting three lines above the link it
+    belonged in. Asserting the text alone would not catch the position, so this
+    checks that the element is inside a link block.
+    """
+    import examples.make_world as MW
+    rover = ROOT / "data" / "work" / "gazebo" / "rover.sdf"
+    if not rover.exists():
+        pytest.skip("rover.sdf not converted; run the C4 conversion first")
+    sdf = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                   "vertices", 2296.6073, rover=str(rover))
+    body = sdf[sdf.index("<model name='rover'"):]
+    body = body[:body.index("</model>")]
+    assert "<gravity>false</gravity>" in body, "the rover has no gravity override"
+    link_at = body.index("<link name=")
+    grav_at = body.index("<gravity>false</gravity>")
+    assert grav_at > link_at, (
+        "<gravity> is before the <link> tag, so it is a child of <model> and "
+        "sdformat drops it")
+
+
+def test_the_world_declares_the_system_that_provides_set_pose():
+    """Protects C5's pose commanding: set_pose has no provider without it.
+
+    Declaring plugins explicitly replaces Gazebo's defaults. With only Physics,
+    Sensors and SceneBroadcaster declared, the running world listed no
+    set_pose, no create and no remove, and every call returned an empty reply
+    that was read for three attempts as an uninformative result rather than as
+    the service not existing.
+    """
+    import examples.make_world as MW
+    sdf = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                   "vertices", 2296.6073)
+    assert "gz-sim-user-commands-system" in sdf, (
+        "UserCommands is not declared, so /world/<name>/set_pose has no "
+        "provider at all")

@@ -76,8 +76,16 @@ def rover_block(path, name="rover", pose=(0.0, 0.0, 2000.0)):
     # lesson in this record about trusting a return value. Dynamic with no
     # gravity is the combination where a commanded pose both applies and stays.
     block = block.replace(">", f">\n      <pose>{x} {y} {z} 0 0 0</pose>", 1)
-    block = block.replace("<link name=", "<gravity>false</gravity>\n      "
-                          "<link name=", 1)
+    # <gravity> is a link element, not a model element. Placed before the
+    # <link> tag it becomes a child of <model>, where sdformat drops it with a
+    # warning and still reports the world Valid, so the rover fell with the
+    # element sitting right there in the file. The first diagnosis of this was
+    # that the edit had reached only one of two links; the rover has exactly
+    # one link, because sdformat merges the fixed joints into base_link, and
+    # the position was the fault rather than the count. Inserted inside every
+    # link so adding a non-fixed joint later cannot reintroduce it.
+    block = re.sub(r"(<link name=[^>]*>)", r"\1\n        <gravity>false</gravity>",
+                   block)
     return "\n    " + block
 
 
@@ -133,8 +141,40 @@ def camera_rig(wx, wy, wz, fov_rad, width, height):
     </model>"""
 
 
+def ray_rig(name, wx, wy, wz, fov_rad, width, height):
+    """A nadir depth camera at a fixed pose: L2's instrument, which cannot roll.
+
+    L2 originally dropped spheres and measured them after settling, and what it
+    measured was the spheres. They rolled 316 to 1230 m down the slopes they
+    landed on and were still creeping when the settling window closed, and six
+    of seven residuals came back positive, which is a 2 m sphere sitting above
+    a slope rather than a displaced heightmap.
+
+    Nothing here moves. The camera is static, and each pixel's own returned
+    range gives the terrain point it hit, so the height comes from the
+    simulator's own geometry at a horizontal position that is read back from
+    the same return rather than assumed.
+    """
+    return f"""
+    <model name="ray_{name}">
+      <static>true</static>
+      <pose>{wx:.4f} {wy:.4f} {wz:.4f} 0 1.5707963 0</pose>
+      <link name="link">
+        <sensor name="depth" type="depth_camera">
+          <always_on>1</always_on><update_rate>5</update_rate>
+          <topic>ray/{name}/depth</topic>
+          <camera>
+            <horizontal_fov>{fov_rad:.9f}</horizontal_fov>
+            <image><width>{width}</width><height>{height}</height></image>
+            <clip><near>1.0</near><far>200000.0</far></clip>
+          </camera>
+        </sensor>
+      </link>
+    </model>"""
+
+
 def build(side, mode, texture, normal, pos_z, light_dir, probes, cam, convention,
-          h_range, rover=None):
+          h_range, rover=None, rays=()):
     span = span_m(HEIGHTMAP_N, PX, convention)
     size_xy = requested_size(HEIGHTMAP_N, PX, SAMPLING, convention)
     ambient = "1 1 1 1" if mode == "ours" else "0 0 0 1"
@@ -148,6 +188,7 @@ def build(side, mode, texture, normal, pos_z, light_dir, probes, cam, convention
       <direction>{dx:.9f} {dy:.9f} {dz:.9f}</direction>
     </light>"""
     cam_sdf = camera_rig(*cam) if cam else ""
+    cam_sdf += "".join(ray_rig(*r) for r in rays)
     rover_sdf = rover_block(rover) if rover else ""
     probe_sdf = "".join(probe_model(n, x, y, z) for n, x, y, z in probes)
     return f"""<?xml version="1.0" ?>
@@ -170,6 +211,14 @@ def build(side, mode, texture, normal, pos_z, light_dir, probes, cam, convention
     </plugin>
     <plugin filename="gz-sim-scene-broadcaster-system"
             name="gz::sim::systems::SceneBroadcaster"/>
+    <!-- UserCommands provides set_pose. Declaring plugins explicitly replaces
+         Gazebo's defaults, so omitting this one leaves the service with no
+         provider at all: listing the running world's services showed no
+         set_pose, no create and no remove, and every call came back with an
+         empty reply. That empty reply was the service not existing, and it was
+         visible from the first attempt before it was diagnosed. -->
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
     <scene>
       <ambient>{ambient}</ambient>
       <background>0 0 0 1</background>
@@ -216,6 +265,8 @@ def main():
     ap.add_argument("--cam", default="")
     ap.add_argument("--z-offset", type=float, default=None,
                     help="heightmap pos z; the calibration measures it")
+    ap.add_argument("--rays", default="",
+                    help="L2' nadir depth cameras: name,x,y,z,fov,w,h;...")
     ap.add_argument("--rover", default="",
                     help="path to the sdformat-converted rover")
     ap.add_argument("--out", default="")
@@ -230,13 +281,19 @@ def main():
         for k, item in enumerate(args.probes.split(";")):
             x, y, z = (float(v) for v in item.split(","))
             probes.append((f"probe{k:02d}", x, y, z))
+    rays = []
+    if args.rays:
+        for item in args.rays.split(";"):
+            f = item.split(",")
+            rays.append((f[0], float(f[1]), float(f[2]), float(f[3]),
+                         float(f[4]), int(f[5]), int(f[6])))
     cam = tuple(float(v) for v in args.cam.split(",")) if args.cam else None
     if cam:
         cam = (cam[0], cam[1], cam[2], cam[3], int(cam[4]), int(cam[5]))
     sdf = build(side["path"], args.mode, texture, normal, args.z_offset,
                 [float(v) for v in args.light.split()], probes, cam,
                 args.convention, side["h_range"],
-                args.rover or None)
+                args.rover or None, rays)
     out = Path(args.out) if args.out else OUT / f"lunar_region_{args.mode}.sdf"
     out.write_text(sdf)
     print(f"wrote {out}")
@@ -245,7 +302,8 @@ def main():
           f"pos z {args.z_offset:.4f}, size requested "
           f"{requested_size(HEIGHTMAP_N, PX, SAMPLING, args.convention):.4f} "
           f"for a true {span_m(HEIGHTMAP_N, PX, args.convention):.0f} m span")
-    print(f"  {len(probes)} probes, camera rig: {'yes' if cam else 'no'}")
+    print(f"  {len(probes)} probes, {len(rays)} ray rigs, "
+          f"camera rig: {'yes' if cam else 'no'}")
     return 0
 
 

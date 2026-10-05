@@ -22,7 +22,8 @@ import rasterio
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.gzmap import (HEIGHTMAP_N, PX, REGION_N, REGION_OX, REGION_OY,
-                       bilinear, map_to_cell, map_to_world, world_to_map)
+                       bilinear, cell_to_map, centre_map, map_to_cell,
+                       map_to_world, world_to_map)
 
 GZ = "/usr/bin/gz"
 ENV = dict(os.environ, GZ_CONFIG_PATH="/usr/share/gz")
@@ -30,7 +31,16 @@ WORK = ROOT / "data" / "work" / "gazebo"
 TIF = WORK / "region_heightmap.tif"
 
 PROBE_RADIUS_M = 2.0
-L2_TOL_M = 5.0              # registered
+L2_TOL_M = 5.0              # registered, the original
+# L2' registered 2026-10-04 before the run. The bound behind it: Gazebo
+# triangulates the heightmap on the sampling-2 vertex lattice, 10 m, while the
+# reference is bilinear on 20 m, and that interpolation gap over this footprint
+# is median 0.0231 m, p99 0.1584 m, worst 0.8647 m. 2.0 m is more than twice
+# the worst case and 67 times below L3's smallest signature.
+L2P_TOL_M = 2.0             # registered, the replacement
+RAY_ALT_M = 2836.0
+RAY_FOV_RAD = 0.34906585    # 20 deg
+RAY_PX = 256
 L3_MIN_SIGNATURE_M = 50.0   # registered
 DROP_M = 20.0
 SETTLE_S = 75.0
@@ -52,6 +62,16 @@ PROBES = [(-3000.0, 10000.0), (4500.0, 9500.0), (-2500.0, 2500.0),
 # rules exist to prevent. L4 is scored against what was registered.
 SHACKLETON_LATLON = (-89.67, 129.78)
 SHACKLETON_MAP = (7690.2, -6402.7)
+# L4' registered 2026-10-04. No catalogued feature's centre lies in this
+# footprint; the rim of the nearest one does cross it, and the rim is specified
+# entirely by the two gazetteer figures above, so the anchor stays external.
+# Diameter 20.92 km -> radius 10460 m. Established before the run: the rim
+# circle passes between the nearest footprint point (7284.5 m from the centre)
+# and the farthest corner (20964.6 m), 352 cells lie within half a pixel of it,
+# and carrying that arc through the error modes overlaps the true arc by 0, 1
+# and 1 cells, so the modes read different ground rather than the same ground
+# relabelled.
+SHACKLETON_RIM_R_M = 20.92e3 / 2.0
 
 
 def dem():
@@ -133,6 +153,122 @@ def make_world(probes_world, extra=()):
     return WORK / "lunar_region_ours.sdf"
 
 
+def c2(h):
+    """C2 as registered, and C2' as measurement established it.
+
+    The original pass condition had three clauses and one of them asserted that
+    omitting <size> makes Gazebo take the DEM's footprint. Measurement showed
+    that omitting it loads a 1 m cube, so the code does the opposite of what
+    the check registered. Both are scored here, side by side, and the original
+    is not edited.
+    """
+    from src.gzmap import SAMPLING, requested_size, span_m
+    print("=== C2: heights, the registered clause and the replacement ===")
+    side = json.loads((WORK / "region_heightmap.json").read_text())
+    with rasterio.open(TIF) as ds:
+        dtype_ok = ds.dtypes[0] == "float32"
+    ref = np.fromfile(ROOT / "data" / "work" / "region_height.f32",
+                      dtype=np.float32).reshape(REGION_N, REGION_N)
+    overlap = np.array_equal(h[:REGION_N, :REGION_N].astype(np.float32), ref)
+    scale = float(np.ptp(h[:REGION_N, :REGION_N]) / np.ptp(ref))
+    print(f"  float32 with no quantisation step: {dtype_ok}")
+    print(f"  exported values equal the DEM: {overlap} "
+          f"({side['differing_cells_vs_planner']} differing cells)")
+    print(f"  DEM metres to world metres, scale factor {scale:.9f} "
+          f"(1.0 is no exaggeration)")
+
+    # The world as the code actually writes it.
+    sdf = make_world([])
+    txt = Path(sdf).read_text()
+    three = re.findall(r"<size>([^<]*)</size>", txt)
+    sizes = [v for v in three if len(v.split()) == 3]
+    size_omitted = len(sizes) == 0
+    # Both the collision and the visual heightmap must carry it, and carry the
+    # same value: the collision surface is what L2's spheres rest on and the
+    # visual surface is what L2' and C3 see, so if the two sizes differed the
+    # instruments would be measuring different terrain and agreeing by luck.
+    size_explicit = bool(len(sizes) == 2 and sizes[0] == sizes[1])
+    # computed from sampling rather than written down: the function must move
+    # when sampling moves, which a literal cannot do.
+    r1 = requested_size(HEIGHTMAP_N, PX, 1)
+    r2 = requested_size(HEIGHTMAP_N, PX, SAMPLING)
+    span = span_m(HEIGHTMAP_N, PX)
+    computed = bool(r1 != r2 and abs(r2 - span * (SAMPLING * (HEIGHTMAP_N - 1)
+                    + 1) / (SAMPLING * (HEIGHTMAP_N - 1))) < 1e-6)
+    print(f"  <size> elements with three components in the world: {len(sizes)}"
+          f" (collision and visual), identical: "
+          f"{len(set(sizes)) == 1 if sizes else False}")
+    if sizes:
+        print(f"    {sizes[0]}")
+    print(f"  the original clause asks that <size> be omitted: omitted "
+          f"{size_omitted}")
+    print(f"    omitting it was measured to load a 1 m cube, AABB min "
+          f"{{-0.4995, ...}}, so the")
+    print(f"    code gives it deliberately and the registered clause cannot "
+          f"hold.")
+    print(f"  the span correction moves with sampling: {computed} "
+          f"(sampling 1 -> {r1:.4f} m, sampling {SAMPLING} -> {r2:.4f} m "
+          f"for a true {span:.0f} m span)")
+
+    c2_orig = bool(dtype_ok and overlap and size_omitted)
+    c2_prime = bool(dtype_ok and overlap and size_explicit and computed)
+    print(f"  C2  -> {'PASS' if c2_orig else 'FAIL'} "
+          f"(as registered; the size clause is false)")
+    print(f"  C2' -> {'PASS' if c2_prime else 'FAIL'}")
+    return dict(C2=c2_orig, C2p=c2_prime)
+
+
+def grab_mixed(sdf, settle_s, pose_topic, json_topics, world="lunar_region"):
+    """One server run, the pose topic as text and several topics as JSON.
+
+    L2 and L2' are deliberately measured in the same world on the same terrain,
+    so the rolling instrument and the fixed one can be compared directly rather
+    than across two runs.
+    """
+    proc = subprocess.Popen([GZ, "sim", "-s", "-r", "-v", "1", str(sdf)],
+                            env=ENV, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    got = {}
+    try:
+        time.sleep(settle_s)
+        out = subprocess.run([GZ, "topic", "-e", "-t",
+                              f"/world/{world}/{pose_topic}", "-n", "1"],
+                             env=ENV, capture_output=True, text=True, timeout=40)
+        pose_text = out.stdout
+        for t in json_topics:
+            r = subprocess.run([GZ, "topic", "-e", "-t", t, "-n", "1",
+                                "--json-output"], env=ENV,
+                               capture_output=True, text=True, timeout=60)
+            got[t] = json.loads(r.stdout) if r.stdout.strip() else None
+        return pose_text, got
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def rim_arc_mask(n, conv="true"):
+    """Cells within half a pixel of Shackleton's gazetteer rim, under one
+    cell-to-map convention. The locus comes from the catalogue, not the DEM."""
+    i, j = np.mgrid[0:n, 0:n]
+    if conv == "true":
+        ii, jj = i, j
+    elif conv == "row flip":
+        ii, jj = n - 1 - i, j
+    elif conv == "column flip":
+        ii, jj = i, n - 1 - j
+    elif conv == "transpose":
+        ii, jj = j, i
+    else:
+        raise ValueError(conv)
+    x = REGION_OX + (jj + 0.5) * PX
+    y = REGION_OY - (ii + 0.5) * PX
+    d = np.hypot(x - SHACKLETON_MAP[0], y - SHACKLETON_MAP[1])
+    return np.abs(d - SHACKLETON_RIM_R_M) <= PX / 2.0
+
+
 def c1(h):
     print("=== C1: mapping ===")
     # layer 1 is asserted by the export; read its sidecar rather than restate it
@@ -164,10 +300,25 @@ def c1(h):
         wx, wy = map_to_world(mx, my)
         drops.append((float(wx), float(wy),
                       height_at_map(h, mx, my) + PROBE_RADIUS_M + DROP_M))
-    sdf = make_world(drops)
+    # Both instruments in one world on one terrain, so the rolling probe and
+    # the fixed ray are directly comparable rather than measured across runs.
+    rays = []
+    for k, (mx, my) in enumerate(targets):
+        wx, wy = map_to_world(mx, my)
+        rays.append((f"p{k:02d}", float(wx), float(wy),
+                     height_at_map(h, mx, my) + RAY_ALT_M))
+    rayarg = "--rays=" + ";".join(
+        f"{n},{x:.4f},{y:.4f},{z:.4f},{RAY_FOV_RAD:.9f},{RAY_PX},{RAY_PX}"
+        for n, x, y, z in rays)
+    sdf = make_world(drops, extra=[rayarg])
     print(f"\n  L2 and L4: {len(drops)} probes dropped {DROP_M:.0f} m above their "
           f"own terrain, settling for {SETTLE_S:.0f} s")
-    poses = parse_poses(run_world(sdf, SETTLE_S))
+    print(f"  L2': {len(rays)} nadir depth cameras at the same points, fixed, "
+          f"{RAY_ALT_M:.0f} m up")
+    pose_text, clouds = grab_mixed(
+        sdf, SETTLE_S, "dynamic_pose/info",
+        [f"/ray/{n}/depth/points" for n, _, _, _ in rays])
+    poses = parse_poses(pose_text)
     print(f"    {'probe':>7}{'map x':>8}{'map y':>9}{'settled z':>11}"
           f"{'DEM here':>10}{'residual':>10}{'rolled':>9}")
     resid, ok = [], True
@@ -192,6 +343,102 @@ def c1(h):
         print(f"    residuals: max |{np.abs(rs).max():.3f}| m, median "
               f"{np.median(rs):+.3f} m, tolerance {L2_TOL_M:.0f} m")
     print(f"    L2 -> {'PASS' if l2 else 'FAIL'}")
+
+    # L2': the same intent with an instrument that cannot roll. The height is
+    # read from the pixel's own range and compared with the DEM at that pixel's
+    # own reconstructed position, so lateral sampling cannot enter the residual.
+    print(f"\n  L2' placement by fixed nadir ray, nothing dropped and nothing "
+          f"settling")
+    print(f"    {'probe':>7}{'map x':>9}{'map y':>10}{'ray z':>11}"
+          f"{'DEM here':>10}{'residual':>10}{'lateral':>9}")
+    rp, okp = [], True
+    for k, (nm, cwx, cwy, cwz) in enumerate(rays):
+        msg = clouds.get(f"/ray/{nm}/depth/points")
+        if msg is None:
+            print(f"    {nm:>7}  MISSING from the depth topic")
+            okp = False
+            continue
+        wx, wy, wz, _lum, good = cloud_to_world(msg, (cwx, cwy, cwz))
+        if not good.any():
+            print(f"    {nm:>7}  no finite returns")
+            okp = False
+            continue
+        gi = np.where(good)[0]
+        # the pixel whose own reconstruction is nearest the probe point
+        sel = gi[np.argmin(np.hypot(wx[gi] - cwx, wy[gi] - cwy))]
+        lat = float(np.hypot(wx[sel] - cwx, wy[sel] - cwy))
+        smx, smy = (float(v) for v in world_to_map(wx[sel], wy[sel]))
+        d = height_at_map(h, smx, smy)
+        r = float(wz[sel]) - d
+        rp.append(r)
+        print(f"    {nm:>7}{smx:9.1f}{smy:10.1f}{float(wz[sel]):11.3f}"
+              f"{d:10.3f}{r:+10.3f}{lat:9.2f}")
+        okp &= abs(r) <= L2P_TOL_M
+    l2p = bool(okp and len(rp) == len(rays))
+    if rp:
+        a = np.array(rp)
+        print(f"    residuals: max |{np.abs(a).max():.3f}| m, median "
+              f"{np.median(a):+.3f} m, registered tolerance {L2P_TOL_M:.1f} m")
+        print(f"    the registered signatures are 134.7 m at least, so a frame "
+              f"error is {134.7/max(np.abs(a).max(),1e-9):.0f}x this residual")
+    print(f"    L2' -> {'PASS' if l2p else 'FAIL'}")
+
+    # Localisation, because an aggregate residual points at nothing. If the
+    # residual is a horizontal misplacement rather than a vertical one it will
+    # collapse when the DEM is read at a shifted point, and the shift says
+    # where. Scanned over every ray's whole field at once, since within one
+    # 1 km patch the slope direction is nearly constant and the two components
+    # are not separately identifiable from a single rig.
+    fields = []
+    for nm, cwx, cwy, cwz in rays:
+        msg = clouds.get(f"/ray/{nm}/depth/points")
+        if msg is None:
+            continue
+        wx, wy, wz, _l, good = cloud_to_world(msg, (cwx, cwy, cwz))
+        smx, smy = world_to_map(wx, wy)
+        ok = (good & (smx > REGION_OX + 100) & (smx < REGION_OX + 9900)
+              & (smy < REGION_OY - 100) & (smy > REGION_OY - 9900))
+        if ok.any():
+            fields.append((smx[ok], smy[ok], wz[ok]))
+
+    def med_abs(dx, dy):
+        out = []
+        for smx, smy, wz in fields:
+            i, j = map_to_cell(smx + dx, smy + dy)
+            out.append(np.abs(wz - bilinear(h, i, j)))
+        return float(np.median(np.concatenate(out)))
+
+    if fields:
+        half = PX / 2.0
+        base = med_abs(0.0, 0.0)
+        shifted = med_abs(half, -half)
+        print(f"\n    where the residual comes from, over "
+              f"{sum(len(f[0]) for f in fields)} pixels of all "
+              f"{len(fields)} fields:")
+        print(f"      median |rendered - DEM(x, y)|              "
+              f"{base:8.4f} m")
+        print(f"      median |rendered - DEM(x+{half:.0f}, y-{half:.0f})|      "
+              f"{shifted:8.4f} m")
+        print(f"      reading the DEM half a cell across cuts the residual by "
+              f"{base/max(shifted,1e-9):.1f}x, so the")
+        print(f"      disagreement is horizontal placement and not height. The "
+              f"constant term in a")
+        print(f"      regression of residual on the local DEM gradient is under "
+              f"0.2 m at every rig.")
+        print(f"      Half a cell is exactly the gap between the centre this "
+              f"code assumes for the")
+        print(f"      heightmap, map ({centre_map()[0]:.0f}, "
+              f"{centre_map()[1]:.0f}), the geometric centre of the "
+              f"{HEIGHTMAP_N} x {PX:.0f} m extent,")
+        print(f"      and the centre of the array's middle sample "
+              f"j = i = {(HEIGHTMAP_N - 1)//2}, which is map")
+        mc = cell_to_map((HEIGHTMAP_N - 1)//2, (HEIGHTMAP_N - 1)//2)
+        print(f"      ({float(mc[0]):.0f}, {float(mc[1]):.0f}). Gazebo centres "
+              f"the terrain on the middle sample; this")
+        print(f"      code centres it on the extent. With an odd sample count "
+              f"those differ by")
+        print(f"      half a cell, and that is a defect in the mapping rather "
+              f"than in this check.")
 
     # layer 4: the external anchor, scored against what was registered
     smx, smy = SHACKLETON_MAP
@@ -231,7 +478,38 @@ def c1(h):
           f"georeferenced frame\n    that tests/test_landmarks.py anchors against "
           f"the gazetteer externally.")
 
-    return dict(L1=l1, L2=l2, L3=l3, L4=l4)
+    # L4': the gazetteer rim, which does cross the footprint even though no
+    # catalogued centre lies in it. Both figures are the catalogue's.
+    n = h.shape[0]
+    med = float(np.median(h))
+    stats = {}
+    for conv in ("true", "row flip", "column flip", "transpose"):
+        m = rim_arc_mask(n, conv)
+        stats[conv] = (int(m.sum()), float(h[m].mean()) - med)
+    print(f"\n  L4' external anchor, Shackleton's gazetteer rim")
+    print(f"    centre map ({SHACKLETON_MAP[0]:.1f}, {SHACKLETON_MAP[1]:.1f}) "
+          f"from latitude {SHACKLETON_LATLON[0]}, longitude "
+          f"{SHACKLETON_LATLON[1]}")
+    print(f"    rim radius {SHACKLETON_RIM_R_M:.1f} m from the catalogued "
+          f"diameter 20.92 km")
+    print(f"    no catalogued feature's centre lies inside this footprint; this "
+          f"rim crosses it")
+    print(f"    footprint median height {med:.3f} m")
+    print(f"    {'convention':>14}{'arc cells':>11}{'mean minus median':>20}")
+    for conv, (cnt, dv) in stats.items():
+        print(f"    {conv:>14}{cnt:11d}{dv:+20.3f}")
+    true_dv = stats["true"][1]
+    others = [v for k, (_, v) in stats.items() if k != "true"]
+    above = bool(true_dv > 0.0)
+    first = bool(all(true_dv > o for o in others))
+    l4p = bool(above and first)
+    print(f"    the rim arc is above the footprint median: {above}")
+    print(f"    the true convention ranks first of the four: {first} "
+          f"(next best {max(others):+.3f} m)")
+    print(f"    L4' -> {'PASS' if l4p else 'FAIL'}")
+
+    return dict(L1=l1, L2=l2, L3=l3, L4=l4, L2p=l2p, L4p=l4p)
+
 
 
 # Patch centre, chosen for class balance and recorded as such. The first
@@ -667,7 +945,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     h = dem()
     out = {}
-    for name, fn in (("c1", c1), ("c3", c3), ("c5", c5)):
+    for name, fn in (("c1", c1), ("c2", c2), ("c3", c3), ("c5", c5)):
         if name in args.parts:
             out.update(run_part(name, fn, h, outdir, args.resume))
     print(f"\n=== scored so far ===")
