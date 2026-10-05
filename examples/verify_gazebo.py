@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.gzmap import (HEIGHTMAP_N, PX, REGION_N, REGION_OX, REGION_OY,
                        bilinear, cell_to_map, centre_map, map_to_cell,
-                       map_to_world, world_to_map)
+                       map_to_world, span_m, world_to_map)
 
 GZ = "/usr/bin/gz"
 ENV = dict(os.environ, GZ_CONFIG_PATH="/usr/share/gz")
@@ -419,26 +419,31 @@ def c1(h):
               f"{base:8.4f} m")
         print(f"      median |rendered - DEM(x+{half:.0f}, y-{half:.0f})|      "
               f"{shifted:8.4f} m")
-        print(f"      reading the DEM half a cell across cuts the residual by "
-              f"{base/max(shifted,1e-9):.1f}x, so the")
-        print(f"      disagreement is horizontal placement and not height. The "
-              f"constant term in a")
-        print(f"      regression of residual on the local DEM gradient is under "
-              f"0.2 m at every rig.")
-        print(f"      Half a cell is exactly the gap between the centre this "
-              f"code assumes for the")
-        print(f"      heightmap, map ({centre_map()[0]:.0f}, "
-              f"{centre_map()[1]:.0f}), the geometric centre of the "
-              f"{HEIGHTMAP_N} x {PX:.0f} m extent,")
-        print(f"      and the centre of the array's middle sample "
-              f"j = i = {(HEIGHTMAP_N - 1)//2}, which is map")
-        mc = cell_to_map((HEIGHTMAP_N - 1)//2, (HEIGHTMAP_N - 1)//2)
-        print(f"      ({float(mc[0]):.0f}, {float(mc[1]):.0f}). Gazebo centres "
-              f"the terrain on the middle sample; this")
-        print(f"      code centres it on the extent. With an odd sample count "
-              f"those differ by")
-        print(f"      half a cell, and that is a defect in the mapping rather "
-              f"than in this check.")
+        # Which of the two is smaller says whether the mapping agrees with the
+        # terrain or sits half a cell from it. Before centre_map was corrected
+        # the shifted reading was 16.3x better, which is how the offset was
+        # found; after it, the unshifted reading must be the better one.
+        if shifted < base:
+            print(f"      the shifted reading is {base/max(shifted,1e-9):.1f}x "
+                  f"better, so the mapping sits half a cell from")
+            print(f"      the terrain: a horizontal placement error, not a "
+                  f"height error.")
+        else:
+            print(f"      the unshifted reading is "
+                  f"{shifted/max(base,1e-9):.1f}x better, so the mapping and "
+                  f"the terrain agree")
+            print(f"      and no half-cell offset remains.")
+        mid = (HEIGHTMAP_N - 1) // 2
+        mc = cell_to_map(mid, mid)
+        ext = (REGION_OX + span_m(HEIGHTMAP_N, PX) / 2.0,
+               REGION_OY - span_m(HEIGHTMAP_N, PX) / 2.0)
+        print(f"      centre_map gives map ({centre_map()[0]:.0f}, "
+              f"{centre_map()[1]:.0f}); the middle sample i = j = {mid} is at "
+              f"({float(mc[0]):.0f}, {float(mc[1]):.0f})")
+        print(f"      and the extent's centre is at ({ext[0]:.0f}, "
+              f"{ext[1]:.0f}). Gazebo pins the terrain on the middle")
+        print(f"      sample, and for an odd sample count the extent's centre "
+              f"is half a cell from it.")
 
     # layer 4: the external anchor, scored against what was registered
     smx, smy = SHACKLETON_MAP

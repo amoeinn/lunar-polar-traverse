@@ -52,20 +52,34 @@ def span_m(n=HEIGHTMAP_N, px=PX, convention="vertices"):
     return (n - 1) * px if convention == "vertices" else n * px
 
 
+def cell_to_map(i, j, px=PX, ox=REGION_OX, oy=REGION_OY):
+    """Cell centre in map metres. i is the row, increasing southward."""
+    return ox + (np.asarray(j, float) + 0.5) * px, oy - (np.asarray(i, float) + 0.5) * px
+
+
 def centre_map(n=HEIGHTMAP_N, px=PX, ox=REGION_OX, oy=REGION_OY,
                convention="vertices"):
     """The heightmap's centre in map metres, which is where Gazebo pins it.
 
-    Gazebo centres a heightmap on its model pose, so this is the point that
-    world (0, 0) corresponds to.
+    Gazebo centres a heightmap on its model pose, and the terrain it builds is
+    built on the samples, so the point it pins is the middle SAMPLE's centre
+    and not the middle of the extent. Those coincide only for an even sample
+    count. This heightmap is 513 across, so they differ by half a pixel in
+    each axis, and returning the extent's centre put every map-to-world
+    conversion 14.14 m off diagonally.
+
+    Found by measurement, not by reading: dropping spheres could not see it,
+    because they rolled up to 1229 m and carried 6.41 m of residual against a
+    3.69 m signal. Fixed nadir depth cameras resolved the terrain to 0.23 m,
+    and the median absolute height residual over 458752 pixels fell from
+    3.6869 m to 0.2268 m when the DEM was read half a cell across, which is
+    exactly this offset. The fourth of four conventions on this path that the
+    documentation did not settle.
     """
-    half = span_m(n, px, convention) / 2.0
-    return ox + half, oy - half
-
-
-def cell_to_map(i, j, px=PX, ox=REGION_OX, oy=REGION_OY):
-    """Cell centre in map metres. i is the row, increasing southward."""
-    return ox + (np.asarray(j, float) + 0.5) * px, oy - (np.asarray(i, float) + 0.5) * px
+    mid = (n - 1) // 2
+    cx, cy = cell_to_map(mid, mid, px=px, ox=ox, oy=oy)
+    _ = span_m(n, px, convention)   # the extent's span, no longer the centre
+    return float(cx), float(cy)
 
 
 def map_to_cell(x, y, px=PX, ox=REGION_OX, oy=REGION_OY):

@@ -166,8 +166,12 @@ def test_map_to_world_is_a_translation_and_never_a_reflection():
                            ("SE", (REGION_OX + REGION_N * PX,
                                    REGION_OY - REGION_N * PX))):
         corners[name] = tuple(float(v) for v in map_to_world(mx, my))
-    assert corners["NW"] == (pytest.approx(-5120.0), pytest.approx(5120.0))
-    assert corners["SE"] == (pytest.approx(4880.0), pytest.approx(-4880.0))
+    # These moved by half a cell when centre_map was corrected from the
+    # extent's centre to the middle sample's centre. They are written out
+    # rather than derived from centre_map so that a change to the convention
+    # has to be made deliberately here too, instead of following silently.
+    assert corners["NW"] == (pytest.approx(-5130.0), pytest.approx(5130.0))
+    assert corners["SE"] == (pytest.approx(4870.0), pytest.approx(-4870.0))
     assert len(set(corners.values())) == 4, corners
     # a round trip through the inverse, since both are used in the checks
     for mx, my in ((0.0, 0.0), (REGION_OX, REGION_OY), (1234.5, 6789.0)):
@@ -238,3 +242,50 @@ def test_the_world_declares_the_system_that_provides_set_pose():
     assert "gz-sim-user-commands-system" in sdf, (
         "UserCommands is not declared, so /world/<name>/set_pose has no "
         "provider at all")
+
+
+def test_the_heightmap_centre_is_the_middle_sample_not_the_middle_of_the_extent():
+    """Protects the half-cell offset that L2' found, and the odd-count rule.
+
+    Gazebo pins a heightmap at the centre of the terrain it builds, and that
+    terrain is built on the samples, so the pinned point is the middle
+    sample's centre. The extent's centre is half a pixel away from it whenever
+    the sample count is odd, and 513 is odd. Returning the extent's centre put
+    every map-to-world conversion 14.14 m off diagonally, which the rolling
+    spheres could not resolve and the fixed ray could: the median absolute
+    height residual over 458752 pixels was 3.6869 m at zero shift and 0.2268 m
+    half a cell across.
+
+    The even case is asserted alongside it, because that is where the two
+    definitions agree and a fix that simply added a constant 10 m would pass
+    the odd case and break this one.
+    """
+    mid = (HEIGHTMAP_N - 1) // 2
+    assert HEIGHTMAP_N % 2 == 1, "this heightmap is 2^n+1, so the count is odd"
+    assert centre_map() == pytest.approx(
+        tuple(float(v) for v in cell_to_map(mid, mid))), (
+        "the centre is not the middle sample's centre, so world (0, 0) is half "
+        "a cell from where Gazebo pins the terrain")
+
+    extent = (REGION_OX + span_m(HEIGHTMAP_N, PX) / 2.0,
+              REGION_OY - span_m(HEIGHTMAP_N, PX) / 2.0)
+    off = np.hypot(centre_map()[0] - extent[0], centre_map()[1] - extent[1])
+    assert off == pytest.approx(PX / 2.0 * np.sqrt(2.0)), (
+        f"the gap to the extent's centre is {off:.3f} m, not the half-cell "
+        f"diagonal {PX/2.0*np.sqrt(2.0):.3f} m")
+
+    # Even sample count: here the two definitions do coincide, because the
+    # span is (n-1)*px and (n-1)/2 is a whole number of cells from the origin.
+    # Asserted so that a fix which simply added a constant 10 m would pass the
+    # odd case above and fail here.
+    n_even = 512
+    mid_e = (n_even - 1) // 2
+    c_even = centre_map(n=n_even)
+    ext_even = (REGION_OX + span_m(n_even, PX) / 2.0,
+                REGION_OY - span_m(n_even, PX) / 2.0)
+    assert c_even == pytest.approx(
+        tuple(float(v) for v in cell_to_map(mid_e, mid_e))), (
+        "the even case is not the middle sample either")
+    assert c_even == pytest.approx(ext_even), (
+        "for an even count the middle sample and the extent's centre coincide; "
+        "if they do not, the fix is a constant offset rather than the sample")
