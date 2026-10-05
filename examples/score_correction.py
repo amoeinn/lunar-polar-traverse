@@ -32,16 +32,26 @@ from src.executive import run_instance                           # noqa: E402
 OUT = ROOT / "data" / "work" / "executive_correction"
 
 
-def b3b_correction(graph, plan, times):
-    """One byte per plan step: the model calls this cell lit and the next dark."""
+def b3b_correction(graph, plan, times, arm):
+    """The ternary stream: 0 believe the model, 1 treat as dark, 2 as lit.
+
+    B3b marks a step dark where the model calls this cell lit and the next dark;
+    B3b-lit marks it lit where the model calls this cell dark and the next lit.
+    A step satisfies at most one of the two by construction, since they require
+    opposite states at the same cell, so no conflict rule is needed.
+    """
     iv = FlatIntervals(graph["itimes_path"], graph["ioffsets_path"],
                        graph["ilit0_path"])
     plan = np.asarray(plan, np.int64)
     out = np.zeros(plan.size, np.uint8)
     for i in range(plan.size - 1):
         t = float(times[i])
-        if iv.is_lit(int(plan[i]), t) and not iv.is_lit(int(plan[i + 1]), t):
+        here = iv.is_lit(int(plan[i]), t)
+        nxt = iv.is_lit(int(plan[i + 1]), t)
+        if here and not nxt and arm in ("dark", "both"):
             out[i] = 1
+        elif (not here) and nxt and arm in ("lit", "both"):
+            out[i] = 2
     return out
 
 
@@ -51,7 +61,7 @@ def one(arg):
     plan = np.array(rec["plan"], np.int32)
     times = np.array(rec["times"], np.float64)
     fn = None if kind == "none" else (
-        lambda p, t: b3b_correction(rec["graph"], p, t))
+        lambda p, t: b3b_correction(rec["graph"], p, t, kind))
     legs = run_instance(rec["planner_params"], rec["replay_params"],
                         rec["graph"], plan, times, work, R.BUDGET_H,
                         R.REPLAN_LIMIT, R.REPLAN_CAP_S, True,
@@ -82,42 +92,50 @@ def main():
     args = ap.parse_args()
     recs = R.sample()
     OUT.mkdir(parents=True, exist_ok=True)
-    jobs = [(r, k) for k in ("none", "b3b") for r in recs]
-    print(f"{len(recs)} instances x 2 arms, {args.jobs} workers", flush=True)
+    ARMS = ("none", "dark", "lit", "both")
+    jobs = [(r, k) for k in ARMS for r in recs]
+    print(f"{len(recs)} instances x {len(ARMS)} arms, {args.jobs} workers", flush=True)
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
         res = list(ex.map(one, jobs))
     (OUT / "results.json").write_text(json.dumps(res, indent=1))
 
     key = lambda r: (r["tag"], r["plan_index"])
-    arms = {k: {key(r): r for r in res if r["kind"] == k}
-            for k in ("none", "b3b")}
-    base, cand = arms["none"], arms["b3b"]
+    arms = {k: {key(r): r for r in res if r["kind"] == k} for k in ARMS}
+    base = arms["none"]
     mon = [k for k in base if base[k]["monitored"]]
     print(f"\nmonitored {len(mon)}, controls {len(base)-len(mon)}")
-    for nm, arm in (("bounded rule, no stream", base), ("B3b stream", cand)):
+    for nm in ARMS:
+        arm = arms[nm]
         TP = sum(1 for k in mon if arm[k]["busted"] and arm[k]["fired"])
         FN = sum(1 for k in mon if arm[k]["busted"] and not arm[k]["fired"])
         FP = sum(1 for k in mon if not arm[k]["busted"] and arm[k]["fired"])
         TN = sum(1 for k in mon if not arm[k]["busted"] and not arm[k]["fired"])
         cf = sum(1 for k in base if not base[k]["monitored"] and arm[k]["fired"])
         den = np.sqrt(float((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN)))
-        print(f"  {nm:26s} TP {TP} FN {FN} FP {FP} TN {TN}  controls {cf}  "
+        label = {"none": "bounded rule, no stream", "dark": "B3b dark marks only",
+                 "lit": "B3b-lit lit marks only",
+                 "both": "both directions"}[nm]
+        print(f"  {label:24s} TP {TP} FN {FN} FP {FP} TN {TN}  controls {cf}  "
               f"unnecessary {FP/max(FP+TN,1):.4f}  MCC "
               f"{(TP*TN-FP*FN)/den if den>0 else float('nan'):+.4f}")
-    nonbust = [k for k in mon if not base[k]["busted"]]
-    b = sum(1 for k in nonbust if base[k]["fired"] and not cand[k]["fired"])
-    c = sum(1 for k in nonbust if not base[k]["fired"] and cand[k]["fired"])
-    lost = sum(1 for k in mon if base[k]["busted"] and not cand[k]["fired"])
-    cf = sum(1 for k in base if not base[k]["monitored"] and cand[k]["fired"])
-    p = mcnemar(b, c)
-    print(f"\npaired against the bounded rule on the same plans:")
-    print(f"  false alarms removed  b = {b}")
-    print(f"  false alarms added    c = {c}")
-    print(f"  busts lost              = {lost}   (must be 0)")
-    print(f"  control firings         = {cf}   (must be 0)")
-    print(f"  McNemar exact one-sided p = {p:.4f}   (bar 0.05)")
-    ok = (lost == 0 and cf == 0 and p <= 0.05)
-    print(f"\n  REGISTERED TEST -> {'PASS' if ok else 'FAIL'}")
+    nonbust = [k for k in mon if base[k]["busted"] is False]
+    print(f"\nthe registered paired test, against the bounded rule on the same "
+          f"plans:")
+    print(f"  {'arm':24s}{'b':>4}{'c':>4}{'busts lost':>12}{'ctl fires':>11}"
+          f"{'p':>9}  verdict")
+    for nm in ("dark", "lit", "both"):
+        cand = arms[nm]
+        b = sum(1 for k in nonbust if base[k]["fired"] and not cand[k]["fired"])
+        c = sum(1 for k in nonbust if not base[k]["fired"] and cand[k]["fired"])
+        lost = sum(1 for k in mon if base[k]["busted"] and not cand[k]["fired"])
+        cf = sum(1 for k in base if not base[k]["monitored"] and cand[k]["fired"])
+        p = mcnemar(b, c)
+        ok = (lost == 0 and cf == 0 and p <= 0.05)
+        print(f"  {nm:24s}{b:4d}{c:4d}{lost:12d}{cf:11d}{p:9.4f}  "
+              f"{'PASS' if ok else 'FAIL'}")
+    print(f"\n  zero-busts-lost is now a live guard and not a formality: a lit")
+    print(f"  mark lowers the forecast, so it can hide a real bust. Any arm")
+    print(f"  above with busts lost > 0 fails on that alone.")
     return 0
 
 
