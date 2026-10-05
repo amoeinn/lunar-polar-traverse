@@ -28,6 +28,9 @@ public:
         if (it == numbers.end()) throw std::runtime_error("missing number key: " + k);
         return it->second;
     }
+    bool has_str(const std::string& k) const {
+        return strings.find(k) != strings.end();
+    }
     double num(const std::string& k, double fallback) const {
         auto it = numbers.find(k);
         return it == numbers.end() ? fallback : it->second;

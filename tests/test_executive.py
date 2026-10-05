@@ -110,7 +110,8 @@ def corridor_with_annex(td, annex=1200, edge_h=EDGE_H, annex_edge_h=0.01):
 
 
 def run(td, graph, iv, wrld, plan, times, holds=None, budget=1.0,
-        replan_limit=2, replan_cap_s=30.0, bounded=True, horizon=0.7250):
+        replan_limit=2, replan_cap_s=30.0, bounded=True, horizon=0.7250,
+        correction=None, expect_rc=0):
     holds = np.zeros(len(plan)) if holds is None else holds
     (td / "plan.bin").write_bytes(np.array(plan, np.int32).tobytes())
     (td / "plan_times.bin").write_bytes(np.array(times, np.float64).tobytes())
@@ -137,6 +138,10 @@ def run(td, graph, iv, wrld, plan, times, holds=None, budget=1.0,
              plan_holds_path=str(td / "plan_holds.bin"),
              contradiction_bounded=1.0 if bounded else 0.0,
              contradiction_horizon_h=horizon)
+    if correction is not None:
+        (td / "correction.bin").write_bytes(
+            np.asarray(correction, np.uint8).tobytes())
+        p["correction_path"] = str(td / "correction.bin")
     for name in ("tick", "t", "s_exec", "s_world", "s_pred", "index", "kind",
                  "lit", "fired"):
         p[f"out_log_{name}"] = str(td / f"log_{name}.bin")
@@ -146,6 +151,9 @@ def run(td, graph, iv, wrld, plan, times, holds=None, budget=1.0,
     (td / "params.json").write_text(json.dumps(p, indent=2))
     r = subprocess.run([str(EXEC_BIN), str(td / "params.json")],
                        capture_output=True, text=True)
+    if expect_rc != 0:
+        assert r.returncode == expect_rc, (r.returncode, r.stderr[-300:])
+        return {"stderr": r.stderr}
     assert r.returncode == 0, r.stderr[-600:]
     s = json.loads((td / "summary.json").read_text())
     dt = dict(tick=np.int64, t=np.float64, s_exec=np.float64, s_world=np.float64,
@@ -426,3 +434,79 @@ def test_the_contradiction_horizon_bounds_what_an_observation_projects(tmp_path)
     assert bounded["log"]["s_pred"].max() < 1.0, bounded["log"]["s_pred"]
     assert bounded["outcome"] == "ran_to_end", bounded
     assert bounded["log"]["fired"].sum() == 0
+
+
+def test_no_correction_stream_is_identical_to_an_all_zero_one(tmp_path):
+    """Protects the whole P8 record against the correction stream's existence.
+
+    The stream was added so a learned or computed illumination correction can
+    reach the monitor's forecast. Everything already scored in this record was
+    scored without it, so absent must mean absent: not nearly, and not only in
+    the verdict but in every logged number. An all-zero stream exercises the
+    new branch and must land on exactly the same log as supplying no stream at
+    all, which is what separates "the parameter is ignored" from "the parameter
+    is ignored when empty".
+
+    The full guard is the 187-plan sample: with no stream the extended binary
+    reproduced all 374 published P8 records with zero differing fields,
+    recorded in PLAN.md on 2026-10-05. This is that guard in miniature, at a
+    size the suite can run.
+    """
+    g = line_graph(tmp_path)
+    iv = intervals(tmp_path, lit0={c: True for c in range(N)}, transitions={})
+    w = world(tmp_path, all_lit_walk())
+    plan, times = list(range(N)), [float(i) for i in range(N)]
+
+    (tmp_path / "none").mkdir()
+    a = run(tmp_path / "none", g, iv, w, plan, times, budget=1.0)
+    (tmp_path / "zeros").mkdir()
+    b = run(tmp_path / "zeros", g, iv, w, plan, times, budget=1.0,
+            correction=np.zeros(len(plan), np.uint8))
+    assert a["outcome"] == b["outcome"], (a["outcome"], b["outcome"])
+    for k in a["log"]:
+        assert np.array_equal(a["log"][k], b["log"][k]), (
+            f"{k} differs between no stream and an all-zero stream: "
+            f"{a['log'][k]} vs {b['log'][k]}")
+
+
+def test_the_correction_stream_actually_reaches_the_forecast(tmp_path):
+    """Asserts the stream can change the answer, so the test above can fail.
+
+    Without this, a binary that parsed correction_path and threw it away would
+    pass the identity test above perfectly. The fixture is a walk whose cells
+    the model calls lit for all time, so the forecast is zero darkness and the
+    monitor stays quiet. Marking every step as one whose lit claim is not to be
+    believed makes the forecast four hours of darkness against a one hour
+    budget, so it must fire.
+    """
+    g = line_graph(tmp_path)
+    iv = intervals(tmp_path, lit0={c: True for c in range(N)}, transitions={})
+    w = world(tmp_path, all_lit_walk())
+    plan, times = list(range(N)), [float(i) for i in range(N)]
+
+    (tmp_path / "off").mkdir()
+    quiet = run(tmp_path / "off", g, iv, w, plan, times, budget=1.0)
+    assert quiet["log"]["s_pred"].max() == 0.0, quiet["log"]["s_pred"]
+    assert quiet["log"]["fired"].sum() == 0
+
+    (tmp_path / "on").mkdir()
+    loud = run(tmp_path / "on", g, iv, w, plan, times, budget=1.0,
+               correction=np.ones(len(plan), np.uint8))
+    assert loud["log"]["s_pred"].max() > 1.0, loud["log"]["s_pred"]
+    assert loud["log"]["fired"].sum() > 0, loud
+
+
+def test_a_correction_stream_of_the_wrong_length_is_refused(tmp_path):
+    """A silently truncated stream would correct the wrong steps.
+
+    The stream is indexed by plan step, so a length mismatch is not a smaller
+    correction but a different one, applied to steps it was not computed for.
+    The binary refuses rather than reading what it can.
+    """
+    g = line_graph(tmp_path)
+    iv = intervals(tmp_path, lit0={c: True for c in range(N)}, transitions={})
+    w = world(tmp_path, all_lit_walk())
+    plan, times = list(range(N)), [float(i) for i in range(N)]
+    out = run(tmp_path, g, iv, w, plan, times, budget=1.0,
+              correction=np.ones(len(plan) - 1, np.uint8), expect_rc=2)
+    assert "correction stream" in out["stderr"], out["stderr"]

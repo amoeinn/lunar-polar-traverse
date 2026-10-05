@@ -93,6 +93,19 @@ struct Ctx {
     // registered replacement come from one binary and one sample.
     bool contra_bounded = true;
     double contra_horizon_h = 0.7250;   // registered, the held-out p99
+    // An optional per-plan-step correction. correction[i] != 0 means "do not
+    // believe the model's lit claim on the step from plan[i] to plan[i+1]";
+    // the forecast then treats that step as dark for its whole duration.
+    //
+    // Empty means absent, and absent must be bit-identical to this file before
+    // the stream existed: that is what the guard test asserts, and the full
+    // 187-plan sample was reproduced against the published P8 figures with no
+    // stream supplied before any correction was scored.
+    //
+    // One direction only. The registered target is the model saying lit where
+    // the world is dark, which is the direction the contradiction rule already
+    // acts on, so the stream cannot assert light where the model says dark.
+    std::vector<uint8_t> correction;
     int replan_limit = 2;
     double replan_cap_s = 30.0;
     std::string planner_bin, scratch, tmpl_params;
@@ -167,11 +180,20 @@ double predict_max_shadow(const Ctx& c) {
     for (int i = c.pos; i + 1 < n; ++i) {
         const double tau = c.edge_travel(c.plan[i], c.plan[i + 1]) * slip;
         if (!std::isfinite(tau)) break;
-        double s_arr = 0.0, s_mx = 0.0;
-        c.iv.shadow_along(c.plan[i], c.plan[i + 1], t, t + tau, s, s_arr, s_mx);
-        s_max = std::max(s_max, s_mx);
-        s = s_arr;
-        t += tau;
+        if (!c.correction.empty() && c.correction[i]) {
+            // The correction marks this step as one where the model's lit
+            // claim is not to be believed, so the whole step accrues darkness
+            // instead of consulting the table it is correcting.
+            s += tau;
+            s_max = std::max(s_max, s);
+            t += tau;
+        } else {
+            double s_arr = 0.0, s_mx = 0.0;
+            c.iv.shadow_along(c.plan[i], c.plan[i + 1], t, t + tau, s, s_arr, s_mx);
+            s_max = std::max(s_max, s_mx);
+            s = s_arr;
+            t += tau;
+        }
         if (i + 1 < static_cast<int>(c.plan_hold.size()))
             hold_at(c.plan[i + 1], c.plan_hold[i + 1] * 1.0);
     }
@@ -257,6 +279,16 @@ int main(int argc, char** argv) {
 
     c.plan = read_raw<int32_t>(p.str("plan_path"),
                                count_of<int32_t>(p.str("plan_path")));
+    if (p.has_str("correction_path")) {
+        const std::string& cp = p.str("correction_path");
+        c.correction = read_raw<uint8_t>(cp, count_of<uint8_t>(cp));
+        if (c.correction.size() != c.plan.size()) {
+            std::fprintf(stderr,
+                         "correction stream has %zu entries for a %zu-step plan\n",
+                         c.correction.size(), c.plan.size());
+            return 2;
+        }
+    }
     const size_t nt = count_of<double>(p.str("traj_t_path"));
     const auto tt = read_raw<double>(p.str("traj_t_path"), nt);
     const auto ts = read_raw<double>(p.str("traj_shadow_path"), nt);
