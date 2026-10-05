@@ -154,6 +154,103 @@ def make_world(probes_world, extra=()):
     return WORK / "lunar_region_ours.sdf"
 
 
+L2PPP_OFFSET_MAX_M = 2.0     # registered: 11x the estimator's worst recovery
+L2PPP_RESID_MAX_M = 5.0      # registered: 14x below the smallest flip signature
+
+
+def offset_minimiser(h, fields):
+    """The shift that best explains the rendered cloud, and its residual.
+
+    Coarse over +-24 m so a half-cell or one-cell index error is bracketed,
+    then refined. The height difference between Gazebo's rendered surface and
+    the bilinear DEM scales with local slope, which raises this curve's floor
+    everywhere without moving its minimum: that is why the offset is
+    measurable on this surface when a per-probe height is not.
+    """
+    def med(dx, dy):
+        o = []
+        for smx, smy, wz in fields:
+            i, j = map_to_cell(smx + dx, smy + dy)
+            o.append(np.abs(wz - bilinear(h, i, j)))
+        return float(np.median(np.concatenate(o)))
+
+    c = [0.0, 0.0]
+    for span, step in ((24.0, 3.0), (3.0, 0.25)):
+        g = sorted((med(c[0] + dx, c[1] + dy), c[0] + dx, c[1] + dy)
+                   for dx in np.arange(-span, span + 1e-9, step)
+                   for dy in np.arange(-span, span + 1e-9, step))
+        c = [g[0][1], g[0][2]]
+    return g[0][1], g[0][2], g[0][0], med(0.0, 0.0)
+
+
+def l2ppp(h):
+    """The third replacement for L2: the offset, not a height.
+
+    Four height instruments failed before this one and all four stand in
+    PLAN.md with their numbers. A height residual cannot be bounded per probe
+    on a surface whose difference from its reference scales with slope, which
+    is measured here at a correlation of +0.6888 with local slope. This
+    measures the position instead, which is what L2 exists to ask.
+    """
+    print("=== L2''': placement measured as an offset, not as a height ===")
+    print("  Four height instruments failed before this one and all four stand")
+    print("  in the record. A height residual cannot be bounded per probe on a")
+    print("  surface whose difference from its reference scales with slope, so")
+    print("  this measures the position instead.")
+    rays = []
+    for k, (mx, my) in enumerate(PROBES):
+        wx, wy = map_to_world(mx, my)
+        rays.append((f"p{k:02d}", float(wx), float(wy),
+                     height_at_map(h, mx, my) + RAY_ALT_M))
+    rayarg = "--rays=" + ";".join(
+        f"{n},{x:.4f},{y:.4f},{z:.4f},{RAY_FOV_RAD:.9f},{RAY_PX},{RAY_PX}"
+        for n, x, y, z in rays)
+    sdf = make_world([], extra=[rayarg])
+    _, clouds = grab_mixed(sdf, 30.0, "dynamic_pose/info",
+                           [f"/ray/{n}/depth/points" for n, _, _, _ in rays])
+    fields = []
+    for nm, cwx, cwy, cwz in rays:
+        msg = clouds.get(f"/ray/{nm}/depth/points")
+        if msg is None:
+            print(f"  {nm}: MISSING from the depth topic")
+            continue
+        wx, wy, wz, _l, good = cloud_to_world(msg, (cwx, cwy, cwz))
+        smx, smy = world_to_map(wx, wy)
+        g = (good & (smx > REGION_OX + 100) & (smx < REGION_OX + 9900)
+             & (smy < REGION_OY - 100) & (smy > REGION_OY - 9900))
+        if g.any():
+            fields.append((smx[g], smy[g], wz[g]))
+    if len(fields) != len(rays):
+        print(f"  NOT RUN: {len(fields)} of {len(rays)} fields returned")
+        return dict(L2ppp=None)
+
+    dx, dy, resid, resid0 = offset_minimiser(h, fields)
+    mag = float(np.hypot(dx, dy))
+    npx = sum(len(f[0]) for f in fields)
+    print(f"\n  {npx} pixels across {len(fields)} fields")
+    print(f"    recovered offset           ({dx:+.3f}, {dy:+.3f}) m, "
+          f"magnitude {mag:.3f} m")
+    print(f"    registered bar on it       at most {L2PPP_OFFSET_MAX_M:.1f} m")
+    print(f"    median |residual| there    {resid:.4f} m")
+    print(f"    median |residual| at zero  {resid0:.4f} m")
+    print(f"    registered bar on residual at most {L2PPP_RESID_MAX_M:.1f} m")
+    a = bool(mag <= L2PPP_OFFSET_MAX_M)
+    b = bool(resid <= L2PPP_RESID_MAX_M)
+    print(f"\n    (a) the offset is within its bar: {a}")
+    print(f"    (b) a shift explains the data, so this is not a flip or a "
+          f"transpose: {b}")
+    print(f"        the signatures a shift cannot remove are 693.652 m for a "
+          f"row flip,")
+    print(f"        764.773 m for a column flip and 69.252 m for a transpose, "
+          f"the smallest;")
+    print(f"        the half-cell error this record found and fixed would show "
+          f"as a")
+    print(f"        14.14 m offset, 7 times bar (a).")
+    ok = bool(a and b)
+    print(f"  L2''' -> {'PASS' if ok else 'FAIL'}")
+    return dict(L2ppp=ok)
+
+
 def probe_bounds(h):
     """Per-probe tolerance for L2'', derived from the DEM with no simulator.
 
@@ -1093,13 +1190,22 @@ def main():
     ap.add_argument("--resume", action="store_true",
                     help="skip parts whose JSON is already on disk")
     args = ap.parse_args()
+    # Split rather than substring-match. "l2pp" in "l2ppp" is true, so
+    # --parts l2ppp silently ran l2pp as well, which is the same class of
+    # quiet wrong answer this whole subtask is about.
+    want = [t.strip() for t in args.parts.split(",") if t.strip()]
+    unknown = [t for t in want if t not in ("c1", "l2pp", "l2ppp", "c2",
+                                            "c3", "c5")]
+    if unknown:
+        raise SystemExit(f"unknown parts: {', '.join(unknown)}")
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     h = dem()
     out = {}
-    for name, fn in (("c1", c1), ("l2pp", l2pp), ("c2", c2),
+    for name, fn in (("c1", c1), ("l2pp", l2pp), ("l2ppp", l2ppp),
+                     ("c2", c2),
                      ("c3", c3), ("c5", c5)):
-        if name in args.parts:
+        if name in want:
             out.update(run_part(name, fn, h, outdir, args.resume))
     print(f"\n=== scored so far ===")
     for k, v in out.items():
