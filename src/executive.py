@@ -109,7 +109,7 @@ def simulate(replay_template, plan, start_h, waits, work):
 
 def run_leg(planner_template, graph_paths, plan, plan_times, holds, world, work,
             budget_h, replan_limit, replan_cap_s, replans_so_far,
-            contra_bounded=True, contra_horizon_h=0.7250):
+            contra_bounded=True, contra_horizon_h=0.7250, correction=None):
     """One pass of the tree over one world."""
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
@@ -131,6 +131,13 @@ def run_leg(planner_template, graph_paths, plan, plan_times, holds, world, work,
         plan_path=str(work / "plan.bin"),
         plan_times_path=str(work / "plan_times.bin"),
         plan_holds_path=str(work / "plan_holds.bin"))
+    if correction is not None:
+        # One byte per plan step; the key is absent when there is no
+        # correction, which the binary's guard test proves is bit-identical to
+        # the run every scored figure in this record came from.
+        (work / "correction.bin").write_bytes(
+            np.asarray(correction, np.uint8).tobytes())
+        p["correction_path"] = str(work / "correction.bin")
     for k in TRAJ_KEYS:
         if k == "offsets":
             continue
@@ -162,7 +169,8 @@ def run_leg(planner_template, graph_paths, plan, plan_times, holds, world, work,
 
 def run_instance(planner_template, replay_template, graph_paths, plan, plan_times,
                  work, budget_h, replan_limit=2, replan_cap_s=30.0,
-                 contra_bounded=True, contra_horizon_h=0.7250):
+                 contra_bounded=True, contra_horizon_h=0.7250,
+                 correction_fn=None):
     """Every leg of one instance, chaining after each adopted replan."""
     work = Path(work)
     indptr = np.fromfile(graph_paths["indptr_path"], np.int64)
@@ -176,9 +184,15 @@ def run_instance(planner_template, replay_template, graph_paths, plan, plan_time
         waits = plan_waits(cur_plan, cur_times, indptr, indices, travel)
         world = simulate(replay_template, cur_plan, start, waits,
                          work / f"leg{i}_world")
+        # Recomputed per leg, because a replan changes the plan the stream is
+        # indexed by. A stream carried over from the previous plan would
+        # correct steps that no longer exist.
+        corr = (None if correction_fn is None
+                else correction_fn(cur_plan, cur_times))
         leg = run_leg(planner_template, graph_paths, cur_plan, cur_times, waits,
                       world, work / f"leg{i}_exec", budget_h, replan_limit,
-                      replan_cap_s, replans, contra_bounded, contra_horizon_h)
+                      replan_cap_s, replans, contra_bounded, contra_horizon_h,
+                      corr)
         legs.append(leg)
         if leg.outcome != "fired_replanned" or leg.new_plan.size < 2:
             break
