@@ -28,6 +28,7 @@ from src.gzmap import HEIGHTMAP_N, PX, REGION_N                     # noqa: E402
 from src.intervals import LitIntervals                              # noqa: E402
 
 OUT = ROOT / "data" / "work" / "gazebo"
+LIT_FLOOR = 0.25           # a lit cell never quantises to zero
 
 
 def sun_unit_at(tag, t_hours):
@@ -86,6 +87,15 @@ def main():
     tex[:REGION_N, :REGION_N] = field
     peak = float(tex.max())
     img = np.zeros_like(tex) if peak <= 0 else tex / peak
+    # A lit cell must not quantise to zero. At this epoch the sun is about a
+    # degree up, so cos(incidence) peaks at 0.214 and the median lit cell is
+    # far dimmer; normalising by the peak and rounding to 8 bits floored most
+    # lit cells to 0 and the texture stopped carrying the mask it exists to
+    # carry. Lit cells are therefore floored at LIT_FLOOR, which keeps the
+    # zero of the texture meaning exactly "our model says this cell is dark".
+    litmap = np.zeros_like(tex, dtype=bool)
+    litmap[:REGION_N, :REGION_N] = lit.reshape(n, n)
+    img = np.where(litmap, np.maximum(img, LIT_FLOOR), 0.0)
     OUT.mkdir(parents=True, exist_ok=True)
     stem = f"illum_{args.tag}_{args.hours:+.4f}h"
     arr = (np.clip(img, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)

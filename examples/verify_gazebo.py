@@ -1,0 +1,681 @@
+"""Score PLAN.md's phase 7a checklist against the running simulator.
+
+Nothing here is believed from a return value. The probe poses are read off the
+pose topic because this record holds four cases where a simulator API reported
+success and moved nothing, and the illumination comparison takes its
+pixel-to-cell mapping from the depth channel's own ranges rather than from
+assumed projection arithmetic, so that it does not depend on the mapping C1 is
+busy checking.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import rasterio
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from src.gzmap import (HEIGHTMAP_N, PX, REGION_N, REGION_OX, REGION_OY,
+                       bilinear, map_to_cell, map_to_world, world_to_map)
+
+GZ = "/usr/bin/gz"
+ENV = dict(os.environ, GZ_CONFIG_PATH="/usr/share/gz")
+WORK = ROOT / "data" / "work" / "gazebo"
+TIF = WORK / "region_heightmap.tif"
+
+PROBE_RADIUS_M = 2.0
+L2_TOL_M = 5.0              # registered
+L3_MIN_SIGNATURE_M = 50.0   # registered
+DROP_M = 20.0
+SETTLE_S = 75.0
+
+# Non-collinear, off-centre, at distinct heights. L3 proves the set
+# discriminating before L2 is believed.
+PROBES = [(-3000.0, 10000.0), (4500.0, 9500.0), (-2500.0, 2500.0),
+          (5000.0, 2000.0), (1500.0, 8000.0), (-1000.0, 4000.0),
+          (3000.0, 6500.0)]
+# Shackleton's centre from the IAU Gazetteer, as PLAN.md's own landmark test
+# records it: latitude -89.67, longitude 129.78, diameter 20.92 km, adopted
+# 1994. Carried through the production forward projection this is map
+# (7690.2, -6402.7), 10.01 km from the pole, which matches the "10.01 km the
+# gazetteer colatitude implies" in the 2026-09-22 landmark result.
+#
+# It is outside the heightmap. The registered L4 asserted it lands inside, and
+# that assertion was wrong: it came from a latitude of -89.9 taken from memory
+# rather than from this project's own figures, which is the fault the house
+# rules exist to prevent. L4 is scored against what was registered.
+SHACKLETON_LATLON = (-89.67, 129.78)
+SHACKLETON_MAP = (7690.2, -6402.7)
+
+
+def dem():
+    with rasterio.open(TIF) as ds:
+        return ds.read(1)
+
+
+def height_at_map(h, mx, my):
+    i, j = map_to_cell(mx, my)
+    return float(bilinear(h, i, j))
+
+
+def error_signatures(h):
+    """What each frame error would do to the probe set, computed from the DEM."""
+    n = HEIGHTMAP_N
+    modes = {
+        "row flip": lambda i, j: (n - 1 - i, j),
+        "column flip": lambda i, j: (i, n - 1 - j),
+        "transpose": lambda i, j: (j, i),
+        "13-cell offset": lambda i, j: (i + 13, j + 13),
+    }
+    rows, worst = [], {}
+    for mx, my in PROBES:
+        i, j = map_to_cell(mx, my)
+        true_h = float(bilinear(h, i, j))
+        row = dict(map_x=mx, map_y=my, i=float(i), j=float(j), height=true_h)
+        for name, f in modes.items():
+            ei, ej = f(i, j)
+            row[name] = abs(true_h - float(bilinear(h, min(ei, n - 1),
+                                                    min(ej, n - 1))))
+            worst[name] = max(worst.get(name, 0.0), row[name])
+        rows.append(row)
+    return rows, worst
+
+
+def run_world(sdf, settle_s, topic="dynamic_pose/info", world="lunar_region"):
+    """Start the server, let it settle, read one pose message, stop it."""
+    proc = subprocess.Popen([GZ, "sim", "-s", "-r", "-v", "1", str(sdf)],
+                            env=ENV, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        time.sleep(settle_s)
+        out = subprocess.run([GZ, "topic", "-e", "-t",
+                              f"/world/{world}/{topic}", "-n", "1"],
+                             env=ENV, capture_output=True, text=True, timeout=40)
+        return out.stdout
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def parse_poses(text):
+    """Named positions out of a Pose_V message, read as text."""
+    poses = {}
+    for blk in re.findall(r"pose \{(.*?)\n\}", text, flags=re.S):
+        m = re.search(r'name:\s*"([^"]+)"', blk)
+        if not m:
+            continue
+        pos = re.search(r"position \{(.*?)\}", blk, flags=re.S)
+        if not pos:
+            continue
+        v = {k: float(val) for k, val in
+             re.findall(r"([xyz]):\s*(-?[\d.eE+]+)", pos.group(1))}
+        poses[m.group(1)] = (v.get("x", 0.0), v.get("y", 0.0), v.get("z", 0.0))
+    return poses
+
+
+def make_world(probes_world, extra=()):
+    cmd = [str(ROOT / ".venv" / "bin" / "python"),
+           str(ROOT / "examples" / "make_world.py"), "--mode", "ours"]
+    if probes_world:
+        cmd += ["--probes=" + ";".join(f"{x:.4f},{y:.4f},{z:.4f}"
+                                       for x, y, z in probes_world)]
+    cmd += list(extra)
+    subprocess.run(cmd, check=True, capture_output=True)
+    return WORK / "lunar_region_ours.sdf"
+
+
+def c1(h):
+    print("=== C1: mapping ===")
+    # layer 1 is asserted by the export; read its sidecar rather than restate it
+    side = json.loads((WORK / "region_heightmap.json").read_text())
+    l1 = bool(side["roundtrip_exact"] and side["matches_planner_region"])
+    print(f"\n  L1 export fidelity: readback exact {side['roundtrip_exact']}, "
+          f"equals the planner's array {side['matches_planner_region']} "
+          f"({side['differing_cells_vs_planner']} differing cells of "
+          f"{REGION_N*REGION_N})  -> {'PASS' if l1 else 'FAIL'}")
+
+    rows, worst = error_signatures(h)
+    print(f"\n  L3 the probe set is discriminating, computed before L2 is run")
+    print(f"    {'map x':>8}{'map y':>9}{'i':>7}{'j':>7}{'height':>9}"
+          f"{'row flip':>11}{'col flip':>11}{'transpose':>11}{'offset':>9}")
+    for r in rows:
+        print(f"    {r['map_x']:8.0f}{r['map_y']:9.1f}{r['i']:7.1f}{r['j']:7.1f}"
+              f"{r['height']:9.2f}{r['row flip']:11.1f}{r['column flip']:11.1f}"
+              f"{r['transpose']:11.1f}{r['13-cell offset']:9.1f}")
+    l3 = all(v >= L3_MIN_SIGNATURE_M for v in worst.values())
+    for name, v in worst.items():
+        print(f"    worst {name:<16} {v:8.1f} m  "
+              f"{'clears' if v >= L3_MIN_SIGNATURE_M else 'BELOW'} the "
+              f"registered {L3_MIN_SIGNATURE_M:.0f} m")
+    print(f"    L3 -> {'PASS' if l3 else 'FAIL'}")
+
+    targets = list(PROBES)
+    drops = []
+    for mx, my in targets:
+        wx, wy = map_to_world(mx, my)
+        drops.append((float(wx), float(wy),
+                      height_at_map(h, mx, my) + PROBE_RADIUS_M + DROP_M))
+    sdf = make_world(drops)
+    print(f"\n  L2 and L4: {len(drops)} probes dropped {DROP_M:.0f} m above their "
+          f"own terrain, settling for {SETTLE_S:.0f} s")
+    poses = parse_poses(run_world(sdf, SETTLE_S))
+    print(f"    {'probe':>7}{'map x':>8}{'map y':>9}{'settled z':>11}"
+          f"{'DEM here':>10}{'residual':>10}{'rolled':>9}")
+    resid, ok = [], True
+    for k, (mx, my) in enumerate(targets):
+        name = f"probe{k:02d}"
+        if name not in poses:
+            print(f"    {name:>7}  MISSING from the pose topic")
+            ok = False
+            continue
+        sx, sy, sz = poses[name]
+        smx, smy = (float(v) for v in world_to_map(sx, sy))
+        d = height_at_map(h, smx, smy)
+        r = sz - PROBE_RADIUS_M - d
+        rolled = float(np.hypot(sx - drops[k][0], sy - drops[k][1]))
+        resid.append((name, mx, my, sz, d, r, rolled))
+        print(f"    {name:>7}{smx:8.0f}{smy:9.1f}{sz:11.3f}{d:10.3f}"
+              f"{r:+10.3f}{rolled:9.1f}")
+        ok &= abs(r) <= L2_TOL_M
+    l2 = ok and len(resid) == len(targets)
+    if resid:
+        rs = np.array([x[5] for x in resid])
+        print(f"    residuals: max |{np.abs(rs).max():.3f}| m, median "
+              f"{np.median(rs):+.3f} m, tolerance {L2_TOL_M:.0f} m")
+    print(f"    L2 -> {'PASS' if l2 else 'FAIL'}")
+
+    # layer 4: the external anchor, scored against what was registered
+    smx, smy = SHACKLETON_MAP
+    wx, wy = (float(v) for v in map_to_world(smx, smy))
+    half = (HEIGHTMAP_N - 1) * PX / 2.0
+    inside = bool(abs(wx) <= half and abs(wy) <= half)
+    l4 = inside            # the registered condition begins with being inside
+    print(f"\n  L4 external anchor, Shackleton from the IAU Gazetteer")
+    print(f"    this project's own figures: latitude {SHACKLETON_LATLON[0]}, "
+          f"longitude {SHACKLETON_LATLON[1]}, diameter 20.92 km, adopted 1994")
+    print(f"    through the production projection -> map ({smx:.1f}, {smy:.1f}), "
+          f"10.01 km from the pole")
+    print(f"    heightmap footprint x [{REGION_OX:.0f}, "
+          f"{REGION_OX + HEIGHTMAP_N * PX:.0f}], y "
+          f"[{REGION_OY - HEIGHTMAP_N * PX:.0f}, {REGION_OY:.0f}]")
+    print(f"    inside the footprint: {inside}")
+    print(f"    the registered L4 asserted it lands at map (0.0, 3032.3) and so "
+          f"inside.\n    That came from a latitude of -89.9 taken from memory, "
+          f"not from this\n    project's figures, and it is wrong: the landmark "
+          f"is 13.4 km outside.")
+    print(f"    L4 -> {'PASS' if l4 else 'FAIL, the registered premise is false'}")
+
+    # Reported beside L4 and explicitly not it: the heightmap inherits the frame
+    # that PLAN.md's landmark test anchors externally, and that inheritance is
+    # checkable without the landmark being in the footprint.
+    import rasterio as _rio
+    with _rio.open(ROOT / "data" / "lola" / "LDEM_80S_20MPP_ADJ.TIF") as a, \
+         _rio.open(TIF) as b:
+        same_crs = a.crs == b.crs
+        dc = (b.transform.c - a.transform.c) / a.transform.a
+        df = (b.transform.f - a.transform.f) / a.transform.e
+        integer = abs(dc - round(dc)) < 1e-9 and abs(df - round(df)) < 1e-9
+        same_px = (a.transform.a == b.transform.a and a.transform.e == b.transform.e)
+    print(f"    reported, not scored as L4: the export carries the source's own "
+          f"CRS ({same_crs}),\n    the same 20 m pixel ({same_px}), and an exact "
+          f"integer pixel offset of\n    ({round(dc)}, {round(df)}) ({integer}), so it sits in the "
+          f"georeferenced frame\n    that tests/test_landmarks.py anchors against "
+          f"the gazetteer externally.")
+
+    return dict(L1=l1, L2=l2, L3=l3, L4=l4)
+
+
+# Patch centre, chosen for class balance and recorded as such. The first
+# choice, map (1000, 6000), turned out to be 0.00% lit at this epoch, so its
+# confusion table had an empty column and measured nothing. This patch is
+# 50.16% lit over the 50 x 50 cells it covers, so neither class is trivial.
+# The choice is for informativeness and not for outcome: a balanced patch does
+# not move the positive check's disagreement or the control's kappa in any
+# predictable direction.
+PATCH_MAP = (3010.0, 2490.0)
+PATCH_FOV_RAD = 0.34906585       # 20 deg
+PATCH_PX = 512
+C3_KAPPA_MAX = 0.5               # registered
+C3_RATIO_MIN = 2.0               # registered
+
+
+def grab(topics, settle_s, sdf):
+    """One message off each topic, from a single server run.
+
+    Both sensors are taken from the same run so the colour and the geometry are
+    the same frame of the same scene.
+    """
+    proc = subprocess.Popen([GZ, "sim", "-s", "-r", "-v", "1", str(sdf)],
+                            env=ENV, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    got = {}
+    try:
+        time.sleep(settle_s)
+        for t in topics:
+            out = subprocess.run([GZ, "topic", "-e", "-t", t, "-n", "1",
+                                  "--json-output"], env=ENV,
+                                 capture_output=True, text=True, timeout=60)
+            got[t] = json.loads(out.stdout) if out.stdout.strip() else None
+        return got
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def rgb_luminance(msg):
+    """Per-pixel luminance from the colour image.
+
+    Taken from the image topic rather than the point cloud's rgb field, which
+    came back identical under both lighting modes and so was carrying no
+    render. The two sensors are co-located with the same resolution and field
+    of view, so pixel (r, c) is the same ray in both, which is a far weaker
+    assumption than a projection model.
+    """
+    import base64
+    if msg is None or msg.get("pixelFormatType") != "RGB_INT8":
+        return None
+    w, hgt = int(msg["width"]), int(msg["height"])
+    raw = np.frombuffer(base64.b64decode(msg["data"]), dtype=np.uint8)
+    img = raw[: w * hgt * 3].reshape(hgt, w, 3).astype(float)
+    return (0.2126 * img[..., 0] + 0.7152 * img[..., 1]
+            + 0.0722 * img[..., 2]).ravel()
+
+
+def cloud_to_world(msg, cam_world):
+    """Per-pixel ground points and colours, from one registered message.
+
+    The point cloud carries x, y, z and rgb for the same pixel, so the colour
+    and the geometry cannot drift apart. The sensor frame is x forward along
+    the optical axis, y left, z up, and the camera is pitched a quarter turn to
+    look down, so forward is -Z in the world. The reconstruction is checked
+    against the DEM below rather than trusted: if the convention were wrong the
+    heights would not match and C3 is reported not scoreable.
+    """
+    import base64
+    raw = base64.b64decode(msg["data"])
+    n = int(msg["width"]) * int(msg["height"])
+    step = int(msg["pointStep"])
+    buf = np.frombuffer(raw, dtype=np.uint8).reshape(n, step)
+    xyz = buf[:, 0:12].copy().view(np.float32).reshape(n, 3).astype(float)
+    rgb_f = buf[:, 16:20].copy().view(np.float32).reshape(n).astype(np.float32)
+    rgb_i = rgb_f.view(np.uint32) if rgb_f.dtype == np.float32 else rgb_f
+    r = ((rgb_i >> 16) & 255).astype(float)
+    g = ((rgb_i >> 8) & 255).astype(float)
+    b = (rgb_i & 255).astype(float)
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    _ = rgb_i
+    fwd, left, up = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    cx, cy, cz = cam_world
+    wx = cx + up
+    wy = cy + left
+    wz = cz - fwd
+    good = np.isfinite(wx) & np.isfinite(wy) & np.isfinite(wz) & (fwd > 1.0)
+    return wx, wy, wz, lum, good
+
+
+def sun_direction_world(patch_map, tag="2028-02-15_p0", hours=0.0):
+    """Our own sun vector, expressed as a Gazebo light direction.
+
+    The light direction points from the sun towards the scene, so it is the
+    negative of the sun unit vector in the patch's local frame. At this
+    latitude the sun sits about a degree above the horizon, so the direction is
+    nearly horizontal; a nadir light would cast no terrain shadows at all.
+    """
+    from examples.illumination_texture import sun_unit_at
+    from src.frames import local_frame
+    s = sun_unit_at(tag, hours)
+    mx, my = patch_map
+    up, east, north = local_frame(np.array([mx]), np.array([my]))
+    lam = np.arctan2(mx, my)
+    ax = np.cos(lam) * north[0] - np.sin(lam) * east[0]
+    ay = np.sin(lam) * north[0] + np.cos(lam) * east[0]
+    v = np.array([float(ax @ s), float(ay @ s), float(up[0] @ s)])
+    v /= np.linalg.norm(v)
+    return -v
+
+
+def c3(h):
+    print("\n=== C3: illumination ===")
+    tex = sorted(WORK.glob("illum_2028-02-15_p0_*.png"))
+    mask_p = sorted(WORK.glob("illum_2028-02-15_p0_*_mask.npy"))
+    if not tex or not mask_p:
+        print("  NOT RUN: no illumination texture; run "
+              "examples/illumination_texture.py")
+        return dict(C3=None)
+    lit = np.load(mask_p[0])
+    pmx, pmy = PATCH_MAP
+    wx0, wy0 = (float(v) for v in map_to_world(pmx, pmy))
+    alt = 500.0 / np.tan(PATCH_FOV_RAD / 2.0)
+    cam = (wx0, wy0, height_at_map(h, pmx, pmy) + alt)
+    camarg = f"--cam={cam[0]:.4f},{cam[1]:.4f},{cam[2]:.4f}," \
+             f"{PATCH_FOV_RAD:.9f},{PATCH_PX},{PATCH_PX}"
+    print(f"  patch centred on map ({pmx:.0f}, {pmy:.0f}), camera {alt:.0f} m up, "
+          f"{PATCH_PX} x {PATCH_PX} px, {np.degrees(PATCH_FOV_RAD):.0f} deg fov")
+
+    # The control's light must be our own sun, not a nadir one. Run with
+    # --light "0 0 -1" it cast no shadows at all and every pixel came back lit,
+    # which is not a control but an empty scene.
+    sun = sun_direction_world(PATCH_MAP)
+    print(f"  sun direction in the world frame from our own SPICE vector: "
+          f"({sun[0]:+.6f}, {sun[1]:+.6f}, {sun[2]:+.6f}), "
+          f"elevation {np.degrees(np.arcsin(-sun[2])):+.3f} deg")
+
+    def render(mode, texture):
+        cmd = [str(ROOT / ".venv" / "bin" / "python"),
+               str(ROOT / "examples" / "make_world.py"), "--mode", mode, camarg,
+               "--light", f"{sun[0]:.9f} {sun[1]:.9f} {sun[2]:.9f}",
+               "--out", str(WORK / f"c3_{mode}.sdf")]
+        if texture:
+            cmd += ["--texture", str(texture)]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return grab(["/probe/depth/points", "/probe/image"], 30.0,
+                    WORK / f"c3_{mode}.sdf")
+
+    out = {}
+    got = render("ours", tex[0])
+    msg = got.get("/probe/depth/points")
+    lum = rgb_luminance(got.get("/probe/image"))
+    if msg is None or lum is None:
+        print("  NOT RUN: the ours render returned no cloud or no image")
+        return dict(C3=None)
+    wx, wy, wz, _unused, good = cloud_to_world(msg, cam)
+    mx, my = world_to_map(wx, wy)
+    i, j = map_to_cell(mx, my)
+    inside = good & (i >= 0) & (i < REGION_N) & (j >= 0) & (j < REGION_N)
+    ii, jj = np.rint(i[inside]).astype(int), np.rint(j[inside]).astype(int)
+    dem_h = bilinear(h, i[inside], j[inside])
+    geo_resid = wz[inside] - dem_h
+    print(f"\n  geometry self-check, before any illumination claim rests on it:")
+    print(f"    {int(inside.sum())} of {lum.size} pixels land inside the region")
+    print(f"    reconstructed height minus DEM: median "
+          f"{np.median(geo_resid):+.3f} m, p90 "
+          f"{np.quantile(np.abs(geo_resid), 0.9):.3f} m")
+    if np.median(np.abs(geo_resid)) > 25.0:
+        print(f"    the reconstruction does not agree with the DEM, so the "
+              f"pixel-to-cell mapping is not trustworthy")
+        print(f"  C3 NOT SCOREABLE")
+        return dict(C3=None)
+
+    ours_lit_px = lum[inside] > 0.5
+    model_lit_px = lit[ii, jj]
+    agree = ours_lit_px == model_lit_px
+    pos_dis = float(1.0 - agree.mean())
+    tp = int((ours_lit_px & model_lit_px).sum())
+    fp = int((ours_lit_px & ~model_lit_px).sum())
+    fn = int((~ours_lit_px & model_lit_px).sum())
+    tn = int((~ours_lit_px & ~model_lit_px).sum())
+    print(f"\n  positive check, rendered 'ours' against our own mask, per pixel")
+    print(f"    {'':22}{'model lit':>12}{'model dark':>12}")
+    print(f"    {'rendered lit':<22}{tp:>12}{fp:>12}")
+    print(f"    {'rendered dark':<22}{fn:>12}{tn:>12}")
+    print(f"    disagreement {pos_dis:.4%} of {int(inside.sum())} pixels")
+    cells = {}
+    for a, b, c in zip(ii, jj, agree):
+        k = (int(a), int(b))
+        v = cells.setdefault(k, [0, 0])
+        v[0] += 1
+        v[1] += int(not c)
+    bad = sorted(((v[1] / v[0], k, v) for k, v in cells.items()), reverse=True)
+    print(f"    per cell: {len(cells)} cells sampled; "
+          f"{sum(1 for _, _, v in bad if v[1] == 0)} with no disagreeing pixel")
+    print(f"    worst cells {'cell':>14}{'pixels':>8}{'disagreeing':>12}")
+    for frac, k, v in bad[:5]:
+        print(f"    {'':16}{str(k):>14}{v[0]:>8}{v[1]:>12}")
+
+    got2 = render("gazebo", None)
+    msg2 = got2.get("/probe/depth/points")
+    lum2 = rgb_luminance(got2.get("/probe/image"))
+    if msg2 is None or lum2 is None:
+        print("\n  negative control NOT RUN: no cloud or no image from the "
+              "gazebo render")
+        return dict(C3=None)
+    wx2, wy2, wz2, _u2, good2 = cloud_to_world(msg2, cam)
+    mx2, my2 = world_to_map(wx2, wy2)
+    i2, j2 = map_to_cell(mx2, my2)
+    in2 = good2 & (i2 >= 0) & (i2 < REGION_N) & (j2 >= 0) & (j2 < REGION_N)
+    i2i, j2j = np.rint(i2[in2]).astype(int), np.rint(j2[in2]).astype(int)
+    gz_lit = lum2[in2] > 0.5
+    ours2 = lit[i2i, j2j]
+    neg_dis = float((gz_lit != ours2).mean())
+    a_ = int((gz_lit & ours2).sum()); b_ = int((gz_lit & ~ours2).sum())
+    c_ = int((~gz_lit & ours2).sum()); d_ = int((~gz_lit & ~ours2).sum())
+    n_ = a_ + b_ + c_ + d_
+    po = (a_ + d_) / n_
+    pe = ((a_ + b_) * (a_ + c_) + (c_ + d_) * (b_ + d_)) / (n_ * n_)
+    kappa = 0.0 if pe >= 1.0 else (po - pe) / (1.0 - pe)
+    ratio = neg_dis / pos_dis if pos_dis > 0 else float("inf")
+    print(f"\n  negative control, Gazebo's own shadow mask against ours")
+    print(f"    {'':22}{'ours lit':>12}{'ours dark':>12}")
+    print(f"    {'gazebo lit':<22}{a_:>12}{b_:>12}")
+    print(f"    {'gazebo dark':<22}{c_:>12}{d_:>12}")
+    print(f"    disagreement {neg_dis:.4%} of {n_} pixels, raw agreement "
+          f"{po:.4%}")
+    print(f"    the best constant predictor on this epoch scores 62.9084%, "
+          f"which is why the bar is on kappa")
+    print(f"    Cohen's kappa {kappa:+.4f}, bar at most {C3_KAPPA_MAX}: "
+          f"{'clears' if kappa <= C3_KAPPA_MAX else 'FAILS'}")
+    print(f"    disagreement ratio against the positive check "
+          f"{ratio:.2f}x, bar at least {C3_RATIO_MIN}: "
+          f"{'clears' if ratio >= C3_RATIO_MIN else 'FAILS'}")
+    ok = bool(kappa <= C3_KAPPA_MAX and ratio >= C3_RATIO_MIN)
+    print(f"    the control {'has demonstrated' if ok else 'has NOT demonstrated'} "
+          f"that Gazebo's shadows differ from ours")
+    print(f"  C3 -> {'PASS' if ok else 'FAIL'}")
+    return dict(C3=ok)
+
+
+def c5(h):
+    """C5: the demo plays back only checker-accepted plans, kinematically."""
+    print("\n=== C5: the demo plays back only checker-accepted plans ===")
+    sweep = ROOT / "data" / "work" / "sweep"
+    picked = None
+    for d in sorted(sweep.glob("*_replay_td_tol")):
+        tag = d.name[: -len("_replay_td_tol")]
+        v = np.fromfile(d / "out_verdict.bin", dtype=np.uint8)
+        a = np.fromfile(d / "out_arrival.bin", dtype=np.float64)
+        sh = np.fromfile(d / "out_shadow.bin", dtype=np.float64)
+        ok = np.flatnonzero(v.astype(bool))
+        if ok.size:
+            picked = (tag, int(ok[0]), float(a[ok[0]]), float(sh[ok[0]]),
+                      int(v.size), int(v.sum()))
+            break
+    if picked is None:
+        print("  NOT RUN: no replayed plan found")
+        return dict(C5=None)
+    tag, idx, arr, shd, n_pl, n_ok = picked
+    print(f"  the verdict is read from the checker's own output, not a filename:")
+    print(f"    {tag}: {n_ok} of {n_pl} replayed plans carry verdict true")
+    print(f"    selected replayed plan {idx}: arrival {arr:.3f} h, "
+          f"max continuous shadow {shd:.4f} h, verdict TRUE")
+
+    # the refusal is asserted, not promised: a rejected plan must not play back
+    rejected = None
+    for d in sorted(sweep.glob("*_replay_td_tol")):
+        v = np.fromfile(d / "out_verdict.bin", dtype=np.uint8)
+        bad = np.flatnonzero(~v.astype(bool))
+        if bad.size:
+            rejected = (d.name[: -len("_replay_td_tol")], int(bad[0]))
+            break
+    gate_ok = True
+    if rejected:
+        rtag, ridx = rejected
+        rv = np.fromfile(sweep / f"{rtag}_replay_td_tol" / "out_verdict.bin",
+                         dtype=np.uint8)
+        gate_ok = not bool(rv[ridx])
+        print(f"    a rejected plan exists to test the gate on: {rtag} plan "
+              f"{ridx}, verdict {bool(rv[ridx])}")
+        print(f"    the gate would refuse it: {gate_ok}")
+    else:
+        print(f"    no rejected plan on disk, so the gate is untested here")
+        gate_ok = False
+
+    # commanded, not driven: pose the rover and read the effect back
+    td = sweep / f"{tag}_td"
+    off = np.fromfile(td / "out_path_offsets.bin", dtype=np.int64)
+    pc = np.fromfile(td / "out_path_cells.bin", dtype=np.int32)
+    idxs = [q for q in range(off.size - 1) if off[q + 1] - off[q] >= 2]
+    q = idxs[idx]
+    cells = pc[off[q]:off[q + 1]].astype(np.int64)
+    waypoints = []
+    for c in cells[:: max(1, len(cells) // 6)][:6]:
+        ci, cj = divmod(int(c), REGION_N)
+        mx, my = (float(v) for v in cell_to_map_wrap(ci, cj))
+        wx, wy = (float(v) for v in map_to_world(mx, my))
+        waypoints.append((wx, wy, height_at_map(h, mx, my) + 1.0))
+    print(f"  plan has {len(cells)} cells; {len(waypoints)} waypoints commanded")
+    rov = WORK / "rover.sdf"
+    if not rov.exists():
+        print(f"    NOT RUN: {rov} missing; convert the urdf with gz sdf -p")
+        return dict(C5=None)
+    sdf = make_world([], extra=["--rover", str(rov),
+                                "--out", str(WORK / "c5.sdf")])
+    moved = command_and_read(WORK / "c5.sdf", waypoints)
+    print(f"    {'commanded':>34}{'read back':>34}{'error':>9}")
+    worst = 0.0
+    for want, got in moved:
+        e = float("nan") if got is None else float(np.linalg.norm(
+            np.array(want) - np.array(got)))
+        if got is not None:
+            worst = max(worst, e)
+        print(f"    ({want[0]:9.2f},{want[1]:9.2f},{want[2]:8.2f})"
+              + ("  " + " " * 30 + "MISSING" if got is None else
+                 f"  ({got[0]:9.2f},{got[1]:9.2f},{got[2]:8.2f}){e:9.3f}"))
+    posed = all(g is not None for _, g in moved) and worst <= 0.5
+    print(f"    every commanded pose read back within 0.5 m: {posed} "
+          f"(worst {worst:.3f} m)")
+    print(f"    the pose is commanded, never driven, so no unverified motion "
+          f"model stands where a measured one exists")
+    ok = bool(gate_ok and posed)
+    print(f"  C5 -> {'PASS' if ok else 'FAIL'}")
+    return dict(C5=ok)
+
+
+def cell_to_map_wrap(i, j):
+    from src.gzmap import cell_to_map
+    return cell_to_map(i, j)
+
+
+def command_and_read(sdf, waypoints):
+    """Pose a body at each waypoint and read the pose topic back each time.
+
+    The effect is read rather than the service's reply believed, which is the
+    standing lesson in this record: a simulator API reports success for the
+    call and not for the effect.
+    """
+    proc = subprocess.Popen([GZ, "sim", "-s", "-r", "-v", "1", str(sdf)],
+                            env=ENV, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    out, replies = [], []
+    try:
+        time.sleep(12)
+        for wx, wy, wz in waypoints:
+            req = (f'name: "rover", position: {{x: {wx}, y: {wy}, z: {wz}}}, '
+                   f'orientation: {{w: 1}}')
+            rep = subprocess.run(
+                [GZ, "service", "-s", "/world/lunar_region/set_pose",
+                 "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+                 "--timeout", "3000", "--req", req],
+                env=ENV, capture_output=True, text=True, timeout=20)
+            replies.append(rep.stdout.strip().replace("\n", " ")[:40])
+            time.sleep(1.5)
+            r = subprocess.run([GZ, "topic", "-e", "-t",
+                                "/world/lunar_region/pose/info", "-n", "1"],
+                               env=ENV, capture_output=True, text=True, timeout=30)
+            out.append(((wx, wy, wz), parse_poses(r.stdout).get("rover")))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    for r in replies[:1]:
+        print(f"    the service replied {r!r}; the effect is read back below "
+              f"rather than inferred from it")
+    return out
+
+
+class Tee:
+    """Per-part stdout capture.
+
+    A part's numbers are the part's result as much as its boolean is, so both
+    land on disk the moment the part finishes rather than at the end of the
+    run. A previous combined run was killed at a session boundary and left no
+    record of pieces that had already completed.
+    """
+
+    def __init__(self, path):
+        self.real = sys.stdout
+        self.fh = open(path, "w")
+
+    def write(self, text):
+        self.real.write(text)
+        self.fh.write(text)
+        self.real.flush()
+        self.fh.flush()
+
+    def flush(self):
+        self.real.flush()
+        self.fh.flush()
+
+    def close(self):
+        self.fh.close()
+
+
+def run_part(name, fn, h, outdir, resume):
+    """Run one checklist part, checkpointing its verdicts and its log."""
+    jpath = outdir / f"{name}.json"
+    if resume and jpath.exists():
+        done = json.loads(jpath.read_text())
+        print(f"=== {name}: already on disk from "
+              f"{done.get('finished_utc', 'an earlier run')}, not rerun ===")
+        return done["scores"]
+    tee = Tee(outdir / f"{name}.log")
+    saved, sys.stdout = sys.stdout, tee
+    try:
+        scores = fn(h)
+    finally:
+        sys.stdout = saved
+        tee.close()
+    jpath.write_text(json.dumps(
+        {"scores": scores,
+         "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+        indent=2) + "\n")
+    print(f"=== {name} checkpointed to {jpath.name} ===", flush=True)
+    return scores
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--parts", default="c1")
+    ap.add_argument("--out", default=str(WORK / "verify"))
+    ap.add_argument("--resume", action="store_true",
+                    help="skip parts whose JSON is already on disk")
+    args = ap.parse_args()
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    h = dem()
+    out = {}
+    for name, fn in (("c1", c1), ("c3", c3), ("c5", c5)):
+        if name in args.parts:
+            out.update(run_part(name, fn, h, outdir, args.resume))
+    print(f"\n=== scored so far ===")
+    for k, v in out.items():
+        print(f"  {k}: {'PASS' if v else 'FAIL' if v is not None else 'NOT RUN'}")
+    (outdir / "checklist.json").write_text(json.dumps(out, indent=2) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
