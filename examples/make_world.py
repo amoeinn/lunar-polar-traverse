@@ -212,6 +212,18 @@ def build(side, mode, texture, normal, pos_z, light_dir, probes, cam, convention
       <diffuse>1 1 1 1</diffuse><specular>0 0 0 1</specular>
       <direction>{dx:.9f} {dy:.9f} {dz:.9f}</direction>
     </light>"""
+    # Every file:// URI is written absolute. A relative one resolves against
+    # whatever working directory the simulator happens to be started from, so
+    # a world generated here loaded from the repo root and failed anywhere
+    # else with "uri [...] could not be resolved" and no world at all. The
+    # heightmap and the normal map were already absolute by accident, one
+    # coming from the sidecar and the other generated into an absolute
+    # directory, so only a user-supplied --texture was relative and every
+    # scripted run passed an absolute one. That is why nothing caught it until
+    # the scene was launched by hand from a home directory.
+    side = Path(side).resolve()
+    texture = Path(texture).resolve()
+    normal = Path(normal).resolve()
     cam_sdf = camera_rig(*cam) if cam else ""
     cam_sdf += "".join(ray_rig(*r) for r in rays)
     cam_sdf += "".join(target_model(*t) for t in targets)

@@ -383,3 +383,80 @@ def test_the_rover_pose_reaches_the_world_rather_than_only_being_computed():
     body = body[:body.index("</model>")]
     assert f"<pose>{want[0]} {want[1]} {want[2]} 0 0 0</pose>" in body, body[:300]
     assert "<pose>0.0 0.0 2000.0 0 0 0</pose>" not in body
+
+
+def _generated_world(tmp_path, texture_rel):
+    """A world built with a RELATIVE texture path, which is the trigger."""
+    import examples.make_world as MW
+    return MW.build(texture_rel, "ours", texture_rel, texture_rel, 0.0,
+                    (0, 0, -1), [], None, "vertices", 2296.6073)
+
+
+def test_every_file_uri_in_the_world_is_absolute():
+    """Protects the world against being loadable only from the repo root.
+
+    A relative file:// URI resolves against whatever working directory the
+    simulator was started from. The heightmap and normal map were absolute by
+    accident, one from the sidecar and one generated into an absolute
+    directory, so only a user-supplied --texture came out relative. Every
+    scripted run passed an absolute path, so the suite and all five
+    verification parts passed while the world could not be opened from
+    anywhere but the repo root: launching it by hand from a home directory
+    failed with "uri [file://data/work/...] could not be resolved" and no
+    world at all.
+
+    Built here with a deliberately relative path, because passing an absolute
+    one would make the assertion vacuous.
+    """
+    import re
+    sdf = _generated_world(None, "data/work/gazebo/some_texture.png")
+    uris = re.findall(r"<(?:uri|diffuse|normal)>file://([^<]*)</", sdf)
+    assert uris, "no file:// URIs found, so this test is asserting nothing"
+    bad = [u for u in uris if not u.startswith("/")]
+    assert not bad, f"relative file:// URIs: {bad}"
+
+
+@pytest.mark.skipif(not Path("/usr/bin/gz").exists(), reason="gz is not present")
+def test_the_generated_world_loads_from_a_different_working_directory():
+    """Loads the world in the simulator from outside the repo, as Ali did.
+
+    The string assertion above can be satisfied by a path that is absolute and
+    wrong. This one starts the server on the generated world from a temporary
+    directory and fails on the parser's own resolve error, which is the
+    failure that was actually hit.
+    """
+    import os
+    import subprocess
+    import tempfile
+    import examples.make_world as MW
+    tif = ROOT / "data" / "work" / "gazebo" / "region_heightmap.tif"
+    if not tif.exists():
+        pytest.skip("heightmap not exported")
+    tex = sorted((ROOT / "data" / "work" / "gazebo").glob("illum_*h.png"))
+    if not tex:
+        pytest.skip("no illumination texture generated")
+    # relative paths, as the failing command line supplied them
+    rel_tif = os.path.relpath(tif, ROOT)
+    rel_tex = os.path.relpath(tex[0], ROOT)
+    rel_nrm = os.path.relpath(MW.flat_normal_png(
+        ROOT / "data" / "work" / "gazebo" / "flat_normal.png"), ROOT)
+    cwd = os.getcwd()
+    try:
+        os.chdir(ROOT)
+        sdf = MW.build(rel_tif, "ours", rel_tex, rel_nrm, 0.0, (0, 0, -1),
+                       [], None, "vertices", 2296.6073)
+    finally:
+        os.chdir(cwd)
+    with tempfile.TemporaryDirectory() as td:
+        world = Path(td) / "w.sdf"
+        world.write_text(sdf)
+        env = dict(os.environ, GZ_CONFIG_PATH="/usr/share/gz")
+        r = subprocess.run(["/usr/bin/gz", "sim", "-s", "-r",
+                            "--iterations", "1", str(world)],
+                           cwd=td, env=env, capture_output=True, text=True,
+                           timeout=180)
+    out = r.stdout + r.stderr
+    assert "could not be resolved" not in out, (
+        "the world does not load outside the repo root:\n"
+        + "\n".join(l for l in out.splitlines() if "resolve" in l.lower()))
+    assert "Failed to load a world" not in out, out[-600:]
