@@ -251,6 +251,285 @@ def l2ppp(h):
     return dict(L2ppp=ok)
 
 
+ROVER_PATCH_MAP = (3010.0, 2490.0)   # registered: the patch already characterised
+ROVER_ALT_M = 20.0                   # registered
+TARGET_RANGE_M = 10.000              # registered
+TARGET_RADIUS_M = 0.5
+MAST_Z_M = 2.45                      # clearance + body_h + mast_h, from the xacro
+NAV_BASELINE_M = 0.424               # SOURCE [P], PDS context product navcam.msl
+NAV_FOV_DEG = 45.0                   # SOURCE [M]
+HAZ_FOV_DEG = 124.0                  # SOURCE [H]
+CAM_PX = 1024
+S1_FOV_TOL_DEG = 0.01                # registered
+S2_DISPARITY_TOL_PX = 2.0            # registered
+S3_MEDIAN_MAX_M = 1.5                # registered: the predicted maximum
+S3_P90_MAX_M = 3.0                   # registered
+S3_GRAZE_MIN_DEG = 15.0              # registered
+LIDAR_VFOV_DEG = 42.4                # SOURCE [O]
+LIDAR_ROWS, LIDAR_COLS = 64, 1024    # SOURCE [O]
+LIDAR_RANGE_M = 90.0                 # SOURCE [O], 10% target
+# The open slope-dependent rendering term, measured 2026-10-04 over 458752
+# pixels. A GPU lidar reads the rendered surface, so S3's tolerance carries it.
+SLOPE_BANDS = ((0.0, 2.9, 0.0577), (2.9, 5.7, 0.3919), (5.7, 11.3, 0.2723),
+               (11.3, 19.3, 0.0626), (19.3, 31.0, 0.2624), (31.0, 90.0, 3.0844))
+
+
+def band_term(slope_deg):
+    for lo, hi, v in SLOPE_BANDS:
+        if lo <= slope_deg < hi:
+            return v
+    return SLOPE_BANDS[-1][2]
+
+
+def decode_image(msg):
+    """An RGB_INT8 image message to a float luminance array."""
+    import base64
+    if msg is None:
+        return None
+    w, hgt = int(msg["width"]), int(msg["height"])
+    raw = base64.b64decode(msg["data"])
+    a = np.frombuffer(raw, dtype=np.uint8)
+    if a.size < w * hgt * 3:
+        return None
+    a = a[:w * hgt * 3].reshape(hgt, w, 3).astype(float)
+    return 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+
+
+def march_dem(h, origin, direction, rmax, step=0.25):
+    """First DEM intersection along a ray, by marching. Returns range or None."""
+    r = np.arange(1.0, rmax, step)
+    px = origin[0] + direction[0] * r
+    py = origin[1] + direction[1] * r
+    pz = origin[2] + direction[2] * r
+    mx, my = world_to_map(px, py)
+    i, j = map_to_cell(mx, my)
+    ok = (i >= 0) & (i < REGION_N) & (j >= 0) & (j < REGION_N)
+    if not ok.any():
+        return None, None, None
+    terr = bilinear(h, np.clip(i, 0, REGION_N - 1), np.clip(j, 0, REGION_N - 1))
+    below = (pz <= terr) & ok
+    if not below.any():
+        return None, None, None
+    k = int(np.argmax(below))
+    return float(r[k]), float(mx[k]), float(my[k])
+
+
+def c4x(h):
+    """C4 exercised: every sensor scored against known geometry."""
+    print("=== C4 exercised: the five sensors against known geometry ===")
+    # Convert from the xacro inside the run. A stale rover.sdf converted
+    # before the sourcing pass declared a 120 m range and a 45 deg vertical
+    # field of view, so the scan was scored against figures the model no
+    # longer held. The conversion is part of the measurement.
+    rover = WORK / "rover.sdf"
+    conv = subprocess.run(
+        ["bash", "-lc",
+         "source /opt/ros/jazzy/setup.bash >/dev/null 2>&1; "
+         f"xacro {ROOT}/gazebo/rover.urdf.xacro -o {WORK}/rover.urdf && "
+         f"GZ_CONFIG_PATH=/usr/share/gz /usr/bin/gz sdf -p {WORK}/rover.urdf "
+         f"> {WORK}/rover.sdf"], capture_output=True, text=True)
+    if conv.returncode != 0 or not rover.exists():
+        print(f"  NOT RUN: the xacro did not convert: {conv.stderr[:200]}")
+        return dict(S1=None, S2=None, S3=None)
+    rtxt = rover.read_text()
+    decl_ok = (f"<max>{LIDAR_RANGE_M:.0f}</max>" in rtxt
+               and f"{np.radians(LIDAR_VFOV_DEG/2):.8f}"[:9] in rtxt)
+    print(f"  rover.sdf regenerated from the xacro; it declares the sourced "
+          f"LiDAR figures: {decl_ok}")
+    pmx, pmy = ROVER_PATCH_MAP
+    wx0, wy0 = (float(v) for v in map_to_world(pmx, pmy))
+    base_z = height_at_map(h, pmx, pmy) + ROVER_ALT_M
+    mast_z = base_z + MAST_Z_M
+    tgt = (wx0 + TARGET_RANGE_M, wy0, mast_z)
+    print(f"  rover base commanded to world ({wx0:.3f}, {wy0:.3f}, {base_z:.3f}), "
+          f"{ROVER_ALT_M:.0f} m above the terrain at map ({pmx:.0f}, {pmy:.0f})")
+    print(f"  mast and sensors at z {mast_z:.3f}; target sphere at "
+          f"({tgt[0]:.3f}, {tgt[1]:.3f}, {tgt[2]:.3f}), radius "
+          f"{TARGET_RADIUS_M} m, range {TARGET_RANGE_M:.3f} m")
+
+    cmd = [str(ROOT / ".venv" / "bin" / "python"),
+           str(ROOT / "examples" / "make_world.py"), "--mode", "ours",
+           "--rover", str(rover),
+           "--rover-pose", f"{wx0:.4f},{wy0:.4f},{base_z:.4f}",
+           "--dark",
+           "--targets", f"t0,{tgt[0]:.4f},{tgt[1]:.4f},{tgt[2]:.4f},"
+                        f"{TARGET_RADIUS_M}",
+           "--out", str(WORK / "c4x.sdf")]
+    # Dark, with no light and ambient zero, so only the emissive target
+    # renders. The terrain cannot supply a feature to match: its texture is
+    # one texel per 20 m cell, so at a range short enough for measurable
+    # disparity the whole field of view sits inside a single texel. The LiDAR
+    # is geometric and the intrinsics are not lighting-dependent, so one dark
+    # world serves all three checks.
+    subprocess.run(cmd, check=True, capture_output=True)
+    sdf = WORK / "c4x.sdf"
+
+    topics = []
+    for nm in ("nav_left", "nav_right", "haz_front", "haz_rear"):
+        topics += [f"/rover/{nm}/image", f"/rover/{nm}/camera_info"]
+    topics.append("/rover/lidar/scan")
+    pose_text, got = grab_mixed(sdf, 35.0, "dynamic_pose/info", topics)
+
+    # The rover must actually be where it was commanded. Four cases in this
+    # record have a simulator reporting success and moving nothing.
+    poses = parse_poses(pose_text)
+    placed = poses.get("rover")
+    if placed is not None:
+        err = float(np.hypot(np.hypot(placed[0] - wx0, placed[1] - wy0),
+                             placed[2] - base_z))
+        print(f"  pose read back off the topic: ({placed[0]:.3f}, "
+              f"{placed[1]:.3f}, {placed[2]:.3f}), error {err:.4f} m")
+        if err > 0.5:
+            print(f"  NOT RUN: the rover is not where it was commanded, so "
+                  f"S2 and S3 would be scored against geometry that is not "
+                  f"the geometry in the world. The first run of this check "
+                  f"read back (0, 0, 2000) for a commanded pose 3919.5 m "
+                  f"away, because the pose was computed and never passed to "
+                  f"the world.")
+            return dict(S1=None, S2=None, S3=None)
+    else:
+        print("  NOT RUN: the rover does not appear on the pose topic, so its "
+              "placement is assumed rather than verified")
+        return dict(S1=None, S2=None, S3=None)
+
+    # ---- S1: resolution and field of view from the intrinsics ----
+    print(f"\n  S1 resolution and field of view, from camera_info")
+    print(f"    {'camera':>10}{'w':>6}{'h':>6}{'fx':>11}{'fov deg':>10}"
+          f"{'declared':>10}{'err deg':>9}{'verdict':>9}")
+    s1 = True
+    for nm, decl in (("nav_left", NAV_FOV_DEG), ("nav_right", NAV_FOV_DEG),
+                     ("haz_front", HAZ_FOV_DEG), ("haz_rear", HAZ_FOV_DEG)):
+        ci = got.get(f"/rover/{nm}/camera_info")
+        if ci is None:
+            print(f"    {nm:>10}  no camera_info")
+            s1 = False
+            continue
+        w, hh = int(ci["width"]), int(ci["height"])
+        K = ci.get("intrinsics", {}).get("k") or ci.get("k")
+        fx = float(K[0])
+        fov = float(np.degrees(2.0 * np.arctan(w / (2.0 * fx))))
+        e = abs(fov - decl)
+        ok = (w == CAM_PX and hh == CAM_PX and e <= S1_FOV_TOL_DEG)
+        s1 &= ok
+        print(f"    {nm:>10}{w:6d}{hh:6d}{fx:11.3f}{fov:10.4f}{decl:10.1f}"
+              f"{e:9.4f}{'pass' if ok else 'FAIL':>9}")
+    print(f"    S1 -> {'PASS' if s1 else 'FAIL'}")
+
+    # ---- S2: stereo disparity against the sourced baseline ----
+    fx_nav = CAM_PX / (2.0 * np.tan(np.radians(NAV_FOV_DEG) / 2.0))
+    pred = fx_nav * NAV_BASELINE_M / TARGET_RANGE_M
+    print(f"\n  S2 stereo disparity against the sourced baseline")
+    print(f"    fx {fx_nav:.2f} px, baseline {NAV_BASELINE_M} m [P], range "
+          f"{TARGET_RANGE_M:.3f} m -> predicted {pred:.3f} px")
+    cen = {}
+    for nm in ("nav_left", "nav_right"):
+        img = decode_image(got.get(f"/rover/{nm}/image"))
+        if img is None:
+            print(f"    {nm}: no image")
+            continue
+        thr = img.max() * 0.6
+        m = img >= thr
+        if m.sum() < 50:
+            print(f"    {nm}: the target is not distinguishable "
+                  f"({int(m.sum())} px above {thr:.1f})")
+            continue
+        ys, xs = np.nonzero(m)
+        cen[nm] = (float(xs.mean()), float(ys.mean()), int(m.sum()))
+        print(f"    {nm}: centroid u {cen[nm][0]:.3f}, v {cen[nm][1]:.3f}, "
+              f"{cen[nm][2]} px above threshold")
+    if len(cen) == 2:
+        disp = cen["nav_left"][0] - cen["nav_right"][0]
+        e = abs(abs(disp) - pred)
+        s2 = bool(e <= S2_DISPARITY_TOL_PX)
+        print(f"    measured disparity {disp:+.3f} px, |measured| - predicted "
+              f"= {abs(disp)-pred:+.3f} px, tolerance {S2_DISPARITY_TOL_PX} px")
+        print(f"    this verifies the baseline to about "
+              f"{S2_DISPARITY_TOL_PX*TARGET_RANGE_M/fx_nav*100:.1f} cm, so it "
+              f"does not distinguish 0.424 m from the old 0.420 m assumption, "
+              f"which would differ by {abs(fx_nav*0.004/TARGET_RANGE_M):.2f} px")
+        print(f"    S2 -> {'PASS' if s2 else 'FAIL'}")
+    else:
+        s2 = None
+        print(f"    S2 -> NOT RUN, {len(cen)} of 2 centroids found")
+
+    # ---- S3: lidar ranges against the heightmap ----
+    print(f"\n  S3 LiDAR ranges against the heightmap along known rays")
+    scan = got.get("/rover/lidar/scan")
+    if scan is None:
+        print("    no scan message")
+        return dict(S1=s1, S2=s2, S3=None)
+    rngs = np.asarray([float(v) for v in scan.get("ranges")], dtype=float)
+    nrow = int(scan.get("verticalCount") or LIDAR_ROWS)
+    ncol = int(scan.get("count") or LIDAR_COLS)
+    decl_rmax = float(scan.get("rangeMax", LIDAR_RANGE_M))
+    print(f"    scan {ncol} x {nrow}, declared {LIDAR_COLS} x {LIDAR_ROWS} [O]")
+    if rngs.size != nrow * ncol:
+        print(f"    {rngs.size} ranges for a {ncol} x {nrow} scan; not scoreable")
+        return dict(S1=s1, S2=s2, S3=None)
+    rngs = rngs.reshape(nrow, ncol)
+    amin, amax = float(scan["angleMin"]), float(scan["angleMax"])
+    vmin, vmax = float(scan["verticalAngleMin"]), float(scan["verticalAngleMax"])
+    print(f"    the scan declares rangeMax {decl_rmax:.0f} m and vertical "
+          f"{np.degrees(vmax-vmin):.1f} deg against the sourced "
+          f"{LIDAR_RANGE_M:.0f} m and {LIDAR_VFOV_DEG:.1f} deg")
+    if abs(decl_rmax - LIDAR_RANGE_M) > 0.5 or abs(
+            np.degrees(vmax - vmin) - LIDAR_VFOV_DEG) > 0.1:
+        print(f"    NOT SCOREABLE: the running sensor is not configured with "
+              f"the sourced figures")
+        return dict(S1=s1, S2=s2, S3=None)
+    az = np.linspace(amin, amax, ncol)
+    el = np.linspace(vmin, vmax, nrow)
+    origin = (wx0, wy0, mast_z + 0.15)      # lidar_link is 0.15 m above mast
+    rows = []
+    for ri in range(0, nrow, 1):
+        e = el[ri]
+        if e >= 0:
+            continue
+        for ci in range(0, ncol, 8):
+            got_r = rngs[ri, ci]
+            if not np.isfinite(got_r) or got_r <= 0 or got_r >= LIDAR_RANGE_M:
+                continue
+            graze = float(np.degrees(abs(e)))
+            if graze < S3_GRAZE_MIN_DEG:
+                continue
+            a = az[ci]
+            d = (np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e))
+            pred_r, mx, my = march_dem(h, origin, d, LIDAR_RANGE_M)
+            if pred_r is None:
+                continue
+            rows.append((float(got_r), pred_r, graze, a, mx, my))
+    if len(rows) < 50:
+        print(f"    only {len(rows)} scoreable beams; not scoreable")
+        return dict(S1=s1, S2=s2, S3=None)
+    A = np.array([(r[0], r[1], r[2], r[3]) for r in rows])
+    errs = np.abs(A[:, 0] - A[:, 1])
+    med, p90 = float(np.median(errs)), float(np.percentile(errs, 90))
+    print(f"    {len(rows)} beams scored: returned inside {LIDAR_RANGE_M:.0f} m "
+          f"and grazing at least {S3_GRAZE_MIN_DEG:.0f} deg")
+    print(f"    ranges: median {np.median(A[:,0]):.2f} m, "
+          f"{A[:,0].min():.2f} to {A[:,0].max():.2f} m")
+    print(f"    |range error|: median {med:.3f} m (bar {S3_MEDIAN_MAX_M}), "
+          f"p90 {p90:.3f} m (bar {S3_P90_MAX_M})")
+    print(f"    predicted before the run from the open rendering term x "
+          f"1/sin(grazing): median 0.858 m, p90 1.154 m, max 1.500 m")
+    quad = []
+    for q, (lo, hi) in enumerate(((-np.pi, -np.pi/2), (-np.pi/2, 0.0),
+                                  (0.0, np.pi/2), (np.pi/2, np.pi))):
+        m = (A[:, 3] >= lo) & (A[:, 3] < hi)
+        if m.sum() > 10:
+            quad.append(float(np.median(errs[m])))
+            print(f"      azimuth quadrant {q}: n={int(m.sum()):5d}  median "
+                  f"{np.median(errs[m]):.3f} m")
+    spread = (max(quad) - min(quad)) if quad else float("inf")
+    print(f"    quadrant spread {spread:.3f} m against the "
+          f"{S3_MEDIAN_MAX_M} m bar: "
+          f"{'inside the bar, so the bar measures something' if spread <= S3_MEDIAN_MAX_M else 'WIDER than the bar, so the bar is inside the estimator spread and measures nothing'}")
+    s3 = bool(med <= S3_MEDIAN_MAX_M and p90 <= S3_P90_MAX_M
+              and spread <= S3_MEDIAN_MAX_M)
+    print(f"    S3 -> {'PASS' if s3 else 'FAIL'}")
+    return dict(S1=s1, S2=s2, S3=s3)
+
+
 def probe_bounds(h):
     """Per-probe tolerance for L2'', derived from the DEM with no simulator.
 
@@ -1195,7 +1474,7 @@ def main():
     # quiet wrong answer this whole subtask is about.
     want = [t.strip() for t in args.parts.split(",") if t.strip()]
     unknown = [t for t in want if t not in ("c1", "l2pp", "l2ppp", "c2",
-                                            "c3", "c5")]
+                                            "c3", "c5", "c4x")]
     if unknown:
         raise SystemExit(f"unknown parts: {', '.join(unknown)}")
     outdir = Path(args.out)
@@ -1204,7 +1483,7 @@ def main():
     out = {}
     for name, fn in (("c1", c1), ("l2pp", l2pp), ("l2ppp", l2ppp),
                      ("c2", c2),
-                     ("c3", c3), ("c5", c5)):
+                     ("c3", c3), ("c5", c5), ("c4x", c4x)):
         if name in want:
             out.update(run_part(name, fn, h, outdir, args.resume))
     print(f"\n=== scored so far ===")

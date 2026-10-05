@@ -25,13 +25,48 @@
          The paper body is paywalled from this machine, so figures not in its
          public description are ASSUMPTION below, not SOURCE.
 
-  Not sourced, and labelled so:
-    the Navcam stereo baseline, the Hazcam field of view, and every LiDAR
-    figure. The LiDAR is additionally a deliberate departure from the rover
-    class: no flown lunar rover carries a scanning LiDAR of this type and a
-    terrestrial unit would not survive the thermal and vacuum environment. It
-    is here because later projects in this portfolio want a standard range
-    sensor, and it is labelled rather than passed off as VIPER-like.
+    [P]  MSL Navcam, NASA PDS context product urn:nasa:pds:context:instrument:
+         navcam.msl, read 2026-10-04: "42.4 cm" stereo baseline separation.
+         https://arcnav.psi.edu/urn:nasa:pds:context:instrument:navcam.msl
+    [H]  MSL Hazcam, Washington University Analyst's Notebook instrument page,
+         read 2026-10-04: 124 degree x 124 degree horizontal/vertical field of
+         view, 180 degree diagonal, 2.1 mrad/pixel at image centre, 1024 x 1024
+         imaging region of a 1024 x 2048 CCD, 5.58 mm focal length, f/15,
+         16.6 cm front and 10 cm rear stereo baselines.
+         https://an.rsl.wustl.edu/help/Content/About%20the%20mission/MSL/
+         Instruments/MSL%20Hazcam.htm
+         Maki et al., "The Mars Science Laboratory (MSL) Hazard Avoidance
+         Cameras (Hazcams)", 43rd LPSC (2012) abstract 2828, read 2026-10-04,
+         gives the requirement as a 120 degree field of view at 2 mrad/pixel
+         with stereo ranging to +/- 5 mm; 124 degrees is the as-built figure
+         from [H]. https://www.lpi.usra.edu/meetings/lpsc2012/pdf/2828.pdf
+    [O]  Ouster OS1 datasheet, hardware REV7.0, firmware 3.1.x, revision
+         02/2025, read 2026-10-04: vertical field of view 42.4 deg +/- 1.0 deg
+         (+21.2 to -21.2), vertical resolution 32, 64 or 128 channels,
+         horizontal resolution 512, 1024 or 2048 configurable, range 170 m at
+         >90% detection probability on a >90% reflective target and 90 m on a
+         10% target, both at 100 klx sunlight.
+         https://data.ouster.io/downloads/datasheets/datasheet-rev7-v3p1-os1.pdf
+
+  Second sourcing pass, 2026-10-04. Three figures that were ASSUMPTION are now
+  SOURCE, and two of those three were wrong as assumed:
+    the Navcam stereo baseline was 0.42 m and is 0.424 m per [P];
+    the Hazcam field of view was assumed near 124 deg and [H] confirms exactly
+      124 deg, so the value stands and the label changes;
+    the LiDAR vertical field of view was 45.0 deg and is 42.4 deg per [O];
+    the LiDAR range was 120 m, which is the superseded Gen 1 figure, and is
+      90 m per [O] for a 10% reflective target. 10% is the right column here:
+      this project's own illumination model fits the published Lambertian
+      albedo of 0.1 for the lunar surface, so regolith is a 10% target.
+
+  Still ASSUMPTION after two passes:
+    the split of VIPER's 2.45 m height between chassis and mast.
+  The LiDAR remains a deliberate departure from the rover class even though its
+  figures are now sourced: no flown lunar rover carries a scanning LiDAR of
+  this type and a terrestrial unit would not survive the thermal and vacuum
+  environment. It is here because later projects in this portfolio want a
+  standard range sensor, and it is labelled rather than passed off as
+  VIPER-like.
 -->
 <robot name="polar_rover" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
@@ -51,20 +86,24 @@
   <!-- SOURCE [M]: 45 deg square FOV, 1024 x 1024, 0.82 mrad/pixel -->
   <xacro:property name="nav_fov_deg" value="45.0"/>
   <xacro:property name="nav_px"      value="1024"/>
-  <!-- ASSUMPTION: stereo baseline. Widely quoted for MSL as about 0.42 m but
-       not in the public description of [M], so it is not claimed as sourced. -->
-  <xacro:property name="nav_baseline" value="0.42"/>
-  <!-- ASSUMPTION: Hazcam field of view, commonly quoted near 124 deg for MSL,
-       likewise not sourced here. -->
+  <!-- SOURCE [P]: 42.4 cm stereo baseline separation. Was 0.42 m as an
+       assumption, which was wrong by 4 mm. -->
+  <xacro:property name="nav_baseline" value="0.424"/>
+  <!-- SOURCE [H]: 124 deg x 124 deg, 1024 x 1024 imaging region. The assumed
+       value was right; only the label changes. -->
   <xacro:property name="haz_fov_deg"  value="124.0"/>
   <xacro:property name="haz_px"       value="1024"/>
-  <!-- ASSUMPTION, and a departure from the class: an Ouster OS1-64-class
-       scanning LiDAR. 64 channels, 45 deg vertical and 360 deg horizontal
-       field of view, 120 m range, 10 Hz. Datasheet not read from this machine. -->
+  <!-- SOURCE [O], and still a departure from the rover class. 64 of the
+       offered 32/64/128 channels, 1024 of the offered 512/1024/2048 columns,
+       vertical field of view 42.4 deg (was 45.0 as an assumption, which was
+       the Gen 2 marketing figure rather than the datasheet), and 90 m range
+       for a 10% reflective target (was 120 m, the superseded Gen 1 figure at
+       80% reflectivity). Regolith is a 10% target at this project's own
+       fitted albedo of 0.1. -->
   <xacro:property name="lidar_rows"   value="64"/>
   <xacro:property name="lidar_cols"   value="1024"/>
-  <xacro:property name="lidar_vfov"   value="45.0"/>
-  <xacro:property name="lidar_range"  value="120.0"/>
+  <xacro:property name="lidar_vfov"   value="42.4"/>
+  <xacro:property name="lidar_range"  value="90.0"/>
 
   <xacro:property name="d2r" value="0.0174532925199433"/>
 

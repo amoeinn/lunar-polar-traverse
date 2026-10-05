@@ -289,3 +289,97 @@ def test_the_heightmap_centre_is_the_middle_sample_not_the_middle_of_the_extent(
     assert c_even == pytest.approx(ext_even), (
         "for an even count the middle sample and the extent's centre coincide; "
         "if they do not, the fix is a constant offset rather than the sample")
+
+
+def _xacro_props():
+    """The xacro's declared property values, by name."""
+    import re
+    txt = (ROOT / "gazebo" / "rover.urdf.xacro").read_text()
+    return {m.group(1): m.group(2) for m in
+            re.finditer(r'xacro:property name="([^"]+)"\s+value="([^"]+)"', txt)}
+
+
+def test_the_sourced_sensor_figures_are_the_ones_the_model_declares():
+    """Protects the second sourcing pass against a silent revert.
+
+    Three assumption groups were sourced on 2026-10-04 and two were wrong as
+    assumed: the Navcam stereo baseline was 0.42 m and is 0.424 m per the PDS
+    context product, the LiDAR vertical field of view was 45.0 deg and is
+    42.4 deg per the Ouster REV7.0 datasheet, and the LiDAR range was 120 m,
+    the superseded Gen 1 figure at 80% reflectivity, against 90 m for a 10%
+    target, which is the right column because this project's illumination
+    model fits an albedo of 0.1. The old values are asserted absent, not just
+    the new ones present, because a revert would otherwise pass.
+    """
+    p = _xacro_props()
+    assert p["nav_baseline"] == "0.424", p["nav_baseline"]
+    assert p["haz_fov_deg"] == "124.0", p["haz_fov_deg"]
+    assert p["lidar_vfov"] == "42.4", p["lidar_vfov"]
+    assert p["lidar_range"] == "90.0", p["lidar_range"]
+    assert p["nav_baseline"] != "0.42", "reverted to the assumed baseline"
+    assert p["lidar_vfov"] != "45.0", "reverted to the Gen 2 marketing figure"
+    assert p["lidar_range"] != "120.0", "reverted to the Gen 1 range"
+
+
+def test_the_predicted_stereo_disparity_follows_from_the_sourced_baseline():
+    """Protects S2's prediction, which must come from the sourced figures.
+
+    If the prediction were hard-coded, changing the baseline or the field of
+    view would leave the check scoring against a stale number and still
+    passing. fx comes from the declared field of view and the detector width,
+    and the disparity from fx, the baseline and the range.
+    """
+    p = _xacro_props()
+    px = float(p["nav_px"])
+    fov = np.radians(float(p["nav_fov_deg"]))
+    fx = px / (2.0 * np.tan(fov / 2.0))
+    assert fx == pytest.approx(1236.077, abs=1e-3), fx
+    disp = fx * float(p["nav_baseline"]) / 10.0
+    assert disp == pytest.approx(52.410, abs=1e-3), disp
+    # the 4 mm correction is deliberately below this check's resolution, and
+    # that is stated rather than left for a reader to assume otherwise
+    old = fx * 0.420 / 10.0
+    assert abs(disp - old) < 0.5, (
+        "the baseline correction is claimed to be unresolvable at 10 m but is "
+        f"{abs(disp - old):.2f} px, which a 2 px tolerance would resolve")
+
+
+def test_the_dark_world_renders_only_emissive_geometry():
+    """Protects S2's target isolation.
+
+    The first run thresholded a lit scene and found 240207 bright pixels, a
+    quarter of the image, because the ambient-lit terrain is as bright as the
+    target. The terrain cannot supply a matchable feature either: its texture
+    is one texel per 20 m cell, so at a range short enough for measurable
+    disparity the whole field of view is inside one texel. The dark world has
+    ambient zero and no light at all, so only the emissive sphere renders.
+    """
+    import examples.make_world as MW
+    sdf = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                   "vertices", 2296.6073, dark=True,
+                   targets=[("t0", 1.0, 2.0, 3.0, 0.5)])
+    assert "<light" not in sdf, "the dark world still carries a light"
+    assert "<ambient>0 0 0 1</ambient>" in sdf, "the scene ambient is not zero"
+    assert "target_t0" in sdf and "<emissive>1 1 1 1</emissive>" in sdf
+
+
+def test_the_rover_pose_reaches_the_world_rather_than_only_being_computed():
+    """Protects the bug that voided the first sensor run.
+
+    c4x computed a rover pose and never passed it to the world, so the rover
+    stayed at its default (0, 0, 2000) while the target sphere sat 10 m from
+    where the rover was supposed to be. The pose read back off the topic was
+    3919.5 m from the commanded one, and S2 and S3 would have been scored
+    against geometry that was not the geometry in the world.
+    """
+    import examples.make_world as MW
+    rover = ROOT / "data" / "work" / "gazebo" / "rover.sdf"
+    if not rover.exists():
+        pytest.skip("rover.sdf not converted")
+    want = (123.5, -456.25, 789.125)
+    sdf = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                   "vertices", 2296.6073, rover=str(rover), rover_pose=want)
+    body = sdf[sdf.index("<model name='rover'"):]
+    body = body[:body.index("</model>")]
+    assert f"<pose>{want[0]} {want[1]} {want[2]} 0 0 0</pose>" in body, body[:300]
+    assert "<pose>0.0 0.0 2000.0 0 0 0</pose>" not in body
