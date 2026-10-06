@@ -474,3 +474,52 @@ def test_the_generated_world_loads_from_a_different_working_directory():
         "the world does not load outside the repo root:\n"
         + "\n".join(l for l in out.splitlines() if "resolve" in l.lower()))
     assert "Failed to load a world" not in out, out[-600:]
+
+
+def test_the_rover_shade_lands_on_the_visual_and_not_the_collision():
+    """Protects: a material written into the collision block, where it does nothing.
+
+    The converted rover puts base_link_collision before base_link_visual, so an
+    insertion anchored on "the first </geometry>" lands in the collision, the box
+    renders black, and the element is sitting right there in the file looking
+    correct. This is the same fault as the <gravity> placement and was found the
+    same way, by looking at the render.
+
+    The discriminating assertion is the first one: the fixture is only a fixture
+    if the collision really does come first, so that is checked before anything
+    is measured against it.
+    """
+    import examples.make_world as MW
+    rover = ROOT / "data" / "work" / "gazebo" / "rover.sdf"
+    if not rover.exists():
+        pytest.skip("rover.sdf not converted")
+    raw = rover.read_text()
+    assert raw.index("<collision") < raw.index("<visual"), \
+        "the fixture must put the collision first or this test proves nothing"
+
+    sdf = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                   "vertices", 2296.6073, rover=str(rover),
+                   rover_pose=(1.0, 2.0, 3.0, 0.0), rover_shade=0.85)
+    body = sdf[sdf.index("<model name='rover'"):]
+    body = body[:body.index("</model>")]
+    assert body.count("<material>") == 1
+    coll = body[body.index("<collision"):body.index("<visual")]
+    vis = body[body.index("<visual"):]
+    assert "<material>" not in coll, "the material must not land in the collision"
+    assert "<material>" in vis
+    assert "<ambient>0.8500 0.8500 0.8500 1</ambient>" in vis
+
+    # A darker shade must actually reach the file, so the rover can darken when
+    # our model says its cell is dark.
+    dark = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                    "vertices", 2296.6073, rover=str(rover),
+                    rover_pose=(1.0, 2.0, 3.0, 0.0), rover_shade=0.22)
+    assert "<ambient>0.2200 0.2200 0.2200 1</ambient>" in dark
+    assert "0.8500" not in dark
+
+    # No shade asked for, no material invented.
+    plain = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                     "vertices", 2296.6073, rover=str(rover),
+                     rover_pose=(1.0, 2.0, 3.0, 0.0))
+    body = plain[plain.index("<model name='rover'"):]
+    assert "<material>" not in body[:body.index("</model>")]

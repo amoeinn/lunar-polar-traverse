@@ -613,10 +613,33 @@ GZ = "/usr/bin/gz"
 GZ_ENV_KEY = "GZ_CONFIG_PATH"
 GZ_CONFIG = "/usr/share/gz"
 ROVER_LIFT_M = 0.5          # a display offset; the pose is commanded, see C5
-WIDE_OFFSET = (-1200.0, -1200.0, 1100.0)
-CHASE_OFFSET = (-30.0, -30.0, 14.0)
+# Camera placements. The wide view is steep enough that no sky enters the frame:
+# at 4000 m over a 2828 m ground offset the line of sight is 54.7 deg down and
+# the 47 deg vertical field spans 31 to 78 deg, all of it terrain. The first
+# attempt put it at 1100 m over 1697 m, 32.9 deg down, and the top of every frame
+# was the horizon at 6.6 km, which is outside the heightmap. The second was steep
+# enough but only 2.1 km across, a window in which this epoch's shadows barely
+# move; 6 km covers most of the 10.24 km region, which is where the sweep is.
+WIDE_OFFSET = (-2000.0, -2000.0, 4000.0)
+CHASE_OFFSET = (-18.0, -18.0, 9.0)
 VIEW_W, VIEW_H = 800, 600
 WIDE_FOV, CHASE_FOV = 1.10, 1.05
+# One display curve for the whole sequence, never per frame. Our texture floors
+# lit cells at 0.25 and this epoch's cos(incidence) peaks at 0.288, so the scene
+# renders dim by construction: measured, lit terrain sits at exactly 34 of 255
+# with p99 at 34 to 38 and a maximum of 111. A linear gain was tried first and
+# rejected by measurement rather than by taste: x6 puts lit terrain at a good 204
+# but saturates everything above 42, and the rover box renders at 73 even at a
+# shade of 0.05, so lit and dark rovers both clipped to white and the signal the
+# shade exists to carry was destroyed. A cube-root curve is monotone over the
+# whole range and clips nothing: 0 stays 0, lit terrain 34 reads 130, the lit
+# rover reads 255 and the dark rover 154.
+DISPLAY_GAMMA = 1.0 / 3.0
+# Measured against that curve, not chosen: the box cannot render darker than the
+# terrain at any shade (at 0.01 and below it reads 34, exactly the terrain), so
+# the lit-dark signal is carried by the two shades against each other and not by
+# the rover against its surroundings.
+ROVER_SHADE_LIT, ROVER_SHADE_DARK = 0.85, 0.03
 
 GZ_CAPTION = (
     "Rendered by Gazebo; the illumination is OUR model written as an unlit "
@@ -627,6 +650,15 @@ GZ_CAPTION = (
     "The mechanism is open and unexplained.",
     "The rover's pose is commanded, not driven. Nothing here is a claim about "
     "mobility, slip or traction.",
+    "The rover model's only visual geometry is its 1.53 x 1.53 x 0.60 m chassis "
+    "box; the mast and wheels carry sensor frames and no visual. Its shade is "
+    "set from our lit mask at its own cell, not by any Gazebo shadow.",
+    "Brightness is a single fixed cube-root display curve for the whole "
+    "sequence, never per frame, so frames stay comparable: lit terrain renders "
+    "at 34 of 255 before it and 130 after.",
+    "The chase view spans about 1.4 texels of a one-texel-per-20-m texture, so "
+    "its smooth light and dark gradients are that texture interpolated across "
+    "cells, not terrain detail. The map view draws the same cells unfiltered.",
 )
 
 
@@ -724,6 +756,7 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
     pt = planner_out(tag, "td")
     lo, hi = int(pt["offsets"][instance]), int(pt["offsets"][instance + 1])
     tsteps = pt["times"][lo:hi]
+    litm = np.load(stack["lit_path"], mmap_mode="r")
     dem, outdir, texdir = stack["dem"], Path(outdir), Path(texdir)
     outdir.mkdir(parents=True, exist_ok=True)
     work = outdir / "worlds"
@@ -740,32 +773,46 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
             r, p_, y_ = look_at(cam, tgt)
             views.append((name, cam[0], cam[1], cam[2], r, p_, y_, fov,
                           VIEW_W, VIEW_H))
+        shade = (ROVER_SHADE_LIT if bool(litm[k].reshape(-1)[int(plan[step])])
+                 else ROVER_SHADE_DARK)
         sdf = build(side["path"], "ours", texdir / f"tex{k:04d}.png", normal,
                     side["pos_z"], [0.0, 0.0, -1.0], [], None, "vertices",
                     side["h_range"], rover_sdf, (), (), (wx, wy, wz, yaw),
-                    False, views)
+                    False, views, shade)
         wf = work / f"frame{k:04d}.sdf"
         wf.write_text(sdf)
         img = gz_grab(wf, ["view/wide/image", "view/chase/image"])
-        fig = plt.figure(figsize=(16, 7), dpi=dpi, facecolor="#07070a")
+        wide_m = 2.0 * float(np.linalg.norm(
+            [WIDE_OFFSET[0], WIDE_OFFSET[1], WIDE_OFFSET[2]])) * np.tan(WIDE_FOV / 2)
+        chase_m = float(np.linalg.norm(
+            [CHASE_OFFSET[0], CHASE_OFFSET[1], CHASE_OFFSET[2]]))
+        fig = plt.figure(figsize=(16, 8), dpi=dpi, facecolor="#07070a")
         for q, (topic, label) in enumerate((
                 ("view/wide/image",
-                 f"wide view, about 2.4 km across, camera {abs(WIDE_OFFSET[2]):.0f} m up"),
+                 f"wide view, about {wide_m:.0f} m across, camera "
+                 f"{WIDE_OFFSET[2]:.0f} m up"),
                 ("view/chase/image",
-                 "chase view, about 45 m range: the rover at true scale"))):
-            ax = fig.add_axes([0.01 + q * 0.495, 0.175, 0.485, 0.78])
-            ax.imshow(img[topic])
+                 f"chase view, {chase_m:.0f} m range: the chassis box at "
+                 f"true scale"))):
+            ax = fig.add_axes([0.012 + q * 0.494, 0.248, 0.482, 0.647])
+            # One fixed curve, applied identically to every frame of both views.
+            ax.imshow((255.0 * (img[topic].astype(float) / 255.0)
+                       ** DISPLAY_GAMMA).astype(np.uint8))
             ax.set_xticks([])
             ax.set_yticks([])
             for sp in ax.spines.values():
                 sp.set_color("#30343c")
             ax.set_title(label, color="#e6e8ec", fontsize=10)
-        fig.text(0.01, 0.965, f"{tag}   instance {instance}   t = {t:+.2f} h   "
+        fig.text(0.012, 0.955, f"{tag}   instance {instance}   t = {t:+.2f} h   "
                  f"plan step {step + 1} of {plan.size}   "
-                 f"{stack['lit_fraction'][k]:.2%} of the region lit",
-                 color="#9aa0aa", fontsize=9)
+                 f"{stack['lit_fraction'][k]:.2%} of the region lit   "
+                 f"this cell: {'LIT' if shade == ROVER_SHADE_LIT else 'DARK'}",
+                 color="#9aa0aa", fontsize=10)
+        fig.text(0.012, 0.925, f"display curve: brightness to the power "
+                 f"{DISPLAY_GAMMA:.3f}, the same for every frame",
+                 color="#7e848e", fontsize=8)
         for q, line in enumerate(GZ_CAPTION):
-            fig.text(0.01, 0.125 - q * 0.040, line, color="#7e848e", fontsize=7.5)
+            fig.text(0.012, 0.186 - q * 0.031, line, color="#7e848e", fontsize=7.5)
         out = outdir / f"gz{k:04d}.png"
         fig.savefig(out, facecolor=fig.get_facecolor())
         plt.close(fig)
@@ -1072,7 +1119,12 @@ def main():
                            fps=args.fps,
                            hours_per_second=CADENCE_H * args.fps,
                            normalisation_peak_cos_incidence=stack["peak"],
-                           lit_floor=LIT_FLOOR, rover_lift_m=ROVER_LIFT_M),
+                           lit_floor=LIT_FLOOR, rover_lift_m=ROVER_LIFT_M,
+                           display_gamma=DISPLAY_GAMMA,
+                           rover_shade_lit=ROVER_SHADE_LIT,
+                           rover_shade_dark=ROVER_SHADE_DARK,
+                           wide_offset_m=list(WIDE_OFFSET),
+                           chase_offset_m=list(CHASE_OFFSET)),
         inputs=file_record([
             SWEEP / f"{tag}_td" / "planner_params.json",
             SWEEP / f"{tag}_replay_td_tol" / "out_verdict.bin",
