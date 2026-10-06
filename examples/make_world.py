@@ -96,7 +96,16 @@ def rover_block(path, name="rover", pose=(0.0, 0.0, 2000.0, 0.0), shade=None):
         # which is the same quantity the terrain texture carries: the rover
         # darkens when it enters shadow because the model says that cell is
         # dark, not because anything in Gazebo computed a shadow.
-        g = float(shade)
+        # A scalar is a grey; a triple is a colour. The demo needs a colour,
+        # because brightness cannot carry the lit-dark signal here: measured, the
+        # box renders at 56 raw at its darkest usable shade against lit terrain
+        # at 34, so a "dark" rover still comes out brighter than lit ground and
+        # reads as lit. Hue is free of that constraint.
+        rgb = ((float(shade),) * 3 if np.isscalar(shade)
+               else tuple(float(v) for v in shade))
+        if len(rgb) != 3:
+            raise SystemExit(f"rover shade must be a scalar or 3 values: {shade}")
+        g = " ".join(f"{v:.4f}" for v in rgb)
         # Anchored on the VISUAL's own geometry, not on the first </geometry> in
         # the model. The converted rover puts base_link_collision before
         # base_link_visual, so "the first one" is the collision's, where a
@@ -108,9 +117,9 @@ def rover_block(path, name="rover", pose=(0.0, 0.0, 2000.0, 0.0), shade=None):
         end = block.index("</geometry>", v) + len("</geometry>")
         block = (block[:end]
                  + f"\n          <material>"
-                   f"<ambient>{g:.4f} {g:.4f} {g:.4f} 1</ambient>"
-                   f"<diffuse>{g:.4f} {g:.4f} {g:.4f} 1</diffuse>"
-                   f"<emissive>{g:.4f} {g:.4f} {g:.4f} 1</emissive></material>"
+                   f"<ambient>{g} 1</ambient>"
+                   f"<diffuse>{g} 1</diffuse>"
+                   f"<emissive>{g} 1</emissive></material>"
                  + block[end:])
     return "\n    " + block
 

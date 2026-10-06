@@ -469,23 +469,37 @@ def panel_lines(tag, instance, rows, curves, same=()):
     return lines
 
 
-def never_lit_patch(litm, i0, i1, j0, j1):
-    """Cells inside the zoom window that are dark in every frame of the sequence.
+def dark_clusters(litm, i0, i1, j0, j1, min_frames=1):
+    """Connected groups of cells inside the zoom that are dark in some frame.
 
-    Named on the figure because a solid black square reads as a hole or a data
-    gap, and it is neither. It is not called a permanent shadow: 27.66 h is not
-    a lunation, and all this establishes is that these cells were dark for the
-    whole of this traverse.
+    Named on the figure because a black or grey square reads as a hole or a
+    missing tile and is neither. None of them is called a permanent shadow:
+    27.66 h is not a lunation, and all that is established is how many frames of
+    THIS traverse each was dark for.
+
+    The mask is cast to bool first. litm is uint8 on disk and "~" on a uint8
+    array is a bitwise NOT, so ~0 is 255 rather than True, and a count taken
+    that way comes out in the tens of thousands against 112 frames. That is a
+    mistake this file made once in a scratch measurement and it is worth the
+    line: the wrong answer was 250 times too large and still looked like a
+    count.
     """
-    sub = np.asarray(litm[:, i0:i1 + 1, j0:j1 + 1])
-    dark = ~sub.any(axis=0)
-    if not dark.any():
-        return None
-    ii, jj = np.nonzero(dark)
-    gx, gy = cell_to_map(ii + i0, jj + j0)
-    return dict(n=int(dark.sum()), x=float(gx.mean()) / 1000.0,
-                y=float(gy.mean()) / 1000.0,
-                ever=int((~sub.all(axis=0)).sum()))
+    from scipy import ndimage
+    sub = np.asarray(litm[:, i0:i1 + 1, j0:j1 + 1]).astype(bool)
+    n = sub.shape[0]
+    ndark = (~sub).sum(axis=0)
+    lab, k = ndimage.label(ndark >= min_frames)
+    out = []
+    for c in range(1, k + 1):
+        ii, jj = np.nonzero(lab == c)
+        gx, gy = cell_to_map(ii + i0, jj + j0)
+        nd = ndark[ii, jj]
+        out.append(dict(cells=int(ii.size), x=float(gx.mean()) / 1000.0,
+                        y=float(gy.mean()) / 1000.0, lo=int(nd.min()),
+                        hi=int(nd.max()), frames=int(n),
+                        always=int((nd == n).sum())))
+    out.sort(key=lambda d: (-d["hi"], -d["cells"]))
+    return out
 
 
 def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110):
@@ -543,7 +557,11 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110):
     cgx = cell_to_map(0, np.arange(j0, j1 + 1))[0] / 1000.0
     cgy = cell_to_map(np.arange(i0, i1 + 1), 0)[1] / 1000.0
     clev = np.arange(np.floor(czz.min() / 10.0) * 10.0, czz.max() + 10.0, 10.0)
-    patch = never_lit_patch(litm, i0, i1, j0, j1)
+    # Labelled only if dark in at least 5% of the frames. Below that a cell is
+    # lit in almost every frame and renders lit, so a label would point at
+    # nothing a viewer can see.
+    cl_min = max(2, int(round(0.05 * litm.shape[0])))
+    clusters = dark_clusters(litm, i0, i1, j0, j1, min_frames=cl_min)
 
     # The executive, which is why R3 chose this instance. Read from the committed
     # five-arm run rather than recomputed.
@@ -604,15 +622,25 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110):
                 ax.set_ylim(*lim[1])
                 ax.contour(cgx, cgy, czz, levels=clev, colors="#4b5563",
                            linewidths=0.6, alpha=0.9)
-                if patch:
-                    # A solid black square reads as a hole or a missing tile, so
-                    # it is named. It is not called a permanent shadow.
-                    ax.annotate(
-                        f"{patch['n']} cells dark in\nevery frame of the sequence",
-                        xy=(patch["x"], patch["y"]),
-                        xytext=(patch["x"] - 0.44, patch["y"] + 0.20),
-                        color="#e6e8ec", fontsize=7,
-                        arrowprops=dict(arrowstyle="->", color="#e6e8ec", lw=0.8))
+                # Every dark cluster is named, not only the darkest, so the
+                # grey levels in this panel have a stated meaning everywhere.
+                for ci, cl in enumerate(clusters):
+                    cells = f"{cl['cells']} cell" + ("s" if cl["cells"] > 1 else "")
+                    txt = (f"{cells}, dark in "
+                           + (f"all {cl['frames']}" if cl["lo"] == cl["frames"]
+                              else f"{cl['lo']}-{cl['hi']} of {cl['frames']}")
+                           + " frames")
+                    dy = 0.17 if ci % 2 == 0 else -0.17
+                    # Clamped inside the axes: an unclamped label on a cluster
+                    # near the edge ran over the panel title.
+                    tx = float(np.clip(cl["x"] - 0.40, zx[0] + 0.03,
+                                       zx[1] - 0.46))
+                    ty = float(np.clip(cl["y"] + dy, zy[0] + 0.05,
+                                       zy[1] - 0.05))
+                    ax.annotate(txt, xy=(cl["x"], cl["y"]), xytext=(tx, ty),
+                                color="#e6e8ec", fontsize=6.2,
+                                arrowprops=dict(arrowstyle="->", color="#e6e8ec",
+                                                lw=0.7, alpha=0.85))
             ax.set_xlabel("map x (km)", color="#9aa0aa", fontsize=7)
             ax.set_ylabel("map y (km)", color="#9aa0aa", fontsize=7)
             ax.tick_params(colors="#9aa0aa", labelsize=6.5)
@@ -764,11 +792,24 @@ WIDE_FOV, CHASE_FOV = 1.10, 1.05
 # whole range and clips nothing: 0 stays 0, lit terrain 34 reads 130, the lit
 # rover reads 255 and the dark rover 154.
 DISPLAY_GAMMA = 1.0 / 3.0
-# Measured against that curve, not chosen: the box cannot render darker than the
-# terrain at any shade (at 0.01 and below it reads 34, exactly the terrain), so
-# the lit-dark signal is carried by the two shades against each other and not by
-# the rover against its surroundings.
-ROVER_SHADE_LIT, ROVER_SHADE_DARK = 0.85, 0.03
+# Brightness cannot carry the lit-dark signal and the measurement says why: the
+# box cannot render darker than the terrain at any shade. At 0.01 and below it
+# reads 34, exactly the terrain, and the darkest usable shade of 0.03 reads 56
+# raw, which is 154 after the display curve against lit terrain's 130. So a
+# "dark" rover came out brighter than lit ground and read as lit. Hue is free of
+# that constraint, and the terrain is neutral grey at zero saturation, so any
+# saturated colour separates from it whatever the brightness.
+#
+# Measured on the rendered image at the display curve, 2026-10-06:
+#   amber box   display RGB (252.5, 250.5, 171.8)  saturation 169.5
+#   blue  box   display RGB (186.1, 220.1, 252.5)  saturation 148.3
+#   terrain     display RGB (130.3, 130.3, 130.3)  saturation   0.0
+#   distance from terrain  amber 176.4, blue 161.6; between the two 108.8
+ROVER_RGB_LIT = (1.00, 0.72, 0.06)
+ROVER_RGB_DARK = (0.10, 0.30, 1.00)
+# The swatches on the figure are the colours as they appear after the display
+# curve, so the legend matches the pixels rather than the material.
+SWATCH_LIT, SWATCH_DARK = "#fcfaac", "#badcfc"
 
 GZ_CAPTION = (
     "Rendered by Gazebo; the illumination is OUR model written as an unlit "
@@ -778,17 +819,26 @@ GZ_CAPTION = (
     "amount, median +0.0577 m below 2.9 deg rising to +3.0844 m above 31 deg. "
     "The mechanism is open and unexplained.",
     "The rover's pose is commanded, not driven. Nothing here is a claim about "
-    "mobility, slip or traction.",
-    "The rover model's only visual geometry is its 1.53 x 1.53 x 0.60 m chassis "
-    "box; the mast and wheels carry sensor frames and no visual. Its shade is "
-    "set from our lit mask at its own cell, not by any Gazebo shadow.",
+    "mobility, slip or traction. Its only visual geometry is the 1.53 x 1.53 x "
+    "0.60 m chassis box; the mast and wheels carry sensor frames and no visual.",
     "Brightness is a single fixed cube-root display curve for the whole "
     "sequence, never per frame, so frames stay comparable: lit terrain renders "
     "at 34 of 255 before it and 130 after.",
-    "The chase view spans about 1.4 texels of a one-texel-per-20-m texture, so "
-    "its smooth light and dark gradients are that texture interpolated across "
-    "cells, not terrain detail. The map view draws the same cells unfiltered.",
+    "The thin dark band along the far edge of the wide view is the texture's "
+    "own margin, not terrain: the heightmap is 513 samples and the planning "
+    "region is 500, so 13 rows and columns, 260 m, lie outside it and are "
+    "written dark rather than extrapolated.",
 )
+
+# Sits beside the chase view rather than in the caption block, because it is
+# about that panel alone. sdformat cannot be asked for nearest-neighbour
+# sampling: the installed 1.9 heightmap_shape.sdf gives the texture element only
+# size, diffuse and normal, with no filtering option, and gz-sim builds the
+# terrain material itself, so the world file has no way to request it.
+CHASE_NOTE = ("about 1.4 texels wide: the smooth light and dark gradients here\n"
+              "are a 20 m texture interpolated across cells, not terrain.\n"
+              "sdformat exposes no nearest-neighbour option for a heightmap\n"
+              "texture, so this cannot be made to match the map view's squares.")
 
 
 def look_at(cam, tgt):
@@ -902,8 +952,8 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
             r, p_, y_ = look_at(cam, tgt)
             views.append((name, cam[0], cam[1], cam[2], r, p_, y_, fov,
                           VIEW_W, VIEW_H))
-        shade = (ROVER_SHADE_LIT if bool(litm[k].reshape(-1)[int(plan[step])])
-                 else ROVER_SHADE_DARK)
+        cell_lit = bool(litm[k].reshape(-1)[int(plan[step])])
+        shade = ROVER_RGB_LIT if cell_lit else ROVER_RGB_DARK
         sdf = build(side["path"], "ours", texdir / f"tex{k:04d}.png", normal,
                     side["pos_z"], [0.0, 0.0, -1.0], [], None, "vertices",
                     side["h_range"], rover_sdf, (), (), (wx, wy, wz, yaw),
@@ -932,16 +982,32 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
             for sp in ax.spines.values():
                 sp.set_color("#30343c")
             ax.set_title(label, color="#e6e8ec", fontsize=10)
+            if topic.endswith("chase/image"):
+                # Inside the panel it is about, rather than in the caption block
+                # at the foot of the figure, where it overlapped the full-width
+                # caption lines.
+                ax.text(0.015, 0.025, CHASE_NOTE, transform=ax.transAxes,
+                        color="#d6d9de", fontsize=7.0, va="bottom",
+                        bbox=dict(facecolor="#07070a", edgecolor="#30343c",
+                                  alpha=0.78, pad=4))
         fig.text(0.012, 0.955, f"{tag}   instance {instance}   t = {t:+.2f} h   "
                  f"plan step {step + 1} of {plan.size}   "
                  f"{stack['lit_fraction'][k]:.2%} of the region lit   "
-                 f"this cell: {'LIT' if shade == ROVER_SHADE_LIT else 'DARK'}",
+                 f"this cell: {'LIT' if cell_lit else 'DARK'}",
                  color="#9aa0aa", fontsize=10)
         fig.text(0.012, 0.925, f"display curve: brightness to the power "
                  f"{DISPLAY_GAMMA:.3f}, the same for every frame",
                  color="#7e848e", fontsize=8)
         for q, line in enumerate(GZ_CAPTION):
-            fig.text(0.012, 0.186 - q * 0.031, line, color="#7e848e", fontsize=7.5)
+            fig.text(0.012, 0.196 - q * 0.030, line, color="#7e848e", fontsize=7.2)
+        # The legend is the point of the colours, so it states them rather than
+        # leaving a viewer to infer a code from two frames.
+        for q, (sw, lab) in enumerate((
+                (SWATCH_LIT, "rover on a cell our model says is LIT"),
+                (SWATCH_DARK, "rover on a cell our model says is DARK"))):
+            fig.text(0.512 + q * 0.235, 0.925, "    ", fontsize=8,
+                     bbox=dict(facecolor=sw, edgecolor="#30343c", pad=2.5))
+            fig.text(0.532 + q * 0.235, 0.925, lab, color="#9aa0aa", fontsize=7.5)
         out = outdir / f"gz{k:04d}.png"
         fig.savefig(out, facecolor=fig.get_facecolor())
         plt.close(fig)
@@ -1250,8 +1316,8 @@ def main():
                            normalisation_peak_cos_incidence=stack["peak"],
                            lit_floor=LIT_FLOOR, rover_lift_m=ROVER_LIFT_M,
                            display_gamma=DISPLAY_GAMMA,
-                           rover_shade_lit=ROVER_SHADE_LIT,
-                           rover_shade_dark=ROVER_SHADE_DARK,
+                           rover_rgb_lit=list(ROVER_RGB_LIT),
+                           rover_rgb_dark=list(ROVER_RGB_DARK),
                            wide_offset_m=list(WIDE_OFFSET),
                            chase_offset_m=list(CHASE_OFFSET)),
         inputs=file_record([

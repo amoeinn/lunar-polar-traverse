@@ -523,3 +523,30 @@ def test_the_rover_shade_lands_on_the_visual_and_not_the_collision():
                      rover_pose=(1.0, 2.0, 3.0, 0.0))
     body = plain[plain.index("<model name='rover'"):]
     assert "<material>" not in body[:body.index("</model>")]
+
+    # A colour, not a grey. Brightness cannot carry the lit-dark signal here:
+    # the box renders at 56 raw at its darkest usable shade against lit terrain
+    # at 34, so a dark rover came out brighter than lit ground and read as lit.
+    # The three channels must therefore reach the file independently, and a
+    # colour collapsed to a grey is the failure this guards.
+    col = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                   "vertices", 2296.6073, rover=str(rover),
+                   rover_pose=(1.0, 2.0, 3.0, 0.0),
+                   rover_shade=(1.00, 0.72, 0.06))
+    vis = col[col.index("<visual "):]
+    assert "<ambient>1.0000 0.7200 0.0600 1</ambient>" in vis
+    assert "<emissive>1.0000 0.7200 0.0600 1</emissive>" in vis
+
+    # The two demo colours must differ in the file, or the frames cannot differ.
+    dk = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                  "vertices", 2296.6073, rover=str(rover),
+                  rover_pose=(1.0, 2.0, 3.0, 0.0),
+                  rover_shade=(0.10, 0.30, 1.00))
+    assert "<ambient>0.1000 0.3000 1.0000 1</ambient>" in dk
+    assert "1.0000 0.7200 0.0600" not in dk
+
+    # A malformed colour is refused rather than silently reinterpreted.
+    with pytest.raises(SystemExit, match="scalar or 3 values"):
+        MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                 "vertices", 2296.6073, rover=str(rover),
+                 rover_pose=(1.0, 2.0, 3.0, 0.0), rover_shade=(0.1, 0.2))
