@@ -376,13 +376,27 @@ def test_the_rover_pose_reaches_the_world_rather_than_only_being_computed():
     rover = ROOT / "data" / "work" / "gazebo" / "rover.sdf"
     if not rover.exists():
         pytest.skip("rover.sdf not converted")
+    def model_pose(pose):
+        sdf = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
+                       "vertices", 2296.6073, rover=str(rover), rover_pose=pose)
+        body = sdf[sdf.index("<model name='rover'"):]
+        body = body[:body.index("</model>")]
+        first = body[body.index("<pose>") + 6:body.index("</pose>")]
+        return [float(v) for v in first.split()], body
+
+    # Parsed rather than string-matched. The quantity this protects is the pose
+    # reaching the world, not how a zero is spelled, and a match on the exact
+    # text broke the moment the pose gained a yaw field while the geometry it
+    # guards was unchanged.
     want = (123.5, -456.25, 789.125)
-    sdf = MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
-                   "vertices", 2296.6073, rover=str(rover), rover_pose=want)
-    body = sdf[sdf.index("<model name='rover'"):]
-    body = body[:body.index("</model>")]
-    assert f"<pose>{want[0]} {want[1]} {want[2]} 0 0 0</pose>" in body, body[:300]
-    assert "<pose>0.0 0.0 2000.0 0 0 0</pose>" not in body
+    got, body = model_pose(want)
+    assert got == [123.5, -456.25, 789.125, 0.0, 0.0, 0.0], body[:300]
+    assert "2000.0" not in body.split("</pose>")[0]
+
+    # The demo turns the rover along its path, so a four-element pose must carry
+    # its yaw through to the world and must not disturb the position.
+    got, body = model_pose((123.5, -456.25, 789.125, 1.25))
+    assert got == [123.5, -456.25, 789.125, 0.0, 0.0, 1.25], body[:300]
 
 
 def _generated_world(tmp_path, texture_rel):

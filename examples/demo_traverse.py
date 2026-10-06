@@ -1,0 +1,1097 @@
+"""The demo traverse: a 2D map animation and a Gazebo animation of one plan.
+
+Reads and never recomputes. Every plan, verdict, arrival and accumulated shadow
+comes from the stored outputs of the committed sweep and executive runs, so this
+cannot disagree with the record by re-deriving it. The one thing it does run is
+the committed replay checker, and only over prefixes of a plan it already has,
+to ask the checker where a plan it already rejected first went over budget. That
+question has no stored answer: the sweep records the per-plan maximum and not
+the step it occurred at.
+
+The instance selection rules R1 to R4 are registered in PLAN.md on 2026-10-05,
+before any candidate had been examined, and are implemented here exactly. Every
+filter's candidate count is printed and written to the sidecar, so a reader can
+check that the filters and not a preference chose the instance.
+
+What the artifacts may and may not be read as is in PLAN.md under "Where it
+could mislead", and the same nine items are drawn on the figures themselves.
+"""
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import examples.plan_pilot as P                                      # noqa: E402
+from examples.build_intervals import cache_path, epochs              # noqa: E402
+from examples.illumination_texture import LIT_FLOOR, irradiance      # noqa: E402
+from src.cost import Rover                                           # noqa: E402
+from src.gzmap import HEIGHTMAP_N, PX, REGION_N, REGION_OX, REGION_OY  # noqa: E402
+from src.gzmap import bilinear, cell_to_map, map_to_world             # noqa: E402
+from src.intervals import CADENCE_H, LitIntervals                     # noqa: E402
+from src.replay import ReplaySettings, replay                         # noqa: E402
+
+SWEEP = ROOT / "data" / "work" / "sweep"
+CORR = ROOT / "data" / "work" / "executive_correction"
+OUT = ROOT / "data" / "work" / "demo"
+
+BUDGET_H = 2.0              # the monitored configuration's shadow budget
+ARRIVAL_MIN_H = 24.0        # R1's clause, which is P2's own registered regime
+MEANMAP_ARM = "mm2.0"       # the mean-map baseline at its reported best exponent
+V_FLAT = 50.0               # the monitored configuration's rate
+
+# The keys examples/sweep_core.py puts in the replay checker's `grid`. Read back
+# from the stored replay_params.json rather than rebuilt, so a prefix replay runs
+# against the same geometry the published verdicts were produced with.
+GRID_KEYS = ("radius_m", "region_ox", "region_oy", "region_px", "region_nx",
+             "near_path", "near_ox", "near_oy", "near_px", "near_width",
+             "near_height", "far_path", "far_ox", "far_oy", "far_px",
+             "far_width", "far_height", "reach_m", "switch_m", "near_step_m",
+             "far_step_m")
+
+
+# --------------------------------------------------------------------------
+# read-only accessors over the stored sweep and executive outputs
+# --------------------------------------------------------------------------
+
+def epoch_tags():
+    """The registered enumeration order: epochs() as build_intervals returns it."""
+    return [t for t, _, _ in epochs()]
+
+
+def planner_out(tag, kind):
+    """What the planner binary wrote for one epoch and planner, plus its pairs."""
+    d = SWEEP / f"{tag}_{kind}"
+    pj = json.loads((d / "planner_params.json").read_text())
+    off = np.fromfile(pj["out_path_offsets"], np.int64)
+    return dict(
+        params=pj,
+        pairs=np.fromfile(d / "pairs.bin", np.int32).reshape(-1, 2),
+        offsets=off,
+        cells=np.fromfile(pj["out_path_cells"], np.int32),
+        times=np.fromfile(pj["out_path_times"], np.float64),
+        arrival=np.fromfile(pj["out_arrival"], np.float64),
+        aborted=np.fromfile(pj["out_flags"], np.uint8).astype(bool),
+        # The replay stage kept only plans of two cells or more, in pair order.
+        # That list is the map from a replay row back to its instance, and it is
+        # not stored, so it is rebuilt here the same way sweep_core built it.
+        index=[q for q in range(off.size - 1) if off[q + 1] - off[q] >= 2])
+
+
+def has_replay(tag, kind, label="tol"):
+    """Whether the sweep judged any plan here.
+
+    An epoch where a planner produced nothing was never handed to the checker,
+    so the directory does not exist. 2028-05-15_p0 is one: the time-dependent
+    planner returned 0 feasible plans of 120 instances there.
+    """
+    return (SWEEP / f"{tag}_replay_{kind}_{label}"
+            / "plan_offsets_path.bin").exists()
+
+
+def replay_out(tag, kind, label="tol"):
+    """What the replay checker wrote, with the plans it was given."""
+    d = SWEEP / f"{tag}_replay_{kind}_{label}"
+    off = np.fromfile(d / "plan_offsets_path.bin", np.int64)
+    return dict(
+        dir=d,
+        params=json.loads((d / "replay_params.json").read_text()),
+        offsets=off,
+        cells=np.fromfile(d / "plan_cells_path.bin", np.int32),
+        starts=np.fromfile(d / "plan_start_path.bin", np.float64),
+        waits=np.fromfile(d / "plan_wait_path.bin", np.float64),
+        verdict=np.fromfile(d / "out_verdict.bin", np.uint8).astype(bool),
+        arrival=np.fromfile(d / "out_arrival.bin", np.float64),
+        shadow=np.fromfile(d / "out_shadow.bin", np.float64),
+        illegal=np.fromfile(d / "out_illegal.bin", np.int32))
+
+
+def assert_drivable(tag, plan_index):
+    """C5: only a plan the checker accepted may be played back as a drive.
+
+    Asserted from the checker's own out_verdict.bin, not from a filename, which
+    is what C5 asks for in those words. A rejected plan has no feasible schedule
+    to animate, so the refusal is the honest outcome and inventing a trajectory
+    for it would be the exact substitution C5 exists to forbid.
+    """
+    rep = replay_out(tag, "td")
+    if plan_index >= rep["verdict"].size:
+        raise SystemExit(f"{tag} plan{plan_index:03d}: no such replay row")
+    if not bool(rep["verdict"][plan_index]):
+        raise SystemExit(
+            f"{tag} plan{plan_index:03d}: the replay checker rejected this plan "
+            f"(shadow {rep['shadow'][plan_index]:.4f} h against a "
+            f"{BUDGET_H:.1f} h budget, illegal step "
+            f"{int(rep['illegal'][plan_index])}); C5 forbids driving it")
+    return True
+
+
+def plan_at(rep, row):
+    """One plan, its waits and its departure, out of a replay directory."""
+    lo, hi = int(rep["offsets"][row]), int(rep["offsets"][row + 1])
+    return (rep["cells"][lo:hi].astype(np.int64),
+            rep["waits"][lo:hi].astype(np.float64),
+            float(rep["starts"][row]))
+
+
+# --------------------------------------------------------------------------
+# the registered rules R1 to R4, implemented exactly as written
+# --------------------------------------------------------------------------
+
+def select_r1():
+    """R1: snapshot rejected, time-dependent accepted, arrival over 24 h.
+
+    Ordering is positional and nothing else enters: epochs in epochs() order,
+    then instance index ascending, first match taken. The arrival used is the
+    checker's, since the checker is the authority on a plan it accepted; the
+    planner's is reported beside it.
+    """
+    counts = dict(epochs=0, epochs_judged=0, snap_plans=0, snap_rejected=0,
+                  td_accepted_same_pair=0, over_24h=0)
+    cands = []
+    for tag in epoch_tags():
+        if not (SWEEP / f"{tag}_td" / "planner_params.json").exists():
+            continue
+        counts["epochs"] += 1
+        if not (has_replay(tag, "td") and has_replay(tag, "snap")):
+            continue
+        counts["epochs_judged"] += 1
+        td_p, sn_p = planner_out(tag, "td"), planner_out(tag, "snap")
+        td_r, sn_r = replay_out(tag, "td"), replay_out(tag, "snap")
+        assert len(td_p["index"]) == td_r["verdict"].size, (tag, "td rows")
+        assert len(sn_p["index"]) == sn_r["verdict"].size, (tag, "snap rows")
+        td_row = {q: i for i, q in enumerate(td_p["index"])}
+        counts["snap_plans"] += len(sn_p["index"])
+        for s_row, q in enumerate(sn_p["index"]):
+            if sn_r["verdict"][s_row]:
+                continue
+            counts["snap_rejected"] += 1
+            t_row = td_row.get(q)
+            if t_row is None or not td_r["verdict"][t_row]:
+                continue
+            counts["td_accepted_same_pair"] += 1
+            arr = float(td_r["arrival"][t_row])
+            if arr <= ARRIVAL_MIN_H:
+                continue
+            counts["over_24h"] += 1
+            cands.append(dict(tag=tag, instance=int(q), td_row=t_row,
+                              snap_row=s_row, arrival_checker=arr,
+                              arrival_planner=float(td_p["arrival"][q])))
+    return (cands[0] if cands else None), counts, cands
+
+
+def _corr_records():
+    """The executive's five-arm records, keyed by arm then (tag, plan index)."""
+    recs = json.loads((CORR / "results.json").read_text())
+    order = {t: k for k, t in enumerate(epoch_tags())}
+    arms = {}
+    for r in recs:
+        arms.setdefault(r["kind"], {})[(r["tag"], r["plan_index"])] = r
+    keys = sorted(arms["none"], key=lambda k: (order[k[0]], k[1]))
+    return arms, keys
+
+
+def select_r2():
+    """R2: the busts among the 45 monitored plans, first in enumeration order."""
+    arms, keys = _corr_records()
+    cands = [dict(tag=t, plan_index=i)
+             for (t, i) in keys
+             if arms["none"][(t, i)]["monitored"]
+             and arms["none"][(t, i)]["busted"]]
+    counts = dict(monitored=sum(1 for k in keys if arms["none"][k]["monitored"]),
+                  busts=len(cands))
+    return (cands[0] if cands else None), counts, cands
+
+
+def select_r3():
+    """R3: a monitored non-bust the bounded rule fires on and B3b-lit clears."""
+    arms, keys = _corr_records()
+    cands = []
+    for k in keys:
+        base = arms["none"][k]
+        if not base["monitored"] or base["busted"]:
+            continue
+        if base["fired"] and not arms["lit"][k]["fired"]:
+            cands.append(dict(tag=k[0], plan_index=k[1]))
+    nonbust = [k for k in keys
+               if arms["none"][k]["monitored"] and not arms["none"][k]["busted"]]
+    counts = dict(monitored_nonbust=len(nonbust),
+                  false_alarms=sum(1 for k in nonbust if arms["none"][k]["fired"]),
+                  removed_by_lit=len(cands))
+    return (cands[0] if cands else None), counts, cands
+
+
+def select_r4():
+    """R4: no selection. Every epoch, with what the record already reports."""
+    rows = []
+    for tag in epoch_tags():
+        if not (SWEEP / f"{tag}_td" / "planner_params.json").exists():
+            rows.append(dict(tag=tag, present=False))
+            continue
+        td_p, sn_p = planner_out(tag, "td"), planner_out(tag, "snap")
+        iv = LitIntervals.load(cache_path(tag))
+        if not (has_replay(tag, "td") and has_replay(tag, "snap")):
+            rows.append(dict(tag=tag, present=True, judged=False,
+                             lit_t0=float(iv.lit0.mean()),
+                             td_plans=len(td_p["index"]),
+                             snap_plans=len(sn_p["index"]),
+                             aborted=int(td_p["aborted"].sum())))
+            continue
+        td_r, sn_r = replay_out(tag, "td"), replay_out(tag, "snap")
+        rows.append(dict(tag=tag, present=True, judged=True,
+                         lit_t0=float(iv.lit0.mean()),
+                         td_plans=len(td_p["index"]),
+                         td_pass=int(td_r["verdict"].sum()),
+                         snap_plans=len(sn_p["index"]),
+                         snap_pass=int(sn_r["verdict"].sum()),
+                         aborted=int(td_p["aborted"].sum())))
+    return rows
+
+
+# --------------------------------------------------------------------------
+# the checker, asked where a plan first went over budget
+# --------------------------------------------------------------------------
+
+def shadow_curve(rep, row, work):
+    """Accumulated continuous shadow against prefix length, from the checker.
+
+    The sweep stores the per-plan maximum and not where it occurred, so the
+    curve is obtained by handing the committed checker every prefix of the plan
+    in one batch. The quantity is a maximum over the traverse, so it is monotone
+    in prefix length, and the last point must reproduce the stored value exactly.
+    That equality is asserted: it checks the whole read-back chain at once, the
+    plan, the waits, the departure and the sun table.
+    """
+    plan, wait, start = plan_at(rep, row)
+    if plan.size < 2:
+        raise SystemExit("a plan of under two cells has no prefix curve")
+    grid = {k: rep["params"][k] for k in GRID_KEYS}
+    sun = np.fromfile(rep["dir"] / "sun_path.bin", np.float64).reshape(-1, 3)
+    rover = Rover(v_flat=V_FLAT)
+    for k, v in (("v_flat", rover.v_flat), ("pitch_max", rover.pitch_max),
+                 ("roll_max", rover.roll_max)):
+        assert abs(float(rep["params"][k]) - v) < 1e-9, (k, rep["params"][k], v)
+    lengths = list(range(2, plan.size + 1))
+    out = replay([plan[:L] for L in lengths], [start] * len(lengths), grid, rover,
+                 sun, float(rep["params"]["sun_dt_hours"]), BUDGET_H, Path(work),
+                 ReplaySettings(
+                     limit_tolerance_deg=float(rep["params"]["limit_tolerance_deg"])),
+                 waits=[wait[:L] for L in lengths])
+    curve = out["shadow"]
+    stored = float(rep["shadow"][row])
+    assert abs(float(curve[-1]) - stored) < 1e-9, (float(curve[-1]), stored)
+    over = np.flatnonzero(curve > BUDGET_H)
+    return dict(lengths=np.asarray(lengths), shadow=curve,
+                arrival=out["arrival"], stored_shadow=stored,
+                first_over=int(lengths[int(over[0])]) if over.size else None,
+                illegal=int(rep["illegal"][row]))
+
+
+# --------------------------------------------------------------------------
+# illumination fields, one per frame, on one fixed normalisation
+# --------------------------------------------------------------------------
+
+def frame_times(t_dep, t_arr):
+    """One frame per sun-table sample, so no frame shows an unevaluated state."""
+    k0 = int(np.floor(t_dep / CADENCE_H))
+    k1 = int(np.ceil(t_arr / CADENCE_H))
+    return np.arange(k0, k1 + 1) * CADENCE_H
+
+
+def field_stack(tag, times, path):
+    """Our model's irradiance per cell at every frame time, as a memmap.
+
+    One fixed normalisation constant for the whole sequence, which is the point
+    of building the stack before writing any image: the committed texture writer
+    normalises each frame by that frame's own peak, correct frame by frame and
+    wrong in a sequence, because the sun elevation moves over a traverse and the
+    picture would hold its brightness while the irradiance fell.
+    """
+    p, n, px, dem, horizon, cells, gx, gy, edges, _ = P.load(Rover(v_flat=V_FLAT))
+    iv = LitIntervals.load(cache_path(tag))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mpath = path.with_name(path.stem + "_lit.npy")
+    mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32,
+                                   shape=(times.size, n, n))
+    ml = np.lib.format.open_memmap(mpath, mode="w+", dtype=np.uint8,
+                                   shape=(times.size, n, n))
+    lit_frac, peak = np.zeros(times.size), 0.0
+    for k, t in enumerate(times):
+        lit = np.asarray([iv.is_lit(c, float(t)) for c in range(n * n)], dtype=bool)
+        cosi = irradiance(tag, float(t), dem, gx, gy, p["radius_m"])
+        f = np.where(lit, cosi, 0.0).reshape(n, n)
+        mm[k] = f.astype(np.float32)
+        # The mask is stored, not recovered from the field being positive. At
+        # this epoch the sun is about a degree up and cos(incidence) clips to
+        # exactly zero on 153188 of 168873 lit cells, so "field > 0" would call
+        # 90.7% of the lit region dark and the picture would be the inverse of
+        # the model. The committed texture writer floors by the mask for the
+        # same reason and this keeps that convention rather than re-deriving it.
+        ml[k] = lit.reshape(n, n).astype(np.uint8)
+        lit_frac[k] = float(lit.mean())
+        peak = max(peak, float(f.max()))
+    mm.flush()
+    ml.flush()
+    return dict(path=str(path), lit_path=str(mpath), peak=peak,
+                lit_fraction=lit_frac, dem=dem, n=n, radius_m=p["radius_m"])
+
+
+def texture_png(field, litmask, peak, out):
+    """One 513 x 513 unlit texture, on the sequence's fixed normalisation.
+
+    Identical in convention to examples/illumination_texture.py, including the
+    floor that keeps a lit cell from quantising to zero and the 13 extra rows
+    and columns written dark rather than extrapolated, and differing from it in
+    exactly one way: peak is the sequence's, not the frame's.
+    """
+    import matplotlib.image as mpimg
+    tex = np.zeros((HEIGHTMAP_N, HEIGHTMAP_N), dtype=np.float64)
+    tex[:REGION_N, :REGION_N] = field
+    img = np.zeros_like(tex) if peak <= 0 else tex / peak
+    litmap = np.zeros_like(tex, dtype=bool)
+    litmap[:REGION_N, :REGION_N] = np.asarray(litmask, bool)
+    img = np.where(litmap, np.maximum(img, LIT_FLOOR), 0.0)
+    arr = (np.clip(img, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    mpimg.imsave(out, arr, cmap="gray", vmin=0, vmax=255)
+    return out
+
+
+# --------------------------------------------------------------------------
+# geometry helpers shared by both artifacts
+# --------------------------------------------------------------------------
+
+def cells_to_map(cells, n=REGION_N):
+    i, j = np.asarray(cells) // n, np.asarray(cells) % n
+    return cell_to_map(i, j)
+
+
+def step_at(times, t):
+    """The plan step the rover is on at time t: the last one already departed."""
+    k = int(np.searchsorted(np.asarray(times, float), float(t), side="right") - 1)
+    return max(0, min(k, len(times) - 1))
+
+
+# --------------------------------------------------------------------------
+# the 2D map view, which is the load-bearing artifact
+# --------------------------------------------------------------------------
+
+CAPTION = (
+    "Shadows are our illumination model's, not Gazebo's. Greyscale is the lit "
+    "mask with relative cos(incidence) above a 0.25 floor, not photometry.",
+    "The time-dependent planner does not arrive earlier: median +0.51% over the "
+    "182 cases where both plans are feasible, P3 clause 2 scored FAIL.",
+    "One epoch is one geometry. Frames are 15 min apart; a cell lit at two "
+    "consecutive samples can be dark between them.",
+)
+
+C_TD, C_SNAP, C_MM, C_ROVER = "#36d7e0", "#ff9436", "#d86bff", "#ffe14d"
+
+# Figure geometry. The region map is square data, so its box is square in
+# inches: a 16 x 9 figure and a height of 0.78 give a width of 0.78 * 9 / 16.
+REGION_RECT = [0.030, 0.145, 0.75 * 9.0 / 16.0, 0.75]
+ZOOM_RECT_X, ZOOM_RECT_Y, ZOOM_RECT_W = 0.500, 0.560, 0.250
+SHADOW_RECT = [0.500, 0.145, 0.250, 0.300]
+TEXT_RECT = [0.785, 0.145, 0.200, 0.690]
+
+
+def route_rows(tag, instance):
+    """The three planners' rows for one instance, where each produced a plan."""
+    out = {}
+    td = planner_out(tag, "td")
+    out["td"] = td["index"].index(instance) if instance in td["index"] else None
+    sn = planner_out(tag, "snap")
+    out["snap"] = sn["index"].index(instance) if instance in sn["index"] else None
+    mm = replay_out(tag, MEANMAP_ARM)
+    # The mean-map planner produced a plan for every instance, so its replay row
+    # is the instance index. Asserted rather than assumed, since a short plan
+    # would have been dropped and shifted every row after it.
+    assert mm["offsets"].size - 1 == 120, (tag, mm["offsets"].size - 1)
+    out["mm"] = instance
+    return out
+
+
+def panel_lines(tag, instance, rows, curves, same=()):
+    """The checker's own output for every planner, verbatim, as panel text."""
+    lines = [f"epoch {tag}   instance {instance}", ""]
+    lines.append(f"{'planner':<14}{'verdict':>9}{'arrive':>9}{'shadow':>8}")
+    for key, label, kind in (("td", "time-dependent", "td"),
+                             ("snap", "snapshot", "snap"),
+                             ("mm", "mean-map e=2", MEANMAP_ARM)):
+        r = rows[key]
+        if r is None:
+            lines.append(f"{label:<14}{'no plan':>9}{'-':>9}{'-':>8}")
+            continue
+        rep = replay_out(tag, kind)
+        v = "ACCEPTED" if rep["verdict"][r] else "REJECTED"
+        lines.append(f"{label:<14}{v:>9}{rep['arrival'][r]:>9.2f}"
+                     f"{rep['shadow'][r]:>8.3f}")
+    lines += ["", f"shadow budget{BUDGET_H:>8.2f} h"]
+    c = curves.get("td")
+    if c and c["first_over"] is not None:
+        lines.append(f"over budget from step {c['first_over']}")
+    if "snap" in same:
+        lines += ["", "the snapshot planner returned the SAME route,",
+                  "cell for cell, and the checker accepted both.",
+                  "On this core the two planners never disagree",
+                  "on feasibility: 178 of 181 shared pairs both",
+                  "accepted, 3 both rejected, 0 either way."]
+    lines += ["", "Arrival times agree to about half a percent.",
+              "P3 clause 2 is scored FAIL: the method does not",
+              "arrive earlier. What it does is decline to emit",
+              "plans it cannot certify."]
+    return lines
+
+
+def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=100):
+    """One PNG per sun-table sample: the sweeping mask, the routes, the rover.
+
+    Two map axes, because one cannot carry both facts. The region is 10.24 km
+    and this traverse is 560 m of it, so a single view either shows the shadows
+    sweeping and loses the route to a few pixels, or shows the route and loses
+    the sweep. The left view is the region with the zoom box drawn on it and the
+    right view is the route, both at the same instant.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    fields = np.load(stack["path"], mmap_mode="r")
+    litm = np.load(stack["lit_path"], mmap_mode="r")
+    peak = stack["peak"]
+    ext_km = (REGION_OX / 1000.0, (REGION_OX + REGION_N * PX) / 1000.0,
+              (REGION_OY - REGION_N * PX) / 1000.0, REGION_OY / 1000.0)
+    rep_td = replay_out(tag, "td")
+    plan, _, dep = plan_at(rep_td, rows["td"])
+    pt = planner_out(tag, "td")
+    off = pt["offsets"]
+    lo, hi = int(off[instance]), int(off[instance + 1])
+    tsteps = pt["times"][lo:hi]
+    routes, same = {}, []
+    for key, kind in (("td", "td"), ("snap", "snap"), ("mm", MEANMAP_ARM)):
+        if rows[key] is None:
+            continue
+        pl, _, _ = plan_at(replay_out(tag, kind), rows[key])
+        if key != "td" and pl.size == plan.size and bool((pl == plan).all()):
+            same.append(key)
+        x, y = cells_to_map(pl)
+        routes[key] = (x / 1000.0, y / 1000.0)
+    rx, ry = cells_to_map(plan)
+    # The zoom box is the union of every route drawn, with a fixed margin, so it
+    # does not move between frames and cannot be read as the camera following
+    # anything interesting.
+    allx = np.concatenate([routes[k][0] for k in routes])
+    ally = np.concatenate([routes[k][1] for k in routes])
+    mx = max(0.35, 0.25 * max(np.ptp(allx), np.ptp(ally)))
+    zx = (allx.min() - mx, allx.max() + mx)
+    zy = (ally.min() - mx, ally.max() + mx)
+    # The zoom axes box is sized from the zoom's own data aspect.
+    zoom_w_in = ZOOM_RECT_W * 16.0
+    zoom_rect = [ZOOM_RECT_X, ZOOM_RECT_Y, ZOOM_RECT_W,
+                 (zoom_w_in / ((zx[1] - zx[0]) / (zy[1] - zy[0]))) / 9.0]
+    dem = stack["dem"]
+    i0, i1 = (np.clip(np.floor((REGION_OY / 1000.0 - np.array([zy[1], zy[0]]))
+                               * 1000.0 / PX).astype(int), 0, REGION_N - 1))
+    j0, j1 = (np.clip(np.floor((np.array([zx[0], zx[1]]) * 1000.0 - REGION_OX)
+                               / PX).astype(int), 0, REGION_N - 1))
+    czz = np.asarray(dem, float)[i0:i1 + 1, j0:j1 + 1]
+    # cell_to_map takes x from the column and y from the row, so the two axes
+    # come from separate calls rather than from one broadcast.
+    cgx = cell_to_map(0, np.arange(j0, j1 + 1))[0] / 1000.0
+    cgy = cell_to_map(np.arange(i0, i1 + 1), 0)[1] / 1000.0
+    clev = np.arange(np.floor(czz.min() / 10.0) * 10.0, czz.max() + 10.0, 10.0)
+    lines = panel_lines(tag, instance, rows, curves, same)
+    cv = curves["td"]
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for k, t in enumerate(times):
+        img = np.asarray(fields[k], float)
+        mask = np.asarray(litm[k], bool)
+        shown = np.where(mask, np.maximum(img / max(peak, 1e-12), LIT_FLOOR), 0.0)
+        fig = plt.figure(figsize=(16, 9), dpi=dpi, facecolor="#07070a")
+        step = step_at(tsteps, t)
+
+        # Each axes box is sized to its own data aspect, so neither map is
+        # letterboxed into a band of empty figure and neither is stretched. A
+        # stretched map would misreport the terrain, which is why the boxes move
+        # rather than the aspect.
+        axes = []
+        for q, (rect, lim, title) in enumerate((
+                (REGION_RECT, None,
+                 f"the planning region, 10.24 km, at t = {t:+.2f} h"),
+                (zoom_rect, (zx, zy),
+                 f"the traverse, {1000 * (zx[1] - zx[0]):.0f} m across"))):
+            ax = fig.add_axes(rect)
+            ax.set_facecolor("#07070a")
+            ax.imshow(shown, cmap="gray", vmin=0.0, vmax=1.0, extent=ext_km,
+                      origin="upper", interpolation="nearest")
+            for key, (style, col, lw, lab) in (
+                    ("snap", ("-", C_SNAP, 5.0, "snapshot plan")),
+                    ("mm", (":", C_MM, 1.8, "mean-map plan")),
+                    ("td", ("-", C_TD, 1.8, "time-dependent plan, driven"))):
+                if key in routes:
+                    ax.plot(*routes[key], style, color=col, lw=lw,
+                            solid_capstyle="round",
+                            alpha=0.55 if key == "snap" else 1.0, label=lab)
+            ax.plot([rx[step] / 1000.0], [ry[step] / 1000.0], "o", color=C_ROVER,
+                    ms=11 if lim else 7, mec="#07070a", mew=1.2,
+                    label="rover (pose commanded)")
+            ax.plot([rx[0] / 1000.0], [ry[0] / 1000.0], "s", color="#ffffff", ms=5)
+            ax.plot([rx[-1] / 1000.0], [ry[-1] / 1000.0], "*", color="#ffffff",
+                    ms=12)
+            if lim is None:
+                ax.add_patch(Rectangle((zx[0], zy[0]), zx[1] - zx[0],
+                                       zy[1] - zy[0], fill=False,
+                                       edgecolor="#ffffff", lw=0.9, ls="--"))
+            else:
+                ax.set_xlim(*lim[0])
+                ax.set_ylim(*lim[1])
+                # Relief as a separate channel. The greyscale is irradiance and
+                # must stay that, so the terrain is drawn as contour lines over
+                # it rather than shaded into it: at this sun elevation almost
+                # every lit cell sits on the 0.25 floor and the zoom would
+                # otherwise be a flat grey rectangle carrying no terrain at all.
+                ax.contour(cgx, cgy, czz, levels=clev, colors="#4b5563",
+                           linewidths=0.6, alpha=0.9)
+            ax.set_xlabel("map x (km)", color="#9aa0aa", fontsize=8)
+            if q == 0:
+                ax.set_ylabel("map y (km)", color="#9aa0aa", fontsize=8)
+            ax.tick_params(colors="#9aa0aa", labelsize=7)
+            for sp in ax.spines.values():
+                sp.set_color("#30343c")
+            ax.set_title(title, color="#e6e8ec", fontsize=10)
+            axes.append(ax)
+        leg = axes[1].legend(loc="upper left", fontsize=7.5, facecolor="#101218",
+                             edgecolor="#30343c", labelcolor="#d6d9de")
+        leg.get_frame().set_alpha(0.92)
+        fig.text(0.030, 0.958, f"{tag}   instance {instance}   "
+                 f"{stack['lit_fraction'][k]:.2%} of the region lit   "
+                 f"plan step {step + 1} of {plan.size}", color="#9aa0aa",
+                 fontsize=9)
+
+        axs = fig.add_axes(SHADOW_RECT)
+        axs.set_facecolor("#101218")
+        axs.plot(cv["lengths"], cv["shadow"], "-", color=C_TD, lw=1.6)
+        axs.axhline(BUDGET_H, color="#ff5c5c", ls="--", lw=1.2)
+        axs.axvline(step + 1, color=C_ROVER, lw=1.2)
+        axs.set_ylim(0.0, max(BUDGET_H * 1.15, float(cv["shadow"].max()) * 1.15))
+        axs.set_xlabel("plan step", color="#9aa0aa", fontsize=8)
+        axs.set_ylabel("accumulated shadow (h)", color="#9aa0aa", fontsize=8)
+        axs.set_title("the checker's own integration, by prefix",
+                      color="#e6e8ec", fontsize=9)
+        axs.tick_params(colors="#9aa0aa", labelsize=7)
+        for sp in axs.spines.values():
+            sp.set_color("#30343c")
+        axs.text(0.98, 0.90, f"budget {BUDGET_H:.1f} h", color="#ff5c5c",
+                 fontsize=8, ha="right", transform=axs.transAxes)
+
+        axt = fig.add_axes(TEXT_RECT)
+        axt.axis("off")
+        axt.text(0.0, 1.0, "\n".join(lines), color="#d6d9de", fontsize=8.0,
+                 family="monospace", va="top", transform=axt.transAxes)
+
+        for q, line in enumerate(CAPTION):
+            fig.text(0.030, 0.082 - q * 0.026, line, color="#7e848e", fontsize=7.5)
+        out = outdir / f"frame{k:04d}.png"
+        fig.savefig(out, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        written.append(out)
+    return written
+
+
+# --------------------------------------------------------------------------
+# the Gazebo animation, the second artifact
+# --------------------------------------------------------------------------
+
+GZ = "/usr/bin/gz"
+GZ_ENV_KEY = "GZ_CONFIG_PATH"
+GZ_CONFIG = "/usr/share/gz"
+ROVER_LIFT_M = 0.5          # a display offset; the pose is commanded, see C5
+WIDE_OFFSET = (-1200.0, -1200.0, 1100.0)
+CHASE_OFFSET = (-30.0, -30.0, 14.0)
+VIEW_W, VIEW_H = 800, 600
+WIDE_FOV, CHASE_FOV = 1.10, 1.05
+
+GZ_CAPTION = (
+    "Rendered by Gazebo; the illumination is OUR model written as an unlit "
+    "texture, and the scene's light casts no shadow. C3 measured 2.6039% of "
+    "texture pixels disagreeing with our own lit mask.",
+    "The rendered surface is not the DEM: it differs by a slope-dependent "
+    "amount, median +0.0577 m below 2.9 deg rising to +3.0844 m above 31 deg. "
+    "The mechanism is open and unexplained.",
+    "The rover's pose is commanded, not driven. Nothing here is a claim about "
+    "mobility, slip or traction.",
+)
+
+
+def look_at(cam, tgt):
+    """Roll, pitch and yaw that point a Gazebo camera from cam at tgt."""
+    dx, dy, dz = (tgt[0] - cam[0], tgt[1] - cam[1], tgt[2] - cam[2])
+    yaw = float(np.arctan2(dy, dx))
+    pitch = float(-np.arctan2(dz, float(np.hypot(dx, dy))))
+    return 0.0, pitch, yaw
+
+
+def rover_world_pose(cells, step, dem):
+    """World x, y, z and yaw for the rover at one plan step.
+
+    z comes from the DEM, not from Gazebo's rendered surface, and the two differ
+    by a slope-dependent amount this record carries as open. The pose is
+    commanded, so this is a placement and not a contact solution.
+    """
+    i, j = int(cells[step]) // REGION_N, int(cells[step]) % REGION_N
+    mx, my = cell_to_map(i, j)
+    wx, wy = map_to_world(mx, my)
+    z = float(bilinear(dem, i, j)) + ROVER_LIFT_M
+    nxt = min(step + 1, len(cells) - 1)
+    i2, j2 = int(cells[nxt]) // REGION_N, int(cells[nxt]) % REGION_N
+    mx2, my2 = cell_to_map(i2, j2)
+    yaw = (float(np.arctan2(my2 - my, mx2 - mx))
+           if (i2, j2) != (i, j) else 0.0)
+    return float(wx), float(wy), z, yaw
+
+
+def gz_grab(sdf, topics, poll_s=0.5, cap_s=40.0):
+    """Launch, poll until every topic has a non-blank image, tear down.
+
+    Polled rather than slept. Measured on 2026-10-06: the first image arrives in
+    2.6 to 3.0 s and is bit-identical to the image at 30 s, because the scene is
+    static. The committed camera path's 30 s settle came from the sphere checks,
+    where something had to stop moving, and it is 10 times too long here. A
+    non-blank check is kept because an arriving message is not a finished render,
+    which is this record's standing lesson about trusting a return value.
+    """
+    import base64
+    import os
+    import time
+
+    env = dict(os.environ, **{GZ_ENV_KEY: GZ_CONFIG})
+    proc = subprocess.Popen([GZ, "sim", "-s", "-r", "-v", "1", str(sdf)],
+                            env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    got, t0 = {}, time.time()
+    try:
+        while len(got) < len(topics) and time.time() - t0 < cap_s:
+            time.sleep(poll_s)
+            for t in topics:
+                if t in got:
+                    continue
+                r = subprocess.run([GZ, "topic", "-e", "-t", t, "-n", "1",
+                                    "--json-output"], env=env,
+                                   capture_output=True, text=True, timeout=20)
+                if not r.stdout.strip():
+                    continue
+                m = json.loads(r.stdout)
+                if not m.get("data"):
+                    continue
+                w, h = int(m["width"]), int(m["height"])
+                a = np.frombuffer(base64.b64decode(m["data"]), np.uint8)
+                if a.size < w * h * 3 or not a.any():
+                    continue
+                got[t] = a[:w * h * 3].reshape(h, w, 3)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    missing = [t for t in topics if t not in got]
+    if missing:
+        raise SystemExit(f"no image on {', '.join(missing)} within {cap_s:.0f} s")
+    return got
+
+
+def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
+                  dpi=100):
+    """One Gazebo frame per sun-table sample, two views, same cadence as the map."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from examples.make_world import build, flat_normal_png
+
+    side = json.loads((ROOT / "data" / "work" / "gazebo"
+                       / "region_heightmap.json").read_text())
+    normal = flat_normal_png(ROOT / "data" / "work" / "gazebo" / "flat_normal.png")
+    rep_td = replay_out(tag, "td")
+    plan, _, _ = plan_at(rep_td, rows["td"])
+    pt = planner_out(tag, "td")
+    lo, hi = int(pt["offsets"][instance]), int(pt["offsets"][instance + 1])
+    tsteps = pt["times"][lo:hi]
+    dem, outdir, texdir = stack["dem"], Path(outdir), Path(texdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    work = outdir / "worlds"
+    work.mkdir(parents=True, exist_ok=True)
+    written = []
+    for k, t in enumerate(times):
+        step = step_at(tsteps, t)
+        wx, wy, wz, yaw = rover_world_pose(plan, step, dem)
+        tgt = (wx, wy, wz + 1.2)
+        views = []
+        for name, off, fov in (("wide", WIDE_OFFSET, WIDE_FOV),
+                               ("chase", CHASE_OFFSET, CHASE_FOV)):
+            cam = (wx + off[0], wy + off[1], wz + off[2])
+            r, p_, y_ = look_at(cam, tgt)
+            views.append((name, cam[0], cam[1], cam[2], r, p_, y_, fov,
+                          VIEW_W, VIEW_H))
+        sdf = build(side["path"], "ours", texdir / f"tex{k:04d}.png", normal,
+                    side["pos_z"], [0.0, 0.0, -1.0], [], None, "vertices",
+                    side["h_range"], rover_sdf, (), (), (wx, wy, wz, yaw),
+                    False, views)
+        wf = work / f"frame{k:04d}.sdf"
+        wf.write_text(sdf)
+        img = gz_grab(wf, ["view/wide/image", "view/chase/image"])
+        fig = plt.figure(figsize=(16, 7), dpi=dpi, facecolor="#07070a")
+        for q, (topic, label) in enumerate((
+                ("view/wide/image",
+                 f"wide view, about 2.4 km across, camera {abs(WIDE_OFFSET[2]):.0f} m up"),
+                ("view/chase/image",
+                 "chase view, about 45 m range: the rover at true scale"))):
+            ax = fig.add_axes([0.01 + q * 0.495, 0.175, 0.485, 0.78])
+            ax.imshow(img[topic])
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_color("#30343c")
+            ax.set_title(label, color="#e6e8ec", fontsize=10)
+        fig.text(0.01, 0.965, f"{tag}   instance {instance}   t = {t:+.2f} h   "
+                 f"plan step {step + 1} of {plan.size}   "
+                 f"{stack['lit_fraction'][k]:.2%} of the region lit",
+                 color="#9aa0aa", fontsize=9)
+        for q, line in enumerate(GZ_CAPTION):
+            fig.text(0.01, 0.125 - q * 0.040, line, color="#7e848e", fontsize=7.5)
+        out = outdir / f"gz{k:04d}.png"
+        fig.savefig(out, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        written.append(out)
+    return written
+
+
+# --------------------------------------------------------------------------
+# encoding and the sidecar
+# --------------------------------------------------------------------------
+
+def encode(pattern, out, fps):
+    """PNG sequence to MP4 with the committed ffmpeg, at the stated rate."""
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
+                    "-i", str(pattern), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-crf", "20", str(out)], check=True)
+    return out
+
+
+def head_commit():
+    r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
+def file_record(paths):
+    import hashlib
+    out = {}
+    for p in paths:
+        p = Path(p)
+        if not p.exists():
+            out[str(p)] = None
+            continue
+        h = hashlib.sha256(p.read_bytes()).hexdigest()[:16] if p.stat().st_size < 2 << 28 \
+            else "too large to hash"
+        out[str(p)] = dict(bytes=p.stat().st_size, sha256_16=h)
+    return out
+
+
+# --------------------------------------------------------------------------
+# the static panels: the executive on two instances, and all twelve epochs
+# --------------------------------------------------------------------------
+
+LOG_DT = dict(tick=np.int64, t=np.float64, s_exec=np.float64,
+              s_world=np.float64, s_pred=np.float64, index=np.int32,
+              kind=np.uint8, lit=np.uint8, fired=np.uint8)
+
+
+def exec_log(arm, tag, plan_index, leg=0):
+    """One leg's executive log, as the committed run left it on disk."""
+    d = CORR / arm / tag / f"plan{plan_index:03d}" / f"leg{leg}_exec"
+    if not d.exists():
+        return None
+    return {k: np.fromfile(d / f"out_log_{k}.bin", dt) for k, dt in LOG_DT.items()}
+
+
+def world_traj(arm, tag, plan_index, leg=0):
+    """The world's own accumulated-shadow trajectory for the same leg."""
+    d = CORR / arm / tag / f"plan{plan_index:03d}" / f"leg{leg}_world"
+    return dict(t=np.fromfile(d / "out_traj_t.bin", np.float64),
+                shadow=np.fromfile(d / "out_traj_shadow.bin", np.float64))
+
+
+def render_exec_panel(tag, plan_index, arms, title, out, dpi=120):
+    """Forecast against the world, per arm, with the budget and the firing."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(12, 4.6 * len(arms)), dpi=dpi, facecolor="#07070a")
+    for q, (arm, label) in enumerate(arms):
+        log, w = exec_log(arm, tag, plan_index), world_traj(arm, tag, plan_index)
+        ax = fig.add_subplot(len(arms), 1, q + 1)
+        ax.set_facecolor("#101218")
+        ax.plot(w["t"], w["shadow"], "-", color="#6f7681", lw=1.2,
+                label="the world's accumulated shadow")
+        if log is not None:
+            ax.plot(log["t"], log["s_pred"], "-", color=C_TD, lw=1.6,
+                    label="the executive's forecast maximum")
+            fired = log["fired"].astype(bool)
+            if fired.any():
+                k = int(np.flatnonzero(fired)[0])
+                ax.axvline(log["t"][k], color="#ff5c5c", lw=1.4)
+                ax.plot([log["t"][k]], [log["s_pred"][k]], "o", color="#ff5c5c",
+                        ms=8, label=f"control fires at t = {log['t'][k]:.2f} h")
+            else:
+                ax.plot([], [], " ", label="no control fires")
+        ax.axhline(BUDGET_H, color="#ffa94d", ls="--", lw=1.2,
+                   label=f"budget {BUDGET_H:.1f} h")
+        ax.set_title(f"{label}", color="#e6e8ec", fontsize=10, loc="left")
+        ax.set_xlabel("time since departure (h)", color="#9aa0aa")
+        ax.set_ylabel("continuous shadow (h)", color="#9aa0aa")
+        ax.tick_params(colors="#9aa0aa", labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color("#30343c")
+        leg = ax.legend(loc="upper left", fontsize=8, facecolor="#101218",
+                        edgecolor="#30343c", labelcolor="#d6d9de")
+        leg.get_frame().set_alpha(0.92)
+    fig.suptitle(title, color="#e6e8ec", fontsize=12)
+    fig.tight_layout(rect=(0, 0.0, 1, 0.97))
+    fig.savefig(out, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return out
+
+
+def render_epoch_panel(rows, out, dpi=120):
+    """R4: all twelve epochs, no selection, from the stored sweep outputs."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    tags = [r["tag"] for r in rows]
+    lit = [100.0 * r.get("lit_t0", 0.0) for r in rows]
+    tdp = [r.get("td_plans", 0) for r in rows]
+    tdf = [r.get("td_pass", 0) for r in rows]
+    snp = [r.get("snap_plans", 0) for r in rows]
+    x = np.arange(len(rows))
+    fig = plt.figure(figsize=(13, 7), dpi=dpi, facecolor="#07070a")
+    ax = fig.add_subplot(2, 1, 1)
+    ax.set_facecolor("#101218")
+    ax.bar(x, lit, color="#d6d9de", width=0.6)
+    ax.set_ylabel("region lit at departure (%)", color="#9aa0aa")
+    ax.set_title("solvability is set by the lunation phase, not by the date",
+                 color="#e6e8ec", fontsize=11, loc="left")
+    ax2 = fig.add_subplot(2, 1, 2)
+    ax2.set_facecolor("#101218")
+    ax2.bar(x - 0.2, snp, width=0.36, color=C_SNAP, label="snapshot plans produced")
+    ax2.bar(x + 0.2, tdp, width=0.36, color=C_TD, label="time-dependent produced")
+    ax2.plot(x + 0.2, tdf, "o", color="#ffffff", ms=5,
+             label="time-dependent, checker accepted")
+    ax2.set_ylabel("plans of 120 instances", color="#9aa0aa")
+    ax2.legend(fontsize=8, facecolor="#101218", edgecolor="#30343c",
+               labelcolor="#d6d9de")
+    for a in (ax, ax2):
+        a.set_xticks(x)
+        a.set_xticklabels(tags, rotation=35, ha="right", fontsize=8)
+        a.tick_params(colors="#9aa0aa", labelsize=8)
+        for sp in a.spines.values():
+            sp.set_color("#30343c")
+    fig.text(0.01, 0.015, "Every epoch is drawn: R4 applies no selection. "
+             "165 of the 187 feasible time-dependent instances come from three "
+             "of these twelve epochs, which is why one traverse is not typical.",
+             color="#7e848e", fontsize=8)
+    fig.tight_layout(rect=(0, 0.035, 1, 1))
+    fig.savefig(out, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return out
+
+
+# --------------------------------------------------------------------------
+# the run
+# --------------------------------------------------------------------------
+
+def report_selection():
+    """Every filter's counts and choice, printed and returned for the sidecar."""
+    r1, c1, a1 = select_r1()
+    r2, c2, a2 = select_r2()
+    r3, c3, a3 = select_r3()
+    print("the registered rules, applied (PLAN.md 2026-10-05, before looking):")
+    print(f"  R1 counts {c1}")
+    print(f"  R1 candidates {len(a1)} -> {r1}")
+    if r1 is None:
+        print("     R1 is EMPTY. Nothing is relaxed: the registration says an empty")
+        print("     set is reported as an empty set. The traverse subject falls to")
+        print("     R3, itself registered on the same date before any looking.")
+    print(f"  R2 counts {c2}")
+    print(f"  R2 candidates {len(a2)} -> {r2}")
+    print(f"  R3 counts {c3}")
+    print(f"  R3 candidates {len(a3)} -> {r3}")
+    return dict(r1=dict(counts=c1, n=len(a1), choice=r1),
+                r2=dict(counts=c2, n=len(a2), choice=r2),
+                r3=dict(counts=c3, n=len(a3), choice=r3))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--stage", default="select",
+                    help="select,fields,frames,panels,video,gazebo or all")
+    ap.add_argument("--fps", type=int, default=12)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="render only the first N frames, for a look")
+    ap.add_argument("--rover", default=str(ROOT / "data" / "work" / "gazebo"
+                                          / "rover.sdf"))
+    args = ap.parse_args()
+    want = ["select", "fields", "frames", "panels", "video", "gazebo"] \
+        if args.stage == "all" else [t.strip() for t in args.stage.split(",")]
+    unknown = [t for t in want if t not in
+               ("select", "fields", "frames", "panels", "video", "gazebo")]
+    if unknown:
+        raise SystemExit(f"unknown stages: {', '.join(unknown)}")
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    sel = report_selection()
+    subject = sel["r3"]["choice"]
+    if subject is None:
+        raise SystemExit("R3 selected nothing; there is no traverse to render")
+    tag, plan_index = subject["tag"], subject["plan_index"]
+    rep = replay_out(tag, "td")
+    plan, _, dep = plan_at(rep, plan_index)
+    instance = planner_out(tag, "td")["index"][plan_index]
+    arr = float(rep["arrival"][plan_index])
+    times = frame_times(dep, arr)
+    if args.limit:
+        times = times[:args.limit]
+    print(f"\nsubject: {tag} plan{plan_index:03d}, instance {instance}")
+    print(f"  departs {dep:.4f} h, checker arrival {arr:.4f} h, "
+          f"{plan.size} cells, {times.size} frames at {CADENCE_H} h")
+
+    rows = route_rows(tag, instance)
+    curves = {}
+    if {"fields", "frames", "video", "gazebo"} & set(want):
+        for key, kind in (("td", "td"), ("snap", "snap")):
+            if rows[key] is None:
+                continue
+            curves[key] = shadow_curve(replay_out(tag, kind), rows[key],
+                                       OUT / "prefix" / kind)
+        c = curves["td"]
+        print(f"  checker prefix curve: max {c['shadow'].max():.4f} h, stored "
+              f"{c['stored_shadow']:.4f} h, agree")
+
+    assert_drivable(tag, plan_index)
+    print("  C5: the checker's own verdict on this plan is ACCEPTED")
+
+    stack_path = OUT / f"fields_{tag}_{plan_index:03d}.npy"
+    stale = (stack_path.exists()
+             and np.load(stack_path, mmap_mode="r").shape[0] != times.size)
+    if stale:
+        print(f"  the stored field stack has "
+              f"{np.load(stack_path, mmap_mode='r').shape[0]} frames and this "
+              f"run wants {times.size}; rebuilding it")
+    stack = None
+    if "fields" in want or stale or not stack_path.exists():
+        print("\nfields: our illumination at every frame time, one normalisation")
+        stack = field_stack(tag, times, stack_path)
+        (OUT / "fields.json").write_text(json.dumps(
+            dict(tag=tag, plan_index=plan_index, frames=int(times.size),
+                 cadence_h=CADENCE_H, peak_cos_incidence=stack["peak"],
+                 lit_fraction=stack["lit_fraction"].tolist()), indent=1))
+        print(f"  peak cos(incidence) over the sequence {stack['peak']:.6f}")
+        print(f"  lit fraction {stack['lit_fraction'].min():.4%} to "
+              f"{stack['lit_fraction'].max():.4%}")
+    else:
+        meta = json.loads((OUT / "fields.json").read_text())
+        p_, n_, _px, dem_, *_ = P.load(Rover(v_flat=V_FLAT))
+        stack = dict(path=str(stack_path),
+                     lit_path=str(stack_path.with_name(stack_path.stem + "_lit.npy")),
+                     peak=meta["peak_cos_incidence"],
+                     lit_fraction=np.asarray(meta["lit_fraction"]),
+                     dem=dem_, n=n_, radius_m=p_["radius_m"])
+
+    if "frames" in want:
+        print("\nframes: the 2D map view")
+        texdir = OUT / "textures"
+        texdir.mkdir(parents=True, exist_ok=True)
+        fields = np.load(stack["path"], mmap_mode="r")
+        litm = np.load(stack["lit_path"], mmap_mode="r")
+        for k in range(times.size):
+            texture_png(np.asarray(fields[k], float),
+                        np.asarray(litm[k], bool), stack["peak"],
+                        texdir / f"tex{k:04d}.png")
+        got = render_frames(tag, instance, times, stack, rows, curves,
+                            OUT / "map")
+        print(f"  {len(got)} map frames and {times.size} textures written")
+
+    if "panels" in want:
+        print("\npanels: the executive on two instances, and all twelve epochs")
+        b = sel["r2"]["choice"]
+        render_exec_panel(b["tag"], b["plan_index"],
+                          [("none", "bounded rule, no correction stream")],
+                          f"R2, a bust: {b['tag']} plan{b['plan_index']:03d}. "
+                          f"The control fires and the correction must not stop it.",
+                          OUT / "panel_r2_bust.png")
+        render_exec_panel(tag, plan_index,
+                          [("none", "bounded rule, no correction stream: fires"),
+                           ("lit", "with the B3b-lit correction: does not fire")],
+                          f"R3, a false alarm removed: {tag} plan{plan_index:03d}, "
+                          f"1 of the 11 the lit direction removes at p = 0.0005",
+                          OUT / "panel_r3_false_alarm.png")
+        render_epoch_panel(select_r4(), OUT / "panel_r4_epochs.png")
+        print(f"  wrote panel_r2_bust.png, panel_r3_false_alarm.png, "
+              f"panel_r4_epochs.png")
+
+    if "video" in want:
+        print("\nvideo")
+        encode(OUT / "map" / "frame%04d.png", OUT / "demo_map.mp4", args.fps)
+        print(f"  demo_map.mp4 at {args.fps} fps = "
+              f"{CADENCE_H * args.fps:.2f} h of simulated time per second")
+
+    if "gazebo" in want:
+        print("\ngazebo: the second artifact, same subject and same cadence")
+        got = render_gazebo(tag, instance, times, stack, rows, OUT / "textures",
+                            OUT / "gz", args.rover)
+        encode(OUT / "gz" / "gz%04d.png", OUT / "demo_gazebo.mp4", args.fps)
+        print(f"  {len(got)} Gazebo frames, demo_gazebo.mp4")
+
+    side = dict(
+        head_commit=head_commit(), generated_utc=None,
+        subject=dict(tag=tag, plan_index=plan_index, instance=instance,
+                     departure_h=dep, checker_arrival_h=arr,
+                     checker_shadow_h=float(rep["shadow"][plan_index]),
+                     checker_verdict=bool(rep["verdict"][plan_index]),
+                     plan_cells=int(plan.size)),
+        selection=sel, rows=rows,
+        configuration=dict(v_flat=V_FLAT, budget_h=BUDGET_H,
+                           cadence_h=CADENCE_H, frames=int(times.size),
+                           fps=args.fps,
+                           hours_per_second=CADENCE_H * args.fps,
+                           normalisation_peak_cos_incidence=stack["peak"],
+                           lit_floor=LIT_FLOOR, rover_lift_m=ROVER_LIFT_M),
+        inputs=file_record([
+            SWEEP / f"{tag}_td" / "planner_params.json",
+            SWEEP / f"{tag}_replay_td_tol" / "out_verdict.bin",
+            SWEEP / f"{tag}_replay_td_tol" / "out_shadow.bin",
+            CORR / "results.json",
+            cache_path(tag)]),
+        versions=dict(numpy=np.__version__))
+    import datetime as _dt
+    import matplotlib
+    side["generated_utc"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    side["versions"]["matplotlib"] = matplotlib.__version__
+    r = subprocess.run([GZ, "sim", "--versions"],
+                       env={**__import__("os").environ, GZ_ENV_KEY: GZ_CONFIG},
+                       capture_output=True, text=True)
+    side["versions"]["gazebo"] = r.stdout.strip().splitlines()[0] if r.stdout else "?"
+    (OUT / "sidecar.json").write_text(json.dumps(side, indent=1))
+    print(f"\nsidecar {OUT / 'sidecar.json'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

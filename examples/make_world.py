@@ -54,7 +54,7 @@ def grey_png(path, value=128):
     return path
 
 
-def rover_block(path, name="rover", pose=(0.0, 0.0, 2000.0)):
+def rover_block(path, name="rover", pose=(0.0, 0.0, 2000.0, 0.0)):
     """The rover, converted from its URDF by sdformat and renamed.
 
     Converted rather than hand-written in SDF so the xacro stays the single
@@ -67,7 +67,10 @@ def rover_block(path, name="rover", pose=(0.0, 0.0, 2000.0)):
         raise SystemExit(f"no model block in {path}")
     block = re.sub(r"<model name='[^']*'", f"<model name='{name}'",
                    m.group(1), count=1)
-    x, y, z = pose
+    # A three-element pose keeps its yaw at zero, which is what every caller
+    # before the demo passed; the demo needs the rover turned along its path.
+    x, y, z = pose[:3]
+    yaw = float(pose[3]) if len(pose) > 3 else 0.0
     # Dynamic with gravity off, which took two measured attempts to get right
     # and is worth recording. Left dynamic with gravity, the physics engine
     # overrode every commanded pose and the rover free-fell. Made static, the
@@ -75,7 +78,7 @@ def rover_block(path, name="rover", pose=(0.0, 0.0, 2000.0)):
     # so the service accepted the call and moved nothing, which is the standing
     # lesson in this record about trusting a return value. Dynamic with no
     # gravity is the combination where a commanded pose both applies and stays.
-    block = block.replace(">", f">\n      <pose>{x} {y} {z} 0 0 0</pose>", 1)
+    block = block.replace(">", f">\n      <pose>{x} {y} {z} 0 0 {yaw}</pose>", 1)
     # <gravity> is a link element, not a model element. Placed before the
     # <link> tag it becomes a child of <model>, where sdformat drops it with a
     # warning and still reports the world Valid, so the rover fell with the
@@ -141,6 +144,33 @@ def camera_rig(wx, wy, wz, fov_rad, width, height):
     </model>"""
 
 
+def view_rig(name, wx, wy, wz, roll, pitch, yaw, fov_rad, width, height):
+    """A colour camera at an arbitrary pose. The demo's two views.
+
+    camera_rig above is nadir and co-located with a depth channel because C3
+    needed each pixel's own range to make the illumination check independent of
+    the heightmap mapping. The demo needs neither: it is showing the scene, not
+    measuring it, so this is a colour camera and nothing else, and the figures
+    say so rather than letting a rendered image look like a measurement.
+    """
+    return f"""
+    <model name="view_{name}">
+      <static>true</static>
+      <pose>{wx:.4f} {wy:.4f} {wz:.4f} {roll:.9f} {pitch:.9f} {yaw:.9f}</pose>
+      <link name="link">
+        <sensor name="rgb" type="camera">
+          <always_on>1</always_on><update_rate>5</update_rate>
+          <topic>view/{name}/image</topic>
+          <camera>
+            <horizontal_fov>{fov_rad:.9f}</horizontal_fov>
+            <image><width>{width}</width><height>{height}</height></image>
+            <clip><near>0.5</near><far>200000.0</far></clip>
+          </camera>
+        </sensor>
+      </link>
+    </model>"""
+
+
 def target_model(name, wx, wy, wz, radius):
     """A static sphere at an exactly known position, for the stereo check.
 
@@ -198,7 +228,7 @@ def ray_rig(name, wx, wy, wz, fov_rad, width, height):
 
 def build(side, mode, texture, normal, pos_z, light_dir, probes, cam, convention,
           h_range, rover=None, rays=(), targets=(), rover_pose=None,
-          dark=False):
+          dark=False, views=()):
     span = span_m(HEIGHTMAP_N, PX, convention)
     size_xy = requested_size(HEIGHTMAP_N, PX, SAMPLING, convention)
     ambient = "0 0 0 1" if dark else ("1 1 1 1" if mode == "ours"
@@ -227,6 +257,7 @@ def build(side, mode, texture, normal, pos_z, light_dir, probes, cam, convention
     cam_sdf = camera_rig(*cam) if cam else ""
     cam_sdf += "".join(ray_rig(*r) for r in rays)
     cam_sdf += "".join(target_model(*t) for t in targets)
+    cam_sdf += "".join(view_rig(*v) for v in views)
     rover_sdf = (rover_block(rover, pose=rover_pose) if rover_pose
                  else rover_block(rover)) if rover else ""
     probe_sdf = "".join(probe_model(n, x, y, z) for n, x, y, z in probes)
@@ -307,7 +338,9 @@ def main():
     ap.add_argument("--dark", action="store_true",
                     help="ambient 0 and no light: only emissive geometry renders")
     ap.add_argument("--rover-pose", default="",
-                    help="x,y,z for the rover model pose")
+                    help="x,y,z[,yaw] for the rover model pose")
+    ap.add_argument("--views", default="",
+                    help="demo cameras: name,x,y,z,roll,pitch,yaw,fov,w,h;...")
     ap.add_argument("--targets", default="",
                     help="static spheres: name,x,y,z,radius;...")
     ap.add_argument("--rays", default="",
@@ -343,10 +376,15 @@ def main():
         cam = (cam[0], cam[1], cam[2], cam[3], int(cam[4]), int(cam[5]))
     rpose = (tuple(float(v) for v in args.rover_pose.split(","))
              if args.rover_pose else None)
+    views = []
+    if args.views:
+        for item in args.views.split(";"):
+            f = item.split(",")
+            views.append((f[0], *(float(v) for v in f[1:8]), int(f[8]), int(f[9])))
     sdf = build(side["path"], args.mode, texture, normal, args.z_offset,
                 [float(v) for v in args.light.split()], probes, cam,
                 args.convention, side["h_range"],
-                args.rover or None, rays, targets, rpose, args.dark)
+                args.rover or None, rays, targets, rpose, args.dark, views)
     out = Path(args.out) if args.out else OUT / f"lunar_region_{args.mode}.sdf"
     out.write_text(sdf)
     print(f"wrote {out}")
@@ -356,7 +394,7 @@ def main():
           f"{requested_size(HEIGHTMAP_N, PX, SAMPLING, args.convention):.4f} "
           f"for a true {span_m(HEIGHTMAP_N, PX, args.convention):.0f} m span")
     print(f"  {len(targets)} targets, {len(probes)} probes, {len(rays)} ray rigs, "
-          f"camera rig: {'yes' if cam else 'no'}")
+          f"{len(views)} view cameras, camera rig: {'yes' if cam else 'no'}")
     return 0
 
 
