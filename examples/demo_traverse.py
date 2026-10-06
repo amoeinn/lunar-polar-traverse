@@ -850,6 +850,10 @@ GZ_CAPTION = (
     "own margin, not terrain: the heightmap is 513 samples and the planning "
     "region is 500, so 13 rows and columns, 260 m, lie outside it and are "
     "written dark rather than extrapolated.",
+    "A rendered cell can sit 7 to 9 m from where the model puts it, under half "
+    "a 20 m cell. Measured at nadir and obliquely by three instruments; it is "
+    "not the slope term and the mechanism is open. So the rover may appear at "
+    "the edge of its own dark cell. The 2D map view is unaffected.",
 )
 
 # Sits beside the chase view rather than in the caption block, because it is
@@ -994,7 +998,7 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
                 ("view/chase/image",
                  f"chase view, {chase_m:.0f} m range: the chassis box at "
                  f"true scale"))):
-            ax = fig.add_axes([0.012 + q * 0.494, 0.248, 0.482, 0.647])
+            ax = fig.add_axes([0.012 + q * 0.494, 0.258, 0.482, 0.637])
             # One fixed curve, applied identically to every frame of both views.
             ax.imshow((255.0 * (img[topic].astype(float) / 255.0)
                        ** DISPLAY_GAMMA).astype(np.uint8))
@@ -1020,7 +1024,8 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
                  f"{DISPLAY_GAMMA:.3f}, the same for every frame",
                  color="#7e848e", fontsize=8)
         for q, line in enumerate(GZ_CAPTION):
-            fig.text(0.012, 0.196 - q * 0.030, line, color="#7e848e", fontsize=7.2)
+            fig.text(0.012, 0.204 - q * 0.0285, line, color="#7e848e",
+                     fontsize=7.0)
         # The legend is the point of the colours, so it states them rather than
         # leaving a viewer to infer a code from two frames.
         for q, (sw, lab) in enumerate((
