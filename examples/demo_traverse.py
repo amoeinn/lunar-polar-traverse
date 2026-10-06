@@ -381,22 +381,33 @@ def step_at(times, t):
 # --------------------------------------------------------------------------
 
 CAPTION = (
-    "Shadows are our illumination model's, not Gazebo's. Greyscale is the lit "
-    "mask with relative cos(incidence) above a 0.25 floor, not photometry.",
+    "Shadows are our illumination model's, not Gazebo's. The greyscale reads as "
+    "lit or dark rather than as brightness: at this sun elevation cos(incidence) "
+    "clips to zero on 153188 of 168873 lit cells, so most lit cells sit exactly "
+    "on the 0.25 floor and carry no shading.",
     "The time-dependent planner does not arrive earlier: median +0.51% over the "
-    "182 cases where both plans are feasible, P3 clause 2 scored FAIL.",
+    "182 cases where both plans are feasible, P3 clause 2 scored FAIL. At this "
+    "instance the snapshot planner returned the same route, cell for cell.",
     "One epoch is one geometry. Frames are 15 min apart; a cell lit at two "
-    "consecutive samples can be dark between them.",
+    "consecutive samples can be dark between them, and the frame cadence cannot "
+    "resolve the 0.18 h the checker integrated.",
 )
 
 C_TD, C_SNAP, C_MM, C_ROVER = "#36d7e0", "#ff9436", "#d86bff", "#ffe14d"
 
 # Figure geometry. The region map is square data, so its box is square in
 # inches: a 16 x 9 figure and a height of 0.78 give a width of 0.78 * 9 / 16.
-REGION_RECT = [0.030, 0.145, 0.75 * 9.0 / 16.0, 0.75]
-ZOOM_RECT_X, ZOOM_RECT_Y, ZOOM_RECT_W = 0.500, 0.560, 0.250
-SHADOW_RECT = [0.500, 0.145, 0.250, 0.300]
-TEXT_RECT = [0.785, 0.145, 0.200, 0.690]
+# Two rows. The two maps are square boxes because their data windows are square,
+# so neither is stretched and neither is letterboxed into a band of empty figure.
+REGION_RECT = [0.025, 0.495, 0.236, 0.420]
+ZOOM_RECT = [0.300, 0.495, 0.236, 0.420]
+EXEC_RECT = [0.600, 0.495, 0.375, 0.420]
+# Row 2 sits higher than row 1's mirror would put it, because the epoch strip's
+# rotated tick labels hang below its box and ran into the caption.
+EPOCH_RECT = [0.025, 0.170, 0.330, 0.245]
+SHADOW_RECT = [0.420, 0.170, 0.235, 0.245]
+TEXT_RECT = [0.700, 0.150, 0.275, 0.265]
+C_LIT_ARM, C_BUDGET, C_FIRE = "#7ee787", "#ff5c5c", "#ff5c5c"
 
 
 def route_rows(tag, instance):
@@ -412,6 +423,17 @@ def route_rows(tag, instance):
     # would have been dropped and shifted every row after it.
     assert mm["offsets"].size - 1 == 120, (tag, mm["offsets"].size - 1)
     out["mm"] = instance
+    # The executive enumerates the same feasible list the td replay rows come
+    # from, so its plan_index is the td row. Asserted against the committed
+    # five-arm run rather than assumed, because the two indices being equal is a
+    # property of how both were built and not a guarantee.
+    out["exec_plan_index"] = out["td"]
+    if out["td"] is not None and (CORR / "results.json").exists():
+        recs = json.loads((CORR / "results.json").read_text())
+        hit = [r for r in recs
+               if r["tag"] == tag and r["plan_index"] == out["td"]
+               and r["kind"] == "none"]
+        assert len(hit) == 1, (tag, out["td"], len(hit))
     return out
 
 
@@ -447,14 +469,34 @@ def panel_lines(tag, instance, rows, curves, same=()):
     return lines
 
 
-def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=100):
-    """One PNG per sun-table sample: the sweeping mask, the routes, the rover.
+def never_lit_patch(litm, i0, i1, j0, j1):
+    """Cells inside the zoom window that are dark in every frame of the sequence.
 
-    Two map axes, because one cannot carry both facts. The region is 10.24 km
-    and this traverse is 560 m of it, so a single view either shows the shadows
-    sweeping and loses the route to a few pixels, or shows the route and loses
-    the sweep. The left view is the region with the zoom box drawn on it and the
-    right view is the route, both at the same instant.
+    Named on the figure because a solid black square reads as a hole or a data
+    gap, and it is neither. It is not called a permanent shadow: 27.66 h is not
+    a lunation, and all this establishes is that these cells were dark for the
+    whole of this traverse.
+    """
+    sub = np.asarray(litm[:, i0:i1 + 1, j0:j1 + 1])
+    dark = ~sub.any(axis=0)
+    if not dark.any():
+        return None
+    ii, jj = np.nonzero(dark)
+    gx, gy = cell_to_map(ii + i0, jj + j0)
+    return dict(n=int(dark.sum()), x=float(gx.mean()) / 1000.0,
+                y=float(gy.mean()) / 1000.0,
+                ever=int((~sub.all(axis=0)).sum()))
+
+
+def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110):
+    """One PNG per sun-table sample. Six panels, each carrying a measured thing.
+
+    Two map axes, because one cannot carry both facts: the region is 10.24 km and
+    this traverse is 560 m of it, so a single view either shows the shadows
+    sweeping and loses the route to four pixels, or shows the route and loses the
+    sweep. Then the executive panel, which is the reason R3 selected this
+    instance at all; the world's own continuous shadow; all twelve epochs, so one
+    traverse is not read as typical; and the checker's verdicts as text.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -482,31 +524,45 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=100):
         x, y = cells_to_map(pl)
         routes[key] = (x / 1000.0, y / 1000.0)
     rx, ry = cells_to_map(plan)
-    # The zoom box is the union of every route drawn, with a fixed margin, so it
-    # does not move between frames and cannot be read as the camera following
-    # anything interesting.
+
+    # A square zoom window, fixed for the whole sequence, so it cannot be read as
+    # a camera following anything interesting.
     allx = np.concatenate([routes[k][0] for k in routes])
     ally = np.concatenate([routes[k][1] for k in routes])
     mx = max(0.35, 0.25 * max(np.ptp(allx), np.ptp(ally)))
-    zx = (allx.min() - mx, allx.max() + mx)
-    zy = (ally.min() - mx, ally.max() + mx)
-    # The zoom axes box is sized from the zoom's own data aspect.
-    zoom_w_in = ZOOM_RECT_W * 16.0
-    zoom_rect = [ZOOM_RECT_X, ZOOM_RECT_Y, ZOOM_RECT_W,
-                 (zoom_w_in / ((zx[1] - zx[0]) / (zy[1] - zy[0]))) / 9.0]
+    cx, cy = (allx.min() + allx.max()) / 2, (ally.min() + ally.max()) / 2
+    half = max(np.ptp(allx), np.ptp(ally)) / 2 + mx
+    zx, zy = (cx - half, cx + half), (cy - half, cy + half)
+
     dem = stack["dem"]
-    i0, i1 = (np.clip(np.floor((REGION_OY / 1000.0 - np.array([zy[1], zy[0]]))
-                               * 1000.0 / PX).astype(int), 0, REGION_N - 1))
-    j0, j1 = (np.clip(np.floor((np.array([zx[0], zx[1]]) * 1000.0 - REGION_OX)
-                               / PX).astype(int), 0, REGION_N - 1))
+    i0 = int(np.clip((REGION_OY / 1000.0 - zy[1]) * 1000.0 / PX, 0, REGION_N - 1))
+    i1 = int(np.clip((REGION_OY / 1000.0 - zy[0]) * 1000.0 / PX, 0, REGION_N - 1))
+    j0 = int(np.clip((zx[0] * 1000.0 - REGION_OX) / PX, 0, REGION_N - 1))
+    j1 = int(np.clip((zx[1] * 1000.0 - REGION_OX) / PX, 0, REGION_N - 1))
     czz = np.asarray(dem, float)[i0:i1 + 1, j0:j1 + 1]
-    # cell_to_map takes x from the column and y from the row, so the two axes
-    # come from separate calls rather than from one broadcast.
     cgx = cell_to_map(0, np.arange(j0, j1 + 1))[0] / 1000.0
     cgy = cell_to_map(np.arange(i0, i1 + 1), 0)[1] / 1000.0
     clev = np.arange(np.floor(czz.min() / 10.0) * 10.0, czz.max() + 10.0, 10.0)
+    patch = never_lit_patch(litm, i0, i1, j0, j1)
+
+    # The executive, which is why R3 chose this instance. Read from the committed
+    # five-arm run rather than recomputed.
+    ex = {a: exec_log(a, tag, rows["exec_plan_index"]) for a in ("none", "lit")}
+    wtr = world_traj("none", tag, rows["exec_plan_index"])
+    fire_t = fire_s = None
+    if ex["none"] is not None and ex["none"]["fired"].any():
+        k = int(np.flatnonzero(ex["none"]["fired"].astype(bool))[0])
+        fire_t, fire_s = float(ex["none"]["t"][k]), float(ex["none"]["s_pred"][k])
+    wsh = wtr["shadow"]
+    wrun = np.maximum.accumulate(wsh)
+    # The time axes span the traverse and not the frames being rendered, so a
+    # short run for a look shows the same trace the full sequence does.
+    t_end = max(float(wtr["t"][-1]),
+                float(ex["none"]["t"][-1]) if ex["none"] is not None else 0.0,
+                float(ex["lit"]["t"][-1]) if ex["lit"] is not None else 0.0)
+    epochs_rows = select_r4()
+
     lines = panel_lines(tag, instance, rows, curves, same)
-    cv = curves["td"]
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     written = []
@@ -517,34 +573,28 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=100):
         fig = plt.figure(figsize=(16, 9), dpi=dpi, facecolor="#07070a")
         step = step_at(tsteps, t)
 
-        # Each axes box is sized to its own data aspect, so neither map is
-        # letterboxed into a band of empty figure and neither is stretched. A
-        # stretched map would misreport the terrain, which is why the boxes move
-        # rather than the aspect.
         axes = []
         for q, (rect, lim, title) in enumerate((
-                (REGION_RECT, None,
-                 f"the planning region, 10.24 km, at t = {t:+.2f} h"),
-                (zoom_rect, (zx, zy),
-                 f"the traverse, {1000 * (zx[1] - zx[0]):.0f} m across"))):
+                (REGION_RECT, None, "the planning region, 10.24 km"),
+                (ZOOM_RECT, (zx, zy),
+                 f"the traverse, {2000 * half:.0f} m across"))):
             ax = fig.add_axes(rect)
             ax.set_facecolor("#07070a")
             ax.imshow(shown, cmap="gray", vmin=0.0, vmax=1.0, extent=ext_km,
                       origin="upper", interpolation="nearest")
             for key, (style, col, lw, lab) in (
-                    ("snap", ("-", C_SNAP, 5.0, "snapshot plan")),
+                    ("snap", ("-", C_SNAP, 5.0, "snapshot plan (same route)")),
                     ("mm", (":", C_MM, 1.8, "mean-map plan")),
-                    ("td", ("-", C_TD, 1.8, "time-dependent plan, driven"))):
+                    ("td", ("-", C_TD, 1.8, "time-dependent, driven"))):
                 if key in routes:
                     ax.plot(*routes[key], style, color=col, lw=lw,
                             solid_capstyle="round",
                             alpha=0.55 if key == "snap" else 1.0, label=lab)
             ax.plot([rx[step] / 1000.0], [ry[step] / 1000.0], "o", color=C_ROVER,
-                    ms=11 if lim else 7, mec="#07070a", mew=1.2,
-                    label="rover (pose commanded)")
-            ax.plot([rx[0] / 1000.0], [ry[0] / 1000.0], "s", color="#ffffff", ms=5)
+                    ms=10 if lim else 6, mec="#07070a", mew=1.2, label="rover")
+            ax.plot([rx[0] / 1000.0], [ry[0] / 1000.0], "s", color="#ffffff", ms=4)
             ax.plot([rx[-1] / 1000.0], [ry[-1] / 1000.0], "*", color="#ffffff",
-                    ms=12)
+                    ms=10)
             if lim is None:
                 ax.add_patch(Rectangle((zx[0], zy[0]), zx[1] - zx[0],
                                        zy[1] - zy[0], fill=False,
@@ -552,52 +602,131 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=100):
             else:
                 ax.set_xlim(*lim[0])
                 ax.set_ylim(*lim[1])
-                # Relief as a separate channel. The greyscale is irradiance and
-                # must stay that, so the terrain is drawn as contour lines over
-                # it rather than shaded into it: at this sun elevation almost
-                # every lit cell sits on the 0.25 floor and the zoom would
-                # otherwise be a flat grey rectangle carrying no terrain at all.
                 ax.contour(cgx, cgy, czz, levels=clev, colors="#4b5563",
                            linewidths=0.6, alpha=0.9)
-            ax.set_xlabel("map x (km)", color="#9aa0aa", fontsize=8)
-            if q == 0:
-                ax.set_ylabel("map y (km)", color="#9aa0aa", fontsize=8)
-            ax.tick_params(colors="#9aa0aa", labelsize=7)
+                if patch:
+                    # A solid black square reads as a hole or a missing tile, so
+                    # it is named. It is not called a permanent shadow.
+                    ax.annotate(
+                        f"{patch['n']} cells dark in\nevery frame of the sequence",
+                        xy=(patch["x"], patch["y"]),
+                        xytext=(patch["x"] - 0.44, patch["y"] + 0.20),
+                        color="#e6e8ec", fontsize=7,
+                        arrowprops=dict(arrowstyle="->", color="#e6e8ec", lw=0.8))
+            ax.set_xlabel("map x (km)", color="#9aa0aa", fontsize=7)
+            ax.set_ylabel("map y (km)", color="#9aa0aa", fontsize=7)
+            ax.tick_params(colors="#9aa0aa", labelsize=6.5)
             for sp in ax.spines.values():
                 sp.set_color("#30343c")
-            ax.set_title(title, color="#e6e8ec", fontsize=10)
+            ax.set_title(title, color="#e6e8ec", fontsize=9)
             axes.append(ax)
-        leg = axes[1].legend(loc="upper left", fontsize=7.5, facecolor="#101218",
+        leg = axes[1].legend(loc="lower left", fontsize=6.5, facecolor="#101218",
                              edgecolor="#30343c", labelcolor="#d6d9de")
         leg.get_frame().set_alpha(0.92)
-        fig.text(0.030, 0.958, f"{tag}   instance {instance}   "
-                 f"{stack['lit_fraction'][k]:.2%} of the region lit   "
-                 f"plan step {step + 1} of {plan.size}", color="#9aa0aa",
-                 fontsize=9)
 
+        # --- the executive: the forecast against the budget, both arms ---
+        axe = fig.add_axes(EXEC_RECT)
+        axe.set_facecolor("#101218")
+        for arm, col, lab in (("none", C_SNAP, "bounded rule, no correction"),
+                              ("lit", C_LIT_ARM, "with the B3b-lit correction")):
+            g = ex[arm]
+            if g is None:
+                continue
+            axe.plot(g["t"], g["s_pred"], "-o", color=col, lw=1.6, ms=3, label=lab)
+        axe.axhline(BUDGET_H, color=C_BUDGET, ls="--", lw=1.3,
+                    label=f"budget {BUDGET_H:.1f} h")
+        if fire_t is not None:
+            axe.plot([fire_t], [fire_s], "X", color=C_FIRE, ms=12, mec="#07070a",
+                     label=f"bounded rule FIRES, t={fire_t:.2f} h")
+            axe.annotate(f"forecast {fire_s:.2f} h", xy=(fire_t, fire_s),
+                         xytext=(fire_t + 2.0, fire_s + 0.12), color=C_FIRE,
+                         fontsize=7.5)
+        axe.axvline(t, color=C_ROVER, lw=1.2, alpha=0.8)
+        axe.set_xlim(-0.6, t_end + 0.6)
+        # Explicit, because the firing marker sits at the trace's maximum and an
+        # auto-scaled axis clipped both it and its label off the top.
+        top = max(BUDGET_H, *[float(g["s_pred"].max()) for g in ex.values()
+                              if g is not None]) * 1.22
+        axe.set_ylim(-0.06 * top, top)
+        axe.set_xlabel("time since departure (h)", color="#9aa0aa", fontsize=7.5)
+        axe.set_ylabel("executive's forecast maximum (h)", color="#9aa0aa",
+                       fontsize=7.5)
+        axe.set_title("why this instance: the correction removes a false alarm",
+                      color="#e6e8ec", fontsize=9)
+        axe.tick_params(colors="#9aa0aa", labelsize=7)
+        for sp in axe.spines.values():
+            sp.set_color("#30343c")
+        le = axe.legend(loc="upper left", fontsize=6.8, facecolor="#101218",
+                        edgecolor="#30343c", labelcolor="#d6d9de", ncol=2)
+        le.get_frame().set_alpha(0.92)
+        axe.text(0.985, 0.13, f"the world never exceeds {wrun.max():.2f} h, so "
+                 f"the firing is a false alarm", color="#7e848e", fontsize=7.5,
+                 ha="right", transform=axe.transAxes)
+
+        # --- all twelve epochs, no selection ---
+        axp = fig.add_axes(EPOCH_RECT)
+        axp.set_facecolor("#101218")
+        labs = [r["tag"][5:10].replace("-", "") + r["tag"][-3:]
+                for r in epochs_rows]
+        xs = np.arange(len(epochs_rows))
+        lit0 = [100.0 * r.get("lit_t0", 0.0) for r in epochs_rows]
+        cols = [C_ROVER if r["tag"] == tag else "#5a6472" for r in epochs_rows]
+        axp.bar(xs, lit0, color=cols, width=0.62)
+        axp.set_ylabel("region lit at departure (%)", color="#9aa0aa", fontsize=7)
+        axp.set_xticks(xs)
+        axp.set_xticklabels(labs, rotation=45, ha="right", fontsize=6.5)
+        axp.tick_params(colors="#9aa0aa", labelsize=6.5)
+        ax2 = axp.twinx()
+        ax2.plot(xs, [r.get("td_plans", 0) for r in epochs_rows], "o",
+                 color=C_TD, ms=4)
+        ax2.set_ylabel("feasible plans of 120", color=C_TD, fontsize=7)
+        ax2.tick_params(colors=C_TD, labelsize=6.5)
+        for a in (axp, ax2):
+            for sp in a.spines.values():
+                sp.set_color("#30343c")
+        axp.set_title("all twelve epochs, no selection; this one in yellow",
+                      color="#e6e8ec", fontsize=9)
+
+        # --- the world's own continuous shadow, with its resets ---
         axs = fig.add_axes(SHADOW_RECT)
         axs.set_facecolor("#101218")
-        axs.plot(cv["lengths"], cv["shadow"], "-", color=C_TD, lw=1.6)
-        axs.axhline(BUDGET_H, color="#ff5c5c", ls="--", lw=1.2)
-        axs.axvline(step + 1, color=C_ROVER, lw=1.2)
-        axs.set_ylim(0.0, max(BUDGET_H * 1.15, float(cv["shadow"].max()) * 1.15))
-        axs.set_xlabel("plan step", color="#9aa0aa", fontsize=8)
-        axs.set_ylabel("accumulated shadow (h)", color="#9aa0aa", fontsize=8)
-        axs.set_title("the checker's own integration, by prefix",
+        # Markers as well as the step, because the accumulator returns to zero
+        # within a single sample here and the reset is one pixel wide without
+        # them.
+        axs.step(wtr["t"], wsh, where="post", color=C_TD, lw=1.6,
+                 label="current continuous shadow (resets when lit)")
+        axs.plot(wtr["t"], wsh, ".", color=C_TD, ms=4)
+        axs.plot(wtr["t"], wrun, "--", color="#d6d9de", lw=1.2,
+                 label="its running maximum")
+        axs.axvline(t, color=C_ROVER, lw=1.2, alpha=0.8)
+        axs.set_xlim(-0.6, t_end + 0.6)
+        axs.set_ylim(0.0, float(wrun.max()) * 1.45 + 1e-6)
+        axs.set_xlabel("time since departure (h)", color="#9aa0aa", fontsize=7.5)
+        axs.set_ylabel("continuous shadow (h)", color="#9aa0aa", fontsize=7.5)
+        axs.set_title("the world, as the checker integrated it",
                       color="#e6e8ec", fontsize=9)
         axs.tick_params(colors="#9aa0aa", labelsize=7)
         for sp in axs.spines.values():
             sp.set_color("#30343c")
-        axs.text(0.98, 0.90, f"budget {BUDGET_H:.1f} h", color="#ff5c5c",
-                 fontsize=8, ha="right", transform=axs.transAxes)
+        ls = axs.legend(loc="upper left", fontsize=6.8, facecolor="#101218",
+                        edgecolor="#30343c", labelcolor="#d6d9de")
+        ls.get_frame().set_alpha(0.92)
+        axs.text(0.985, 0.04, f"the {BUDGET_H:.1f} h budget is "
+                 f"{BUDGET_H / max(float(wrun.max()), 1e-9):.0f}x off the top "
+                 f"of this axis", color="#7e848e", fontsize=7, ha="right",
+                 transform=axs.transAxes)
 
         axt = fig.add_axes(TEXT_RECT)
         axt.axis("off")
-        axt.text(0.0, 1.0, "\n".join(lines), color="#d6d9de", fontsize=8.0,
+        axt.text(0.0, 1.0, "\n".join(lines), color="#d6d9de", fontsize=7.6,
                  family="monospace", va="top", transform=axt.transAxes)
 
+        fig.text(0.025, 0.955, f"{tag}   instance {instance}   t = {t:+.2f} h   "
+                 f"{stack['lit_fraction'][k]:.2%} of the region lit   "
+                 f"plan step {step + 1} of {plan.size}", color="#9aa0aa",
+                 fontsize=10)
         for q, line in enumerate(CAPTION):
-            fig.text(0.030, 0.082 - q * 0.026, line, color="#7e848e", fontsize=7.5)
+            fig.text(0.025, 0.068 - q * 0.024, line, color="#7e848e", fontsize=7)
         out = outdir / f"frame{k:04d}.png"
         fig.savefig(out, facecolor=fig.get_facecolor())
         plt.close(fig)
