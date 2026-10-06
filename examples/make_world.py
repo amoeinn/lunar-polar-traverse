@@ -279,6 +279,22 @@ def build(side, mode, texture, normal, pos_z, light_dir, probes, cam, convention
           dark=False, views=(), rover_shade=None):
     span = span_m(HEIGHTMAP_N, PX, convention)
     size_xy = requested_size(HEIGHTMAP_N, PX, SAMPLING, convention)
+    # The two are deliberately different numbers and that was tested, not
+    # assumed. The heightmap is declared at requested_size, 10250.0, because Ogre
+    # spans size*(nv-1)/nv and 10250 is what yields a true 10240 m span. It looks
+    # as though the texture should follow, and on 2026-10-06 it was changed to do
+    # so after a rendered dark square was found a third of a cell out of place.
+    # Measurement sent it back. C3's positional disagreement over the same patch
+    # and the same 262144 pixels, with nothing else changed:
+    #
+    #     texture size   10230.0   10240.0   10250.0   10260.0
+    #     disagreement    4.2175%   2.6039%   3.2776%   4.4151%
+    #
+    # V-shaped with its minimum at the span, 10240.0, which is the committed
+    # value. The demo's chase view is also V-shaped and prefers 10250.0, so the
+    # two instruments disagree by one step and no single <size> satisfies both.
+    # The remaining misplacement is carried as open below rather than tuned away,
+    # and this value is pinned by a test so it is not "fixed" again.
     ambient = "0 0 0 1" if dark else ("1 1 1 1" if mode == "ours"
                                       else "0 0 0 1")
     light = ""

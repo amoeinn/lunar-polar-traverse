@@ -7,6 +7,7 @@ entirely plausible, which is the only way this subtask can be wrong: it scores
 no prediction, so it cannot fail a bar, only misrepresent.
 """
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -550,3 +551,47 @@ def test_the_rover_shade_lands_on_the_visual_and_not_the_collision():
         MW.build("hm.tif", "ours", "", "", 0.0, (0, 0, -1), [], None,
                  "vertices", 2296.6073, rover=str(rover),
                  rover_pose=(1.0, 2.0, 3.0, 0.0), rover_shade=(0.1, 0.2))
+
+
+def test_the_texture_size_is_the_span_and_the_heightmap_size_is_not():
+    """Protects: "fixing" the texture size to match the heightmap's.
+
+    The two are different numbers on purpose and the difference is measured, not
+    reasoned. The heightmap is declared at requested_size, 10250.0, because Ogre
+    spans size*(nv-1)/nv and 10250 is what yields a true 10240 m span. It looks
+    as though the texture should follow, and on 2026-10-06 it was changed to do
+    exactly that, after a rendered dark square was found a third of a cell out of
+    place. C3 then got worse. Scanned over the same patch and the same 262144
+    pixels with nothing else changed:
+
+        texture size   10230.0   10240.0   10250.0   10260.0
+        disagreement    4.2175%   2.6039%   3.2776%   4.4151%
+
+    V-shaped with its minimum at 10240.0, the span. The demo's chase view is also
+    V-shaped and prefers 10250.0, so the two instruments disagree by one step and
+    no single <size> satisfies both; the residual misplacement is carried in
+    PLAN.md as open. This test exists so the plausible-looking change is not made
+    again without redoing that measurement.
+
+    The discriminating property is asserted first: the two candidate values must
+    actually differ, or asserting which one is used proves nothing.
+    """
+    import examples.make_world as MW
+    from src.gzmap import HEIGHTMAP_N, PX, SAMPLING, requested_size, span_m
+
+    span = span_m(HEIGHTMAP_N, PX, "vertices")
+    req = requested_size(HEIGHTMAP_N, PX, SAMPLING, "vertices")
+    assert abs(span - req) > 1.0, \
+        "span_m and requested_size must differ or this test proves nothing"
+    assert abs(span - 10240.0) < 1e-6 and abs(req - 10250.0) < 1e-6
+
+    sdf = MW.build("hm.tif", "ours", "t.png", "n.png", 0.0, (0, 0, -1), [], None,
+                   "vertices", 2296.6073)
+    hm = [float(v) for v in
+          re.findall(r"<heightmap>.*?<size>([0-9.]+)", sdf, re.S)]
+    tex = float(re.search(r"<texture>\s*<size>([0-9.]+)", sdf, re.S).group(1))
+    assert len(hm) == 2, hm                       # collision and visual
+    assert all(abs(v - req) < 1e-6 for v in hm), hm
+    assert abs(tex - span) < 1e-6, tex
+    assert abs(tex - req) > 1.0, \
+        "the texture must NOT be declared at requested_size; C3 measured 3.2776% there"
