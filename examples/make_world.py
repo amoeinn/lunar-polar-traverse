@@ -176,7 +176,8 @@ def camera_rig(wx, wy, wz, fov_rad, width, height):
     </model>"""
 
 
-def view_rig(name, wx, wy, wz, roll, pitch, yaw, fov_rad, width, height):
+def view_rig(name, wx, wy, wz, roll, pitch, yaw, fov_rad, width, height,
+             depth=False):
     """A colour camera at an arbitrary pose. The demo's two views.
 
     camera_rig above is nadir and co-located with a depth channel because C3
@@ -185,6 +186,21 @@ def view_rig(name, wx, wy, wz, roll, pitch, yaw, fov_rad, width, height):
     measuring it, so this is a colour camera and nothing else, and the figures
     say so rather than letting a rendered image look like a measurement.
     """
+    # The depth channel is off by default because the demo does not need it and
+    # every sensor costs render time on every frame. It exists for measurement:
+    # its point cloud carries xyz and rgb for the SAME pixel, so a distance on
+    # the ground can be read off directly in the sensor frame, with no camera
+    # convention to get wrong, which is how L2' and C3 measured in this record.
+    depth_sdf = "" if not depth else f"""
+        <sensor name="depth" type="depth_camera">
+          <always_on>1</always_on><update_rate>5</update_rate>
+          <topic>view/{name}/depth</topic>
+          <camera>
+            <horizontal_fov>{fov_rad:.9f}</horizontal_fov>
+            <image><width>{width}</width><height>{height}</height></image>
+            <clip><near>0.5</near><far>200000.0</far></clip>
+          </camera>
+        </sensor>"""
     return f"""
     <model name="view_{name}">
       <static>true</static>
@@ -198,7 +214,7 @@ def view_rig(name, wx, wy, wz, roll, pitch, yaw, fov_rad, width, height):
             <image><width>{width}</width><height>{height}</height></image>
             <clip><near>0.5</near><far>200000.0</far></clip>
           </camera>
-        </sensor>
+        </sensor>{depth_sdf}
       </link>
     </model>"""
 

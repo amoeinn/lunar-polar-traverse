@@ -42,6 +42,13 @@ OUT = ROOT / "data" / "work" / "demo"
 BUDGET_H = 2.0              # the monitored configuration's shadow budget
 ARRIVAL_MIN_H = 24.0        # R1's clause, which is P2's own registered regime
 MEANMAP_ARM = "mm2.0"       # the mean-map baseline at its reported best exponent
+# Nearest-neighbour replication of the illumination texture, measured 2026-10-06
+# and recorded in PLAN.md. Each 20 m cell becomes an 8 x 8 block of identical
+# texels, so the renderer's filter can only blend at block edges. Costs 0.37 s
+# per frame to write and 0.11 MB per PNG against 0.01 s and 0.02 MB. Defined
+# here rather than beside the other render constants because texture_png takes
+# it as a default argument, which Python binds at definition time.
+UPSAMPLE = 8
 V_FLAT = 50.0               # the monitored configuration's rate
 
 # The keys examples/sweep_core.py puts in the replay checker's `grid`. Read back
@@ -341,13 +348,26 @@ def field_stack(tag, times, path):
                 lit_fraction=lit_frac, dem=dem, n=n, radius_m=p["radius_m"])
 
 
-def texture_png(field, litmask, peak, out):
-    """One 513 x 513 unlit texture, on the sequence's fixed normalisation.
+def texture_png(field, litmask, peak, out, upsample=UPSAMPLE):
+    """One unlit texture, on the sequence's fixed normalisation.
 
     Identical in convention to examples/illumination_texture.py, including the
     floor that keeps a lit cell from quantising to zero and the 13 extra rows
     and columns written dark rather than extrapolated, and differing from it in
-    exactly one way: peak is the sequence's, not the frame's.
+    two ways: peak is the sequence's rather than the frame's, and each cell is
+    replicated into an upsample x upsample block of identical texels.
+
+    The replication is what makes the chase view readable. sdformat exposes no
+    filtering option, but a filter blends only between NEIGHBOURING texels, so
+    replicating a cell into a block leaves nothing to blend except at the block
+    edges and the blend shrinks from one 20 m texel to one 20/upsample m texel.
+    Nothing is interpolated and no value is invented: every texel in a block is
+    the cell's own value, so the texture carries exactly what the 513 x 513 one
+    did at eight times the sampling.
+
+    The footprint does not change with it. The world's <texture><size> element
+    is 10240 m, computed from the span and not from the pixel count, so a larger
+    image maps to the same ground.
     """
     import matplotlib.image as mpimg
     tex = np.zeros((HEIGHTMAP_N, HEIGHTMAP_N), dtype=np.float64)
@@ -357,6 +377,8 @@ def texture_png(field, litmask, peak, out):
     litmap[:REGION_N, :REGION_N] = np.asarray(litmask, bool)
     img = np.where(litmap, np.maximum(img, LIT_FLOOR), 0.0)
     arr = (np.clip(img, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    if upsample > 1:
+        arr = np.repeat(np.repeat(arr, upsample, axis=0), upsample, axis=1)
     mpimg.imsave(out, arr, cmap="gray", vmin=0, vmax=255)
     return out
 
@@ -831,14 +853,13 @@ GZ_CAPTION = (
 )
 
 # Sits beside the chase view rather than in the caption block, because it is
-# about that panel alone. sdformat cannot be asked for nearest-neighbour
-# sampling: the installed 1.9 heightmap_shape.sdf gives the texture element only
-# size, diffuse and normal, with no filtering option, and gz-sim builds the
-# terrain material itself, so the world file has no way to request it.
-CHASE_NOTE = ("about 1.4 texels wide: the smooth light and dark gradients here\n"
-              "are a 20 m texture interpolated across cells, not terrain.\n"
-              "sdformat exposes no nearest-neighbour option for a heightmap\n"
-              "texture, so this cannot be made to match the map view's squares.")
+# about that panel alone.
+CHASE_NOTE = ("about 11 texels wide. sdformat exposes no filtering option, so\n"
+              "each 20 m cell is written as an 8 x 8 block of identical texels\n"
+              "and the filter can only blend at block edges. Measured on this\n"
+              "view, that narrows the lit-to-dark transition from 4.82 m to\n"
+              "1.98 m and cuts part-lit pixels from 55.4% to 8.8%. Nothing is\n"
+              "interpolated: every texel in a block is that cell's own value.")
 
 
 def look_at(cam, tgt):
@@ -1315,7 +1336,7 @@ def main():
                            hours_per_second=CADENCE_H * args.fps,
                            normalisation_peak_cos_incidence=stack["peak"],
                            lit_floor=LIT_FLOOR, rover_lift_m=ROVER_LIFT_M,
-                           display_gamma=DISPLAY_GAMMA,
+                           display_gamma=DISPLAY_GAMMA, upsample=UPSAMPLE,
                            rover_rgb_lit=list(ROVER_RGB_LIT),
                            rover_rgb_dark=list(ROVER_RGB_DARK),
                            wide_offset_m=list(WIDE_OFFSET),

@@ -161,8 +161,13 @@ def test_the_lit_mask_is_not_recovered_from_the_field():
         mask[5, 5] = True            # lit, but grazing: cos(incidence) == 0
         D.texture_png(field, mask, 0.4, tmp / "t.png")
         img = mpimg.imread(tmp / "t.png")
-        assert img[5, 5, 0] > 0.2, "a lit cell at zero cos must not render dark"
-        assert img[6, 6, 0] == 0.0, "an unlit cell must render at exactly zero"
+        # Cell indices, not texel indices: each cell is an UPSAMPLE-wide block,
+        # so a raw (5, 5) would land inside cell (0, 0).
+        u = D.UPSAMPLE
+        lit = img[5 * u:6 * u, 5 * u:6 * u, 0]
+        dark = img[6 * u:7 * u, 6 * u:7 * u, 0]
+        assert lit.min() > 0.2, "a lit cell at zero cos must not render dark"
+        assert dark.max() == 0.0, "an unlit cell must render at exactly zero"
     finally:
         for f in tmp.glob("*.png"):
             f.unlink()
@@ -189,3 +194,70 @@ def test_look_at_points_the_camera_down_the_line_of_sight():
         want = np.array(tgt) - np.array(cam)
         want = want / np.linalg.norm(want)
         assert np.allclose(fwd, want, atol=1e-9), (cam, tgt, fwd, want)
+
+
+def test_the_texture_is_replicated_not_interpolated():
+    """Protects: a resampled texture that invents values between cells.
+
+    The chase view is readable only because each 20 m cell is written as a block
+    of identical texels, so the renderer's filter has nothing to blend except at
+    block edges. If the upsample ever became an interpolating resize, the
+    picture would look smoother and would be showing values our model never
+    produced, which is the one thing this texture must not do.
+
+    The discriminating property is checked in the fixture first: the two cells
+    used must actually differ, or a uniformity assertion proves nothing.
+    """
+    import matplotlib.image as mpimg
+    tmp = Path(__file__).resolve().parent / "_tmp_up"
+    tmp.mkdir(exist_ok=True)
+    try:
+        field = np.zeros((D.REGION_N, D.REGION_N))
+        mask = np.zeros((D.REGION_N, D.REGION_N), bool)
+        field[3, 3], mask[3, 3] = 0.40, True       # lit, bright
+        mask[3, 4] = False                          # its neighbour: dark
+        assert field[3, 3] != field[3, 4], "the fixture cells must differ"
+
+        up = 8
+        D.texture_png(field, mask, 0.40, tmp / "u.png", upsample=up)
+        img = mpimg.imread(tmp / "u.png")[..., 0]
+        assert img.shape == (D.HEIGHTMAP_N * up, D.HEIGHTMAP_N * up), img.shape
+
+        # the lit cell is one flat block, not a blob with a falloff
+        blk = img[3 * up:4 * up, 3 * up:4 * up]
+        assert blk.min() == blk.max(), (blk.min(), blk.max())
+        assert blk.min() > 0.2
+
+        # its dark neighbour is flat too, and the step between them is abrupt:
+        # exactly one texel wide, with no intermediate value anywhere
+        nbr = img[3 * up:4 * up, 4 * up:5 * up]
+        assert nbr.min() == nbr.max() == 0.0
+        row = img[3 * up + up // 2, 3 * up:5 * up]
+        between = row[(row > 0.01) & (row < blk.min() - 0.01)]
+        assert between.size == 0, f"{between.size} interpolated texels"
+
+        # and upsample=1 reproduces the original size, so the factor is the
+        # only thing that changed
+        D.texture_png(field, mask, 0.40, tmp / "o.png", upsample=1)
+        assert mpimg.imread(tmp / "o.png").shape[0] == D.HEIGHTMAP_N
+    finally:
+        for f in tmp.glob("*.png"):
+            f.unlink()
+        tmp.rmdir()
+
+
+def test_the_texture_footprint_is_set_by_span_not_by_pixel_count():
+    """Protects: an upsampled texture mapped to a different patch of ground.
+
+    The world's <texture><size> is the ground size the image is mapped across.
+    If it ever came from the image's pixel count, upsampling by 8 would shrink
+    the footprint to 1.28 km and put every shadow in the wrong place while still
+    rendering a plausible-looking scene.
+    """
+    import examples.make_world as MW
+    sdf = MW.build("hm.tif", "ours", "t.png", "n.png", 0.0, (0, 0, -1), [], None,
+                   "vertices", 2296.6073)
+    tex = sdf[sdf.index("<texture>"):sdf.index("</texture>")]
+    size = float(tex[tex.index("<size>") + 6:tex.index("</size>")])
+    assert size == 10240.0, size
+    assert abs(size - (D.HEIGHTMAP_N - 1) * D.PX) < 1e-6
