@@ -191,6 +191,57 @@ def select_r1():
     return (cands[0] if cands else None), counts, cands
 
 
+def pair_contingency():
+    """The two planners' replay verdicts, paired per instance.
+
+    R1 reports only the count it needs, "snapshot rejected and time-dependent
+    accepted", which is zero. That number alone does not say whether the two
+    planners disagree in the OTHER direction either, nor what became of the
+    instances where only one of them produced a plan. This prints the whole
+    table, because the aggregate survival rates, 13.7% against 59.3%, read as a
+    feasibility advantage and the paired table says they are not one.
+    """
+    both = dict(aa=0, ar=0, ra=0, rr=0)
+    only_td = only_snap = 0
+    unsolved = dict(aborted=0, infeasible=0)
+    for tag in epoch_tags():
+        if not (SWEEP / f"{tag}_td" / "planner_params.json").exists():
+            continue
+        if not (has_replay(tag, "td") and has_replay(tag, "snap")):
+            continue
+        td_p, sn_p = planner_out(tag, "td"), planner_out(tag, "snap")
+        td_r, sn_r = replay_out(tag, "td"), replay_out(tag, "snap")
+        tdrow = {q: i for i, q in enumerate(td_p["index"])}
+        snrow = {q: i for i, q in enumerate(sn_p["index"])}
+        only_td += sum(1 for q in tdrow if q not in snrow)
+        only_snap += sum(1 for q in snrow if q not in tdrow)
+        for q in set(tdrow) & set(snrow):
+            a = bool(sn_r["verdict"][snrow[q]])
+            b = bool(td_r["verdict"][tdrow[q]])
+            both["aa" if (a and b) else "ar" if a else "ra" if b else "rr"] += 1
+        for q in snrow:
+            if sn_r["verdict"][snrow[q]] or q in tdrow:
+                continue
+            # The cast to bool matters: out_flags is uint8 on disk.
+            unsolved["aborted" if bool(td_p["aborted"][q]) else "infeasible"] += 1
+    n = sum(both.values())
+    print(f"\nthe two planners' verdicts, paired on the {n} instances where both "
+          f"produced a plan:")
+    print(f"  snapshot accepted, time-dependent accepted   {both['aa']:4d}")
+    print(f"  snapshot accepted, time-dependent REJECTED   {both['ar']:4d}")
+    print(f"  snapshot REJECTED, time-dependent accepted   {both['ra']:4d}")
+    print(f"  snapshot REJECTED, time-dependent REJECTED   {both['rr']:4d}")
+    print(f"  instances with only a time-dependent plan    {only_td:4d}")
+    print(f"  instances with only a snapshot plan          {only_snap:4d}")
+    print(f"\n  of the rejected snapshot plans with no time-dependent plan:")
+    print(f"    the planner declared no feasible path      "
+          f"{unsolved['infeasible']:4d}")
+    print(f"    the planner hit its 30 s cap               "
+          f"{unsolved['aborted']:4d}")
+    return dict(both=both, only_td=only_td, only_snap=only_snap,
+                unsolved=unsolved)
+
+
 def _corr_records():
     """The executive's five-arm records, keyed by arm then (tag, plan index)."""
     recs = json.loads((CORR / "results.json").read_text())
@@ -1201,7 +1252,8 @@ def report_selection():
     print(f"  R2 candidates {len(a2)} -> {r2}")
     print(f"  R3 counts {c3}")
     print(f"  R3 candidates {len(a3)} -> {r3}")
-    return dict(r1=dict(counts=c1, n=len(a1), choice=r1),
+    pc = pair_contingency()
+    return dict(pair_contingency=pc,r1=dict(counts=c1, n=len(a1), choice=r1),
                 r2=dict(counts=c2, n=len(a2), choice=r2),
                 r3=dict(counts=c3, n=len(a3), choice=r3))
 
