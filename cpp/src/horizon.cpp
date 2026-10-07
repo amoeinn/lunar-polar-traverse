@@ -82,7 +82,10 @@ inline Vector3d map_to_unit(double x, double y, double R) {
     const double sl = (r > 0.0) ? x / r : 0.0;   // sin(LON), LON = atan2(x, y)
     const double cl = (r > 0.0) ? y / r : 1.0;   // cos(LON)
     // Snyder south polar aspect: x = rho sin(LON), y = rho cos(LON), so the
-    // cosine goes with the x component. See PLAN.md, 2026-09-22.
+    // cosine goes with the x component. Interchanging the two is a reflection
+    // rather than a rotation, it passed every check internal to this project,
+    // and an external landmark is what caught it. README, Results, "The check
+    // that mattered most".
     return Vector3d(sin_theta * cl, sin_theta * sl, -cos_theta);
 }
 

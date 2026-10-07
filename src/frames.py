@@ -31,7 +31,9 @@ def map_to_unit(x, y, radius=MOON_RADIUS_M):
     # Moon-fixed vector is (cos p cos L, cos p sin L, sin p) with cos p = sin t.
     # The cosine goes with the x component. Interchanging the two is a
     # reflection about the L = 45 deg meridian plane, not a rotation, and it
-    # passes every check internal to this project; see PLAN.md, 2026-09-22.
+    # passes every check internal to this project. It was caught by a landmark
+    # from the IAU gazetteer and not by any agreement between implementations;
+    # README, Results, "The check that mattered most", and tests/test_landmarks.py.
     return np.stack([sin_theta * cos_lam, sin_theta * sin_lam, -cos_theta], axis=-1)
 
 

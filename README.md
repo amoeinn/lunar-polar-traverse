@@ -113,6 +113,39 @@ infeasible fraction rises monotonically across duration quartiles.
 .venv/bin/python examples/score_phase3.py --parts core
 ```
 
+### The check that mattered most
+
+Before any of the above was worth reporting, the map projection was mirrored.
+Snyder's south polar aspect is x = rho sin(LON) and y = rho cos(LON), so the
+cosine goes with the x component; ours had the two interchanged, which maps
+longitude L to 90 minus L and reverses handedness. Nothing internal could see
+it. The C++ horizon and the independent Python ray march agreed to half a
+float32 ulp because both were written from the same specification and were wrong
+together, one frame check built its sun vector from our own frame, and a
+sub-solar bearing check agreed with a published image to 0.07 degrees while
+placing the region 20 km from where it belonged. What caught it was the first
+reference in this project that came from outside it: Shackleton's centre from
+the IAU Gazetteer of Planetary Nomenclature, located in the DEM as the centroid
+of the largest closed depression below a stated contour and carried back through
+our own map inverse, landed 20.39 km from the catalogue against a registered
+1 km tolerance, and a mirrored convention had been predicted beforehand to
+displace it 19.93 km. The cost of not running it would not have been a crash.
+On the pre-fix arrays P1's headline shadow edge speed is 28.31 m/hr; on the
+corrected arrays it is 185.31 m/hr, against a bar of 10 m/hr, so the claim this
+whole project rests on would have passed at a sixth of the true speed and the
+margin would have been reported as comfortable.
+
+```bash
+.venv/bin/python -m pytest tests/test_landmarks.py -q
+```
+
+Three tests over two landmarks, Shackleton and Cabeus. Each tolerance is one
+third of that landmark's smallest convention-fault displacement rather than
+anything about how precisely a catalogue centre can be reproduced, and
+`test_the_landmark_tolerance_discriminates` asserts that a mirrored or rotated
+convention would actually fail it, because a test that cannot fail has not been
+shown to work.
+
 ### The payoff, measured and absent
 
 Where both the mean map plan and the time dependent plan are feasible, 182

@@ -37,7 +37,9 @@ DEM80 = ROOT / "data" / "lola" / "LDEM_80S_80MPP_ADJ.TIF"
 # SMALLEST convention-fault displacement, which for both is the 56.892 deg
 # rotation rather than the mirror: Shackleton 9.53/3 and Cabeus 134.79/3 km.
 # The first version of this test used crater size instead, which is the wrong
-# quantity and gave 1 km and 10 km. See PLAN.md, 2026-09-22.
+# quantity and gave 1 km and 10 km. What this test caught, and what it would
+# have cost to skip it, is in the README under Results, "The check that
+# mattered most".
 LANDMARKS = {
     "Shackleton": dict(lat=-89.67, lon=129.78, diameter=20.92e3, tol=3.18e3,
                        dem=DEM20, px=20.0,
