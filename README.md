@@ -139,9 +139,11 @@ margin would have been reported as comfortable.
 .venv/bin/python -m pytest tests/test_landmarks.py -q
 ```
 
-Three tests over two landmarks, Shackleton and Cabeus. Each tolerance is one
-third of that landmark's smallest convention-fault displacement rather than
-anything about how precisely a catalogue centre can be reproduced, and
+Three tests over two landmarks, Shackleton and Cabeus, six cases in all, which
+skip on a fresh clone until `examples/fetch_data.sh` has fetched the DEM they
+locate the craters in. Each tolerance is one third of that landmark's smallest
+convention-fault displacement rather than anything about how precisely a
+catalogue centre can be reproduced, and
 `test_the_landmark_tolerance_discriminates` asserts that a mirrored or rotated
 convention would actually fail it, because a test that cannot fail has not been
 shown to work.
