@@ -37,7 +37,7 @@ target_include_directories(planner PRIVATE src)
 add_executable(replay src/replay.cpp)
 target_include_directories(replay PRIVATE src)
 
-# The executive of phase 6. BehaviorTree.CPP 4.9 ships in the ROS distribution
+# The executive of phase 6. BehaviorTree.CPP 4.10 ships in the ROS distribution
 # at /opt/ros/jazzy. Its own CMake package config is an ament one and pulls in
 # ament_cmake, which needs a Python module that is not installed here, so the
 # header and the library are found directly in the manner this file already
