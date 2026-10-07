@@ -58,7 +58,14 @@ def irradiance(tag, t_hours, dem, gx, gy, radius):
     nrm = np.stack([nx, ny, np.ones_like(nx)], axis=1)
     nrm /= np.linalg.norm(nrm, axis=1)[:, None]
     s = sun_unit_at(tag, t_hours)
-    # the sun in each cell's own local frame: map +x is north-ish, see the local notes
+    # The sun in each cell's own local frame. Under this south polar
+    # stereographic projection the map axes are the local north and east axes
+    # rotated by the point's own longitude: with lam = atan2(x, y), the map +x
+    # direction is cos(lam)*north - sin(lam)*east and +y is
+    # sin(lam)*north + cos(lam)*east. Verify any such basis by finite difference
+    # through map_to_unit before using it; a sign error here does not obviously
+    # fail, and one survived every internal check in this project until an
+    # external landmark caught it.
     lam = np.arctan2(gx.ravel(), gy.ravel())
     ax = np.cos(lam)[:, None] * north - np.sin(lam)[:, None] * east
     ay = np.sin(lam)[:, None] * north + np.cos(lam)[:, None] * east
