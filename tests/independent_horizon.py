@@ -183,7 +183,17 @@ class Reference:
 
 
 def select_cells(horizon, dist, switch_m, seed=20260921):
-    """The sampled cells, by the rule registered in PLAN.md check 1c."""
+    """The sampled cells for check 1c, by the rule fixed before the check ran.
+
+    Stated here rather than only referenced, because this is the rule and the
+    code below is its only published statement: the four cells whose rays land
+    most often in the near field, the four most often in the far field, the four
+    region corners, the four with the largest peak to peak horizon, the two
+    either side of the largest adjacent jump, and two drawn at random from a
+    fixed seed. Chosen to span the cases the two implementations could diverge
+    on rather than to be representative, since the check is for agreement and
+    not for a distribution.
+    """
     n = horizon.shape[0]
     far_frac = (dist > switch_m).mean(axis=2)
     near_frac = 1.0 - far_frac

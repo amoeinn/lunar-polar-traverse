@@ -428,6 +428,40 @@ docs/           the figures this README embeds and the script that makes them.
 data/           not tracked. Fetched products and run outputs.
 ```
 
+### On the references to PLAN.md in the source
+
+Docstrings and comments throughout refer to `PLAN.md`. That is the project's
+working record: dated registrations made before each run, the reasoning behind
+decisions, superseded values kept beside the ones that replaced them, and the
+scored verdicts. It is kept privately rather than published, because most of it
+is a log of what was tried and discarded and it would be read as documentation.
+
+Every number those comments rely on is stated here. Where a comment says a value
+was registered, the value itself is either on the line beside it or in the table
+below.
+
+| Registered value | What it fixes |
+| --- | --- |
+| region 10 km square centred on map (1000, 6000) m, 500 by 500 at 20 m | the planning region, chosen by a rule fixed before any illumination was computed |
+| reach 238 km, near field 20 m switching to far field 80 m | how far a ray is marched, and where the resolution changes |
+| 360 azimuth bins, 720 h horizon, 0.25 h sun cadence | the horizon profile and the interval tables built from it |
+| twelve epochs, four dates by three lunation phases | the sun geometries everything is scored over |
+| check 1c criterion 1.0e-3 deg | C++ horizon against the independent Python ray march |
+| g cross-check tolerance 1e-6 deg | `cpp/src/edges.cpp` against `src/frames.py`, the third copy of the sun convention |
+| sun chord error 3.5e-5 deg over 15 min | linear interpolation between sun samples, against the 1 deg ray spacing |
+| check 3 inequality T_interval <= T_dt + 1e-9 h | the planner may never beat the time expanded reference |
+| check 3 convergence: gap at most (path edges) times dt, monotone as dt halves, at dt 60, 30, 15, 7.5 and 3.75 min | replaced an earlier 1% clause that was arithmetically unreachable, and that clause stays scored as failed |
+| planner port: identical arrival to 1e-9 h and identical path length on at least ten instances with a path | C++ planner against its Python original, swept over shadow tolerances 0.5, 2, 6 and 24 h |
+| cost model: pitch to 1e-8 m of rise, decomposition at dip azimuth 23 deg | the slope cost against the raster and against closed form |
+| shadow quantisation grids 1, 60, 300 and 900 s | the four tried against the abort censoring, none of which removed it |
+| monitored configuration: 50 m/hr, 2 h shadow budget, pitch and roll limits 20 and 15 deg | the single point every executive and demo result is measured at |
+| replay limit tolerance 3.206 deg, and every plan judged again at zero | pitch and roll at the checker, judged twice on purpose |
+| planner cap 30 s per instance | the abort censoring in Limitations above comes from this |
+| executive: 2 replans, declaration audit cap 6 at 300 s, contradiction horizon 0.725 h | the tick budget and the audit that is independent of the executive |
+| McNemar test: same 45 monitored plans, one sided exact p at most 0.05, zero busts lost | the registered bar any correction to the monitor is held to |
+| axis sweep: four epochs, one per date, 40 pairs each, 160 instances per point; rates 20, 100 and 200 m/hr, tolerances 0.5, 6 and 24 h, limit pairs (15, 10) and (25, 20) | one parameter varied at a time from the monitored configuration |
+| bounded measurement: the first five 6 h and first three 24 h instances in draw order on which the exact engine aborted at an 8 s cap, rerun at 300 s | the sample rule behind the abort censoring result; eight of eight were still unresolved at 300 s, so the comparison it was meant to enable could not be made and the fallback was triggered |
+
 ## License
 
 The code in this repository is MIT licensed. See `LICENSE`.
