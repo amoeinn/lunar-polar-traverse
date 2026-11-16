@@ -74,14 +74,17 @@ consequence of that rule rather than a goal of it.
 ### Known issue
 
 Found on 9 Oct 2026, while auditing this project's sun code for the follow-on
-project lunar-landing-gnc. At 9 of the 12 call sites that use it, the code passes
-the sun position in km where metres are expected, so the sun here sits about
-0.663 deg too low. Three results were re-checked on copies with the units
-corrected. P6b still passes, kappa 0.8343 against the 0.8493 recorded. P5 still
-passes, 99.43% against the constant predictor's 97.80%. The G2 azimuth offset
-falls from 3.235 to 1.205 deg. P1 to P4, P7 and P8, the headline result among
-them, have not been re-run against the corrected sun, and should be read as
-unverified until they are. The fix and the re-run are planned.
+project lunar-landing-gnc. At 9 of the 12 call sites that use it, the code
+passes the sun position in km where metres are expected, so the sun here sits
+about 0.663 deg too low. Three results were re-checked on copies with the units
+corrected. P6b, the illumination model's agreement with observed LRO NAC frames
+as Cohen's kappa, still passes, kappa 0.8343 against the 0.8493 recorded. P5,
+agreement with the published PSR map, still passes, 99.43% against the constant
+predictor's 97.80%. The G2 azimuth offset, the bearing offset found early that
+Limitations lists as never closed, falls from 3.235 to 1.205 deg. P1 to P4, P7
+and P8, the headline result among them, have not been re-run against the
+corrected sun, and should be read as unverified until they are. The fix and the
+re-run are planned.
 
 ### The premise, measured
 
@@ -332,7 +335,9 @@ returned an empty set at that clause and nothing was substituted for it.
 * **A residual rotation between our map and the products' frame** that is smaller
   than the roughly 18.3 degrees a crater centroid can detect. This is the
   remaining candidate for a 3.235 degree bearing offset found early and never
-  closed. The evidence points away from our side, since the observation agrees
+  closed. Correcting the sun's units reduces that offset to 1.205 deg (see
+  [Known issue](#known-issue)), but it is not yet closed. The evidence points
+  away from our side, since the observation agrees
   with our mask more than with the published simulation at the label epoch, but
   nothing excludes it, and closing it needs an external reference with better
   angular leverage than a landmark.
