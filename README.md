@@ -1,5 +1,8 @@
 # lunar-polar-traverse
 
+**Known issue:** the sun position is passed in the wrong units at 9 of 12 call
+sites; see [Known issue](#known-issue) under Results.
+
 A time dependent path planner for a rover at the lunar south pole, on the real
 LOLA 20 m DEM with a SPICE sun ephemeris, an independent C++ replay checker that
 judges every plan, and an executive that watches the shadow budget while the plan
@@ -67,6 +70,18 @@ stereographic, 500 by 500 cells at 20 m, 6.08 km from the pole, 2296.6 m of
 relief, 2.20% of it in permanent shadow. It was selected by a rule registered
 before any illumination was computed, and the low shadow fraction is a
 consequence of that rule rather than a goal of it.
+
+### Known issue
+
+Found on 9 Oct 2026, while auditing this project's sun code for the follow-on
+project lunar-landing-gnc. At 9 of the 12 call sites that use it, the code passes
+the sun position in km where metres are expected, so the sun here sits about
+0.663 deg too low. Three results were re-checked on copies with the units
+corrected. P6b still passes, kappa 0.8343 against the 0.8493 recorded. P5 still
+passes, 99.43% against the constant predictor's 97.80%. The G2 azimuth offset
+falls from 3.235 to 1.205 deg. P1 to P4, P7 and P8, the headline result among
+them, have not been re-run against the corrected sun, and should be read as
+unverified until they are. The fix and the re-run are planned.
 
 ### The premise, measured
 
