@@ -26,6 +26,7 @@ from src.cost import Rover, build_edges, legal                   # noqa: E402
 from src.frames import cell_position                             # noqa: E402
 from src.intervals import LitIntervals                           # noqa: E402
 from src.replay import ReplaySettings, replay                    # noqa: E402
+from src.sun import sun_positions_m  # noqa: E402
 
 SEED = 20261001
 CAP_S = 30.0
@@ -39,7 +40,7 @@ def fine_sun(tag):
     t0 = sp.str2et(f"{date}T00:00:00") + PHASE_OFFSET_DAYS[int(phase)] * 86400.0
     ets = np.arange(t0, t0 + (HORIZON_H + FINE_SUN_DT_H) * 3600.0,
                     FINE_SUN_DT_H * 3600.0)
-    pos = np.array([sp.spkpos("SUN", e, P.FRAME, "LT+S", "MOON")[0] for e in ets])
+    pos = sun_positions_m(ets, P.FRAME)
     sp.kclear()
     return pos
 

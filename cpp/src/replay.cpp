@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -126,6 +127,27 @@ struct Rover {
 
 }  // namespace
 
+// The sun table arrives in METRES. az_el subtracts c.origin, built from
+// radius_m on the 1737400 m sphere, so a kilometre table mixes units and drops
+// the sun about 0.67 deg in elevation while leaving the azimuth exact, which is
+// why it survived every azimuth check in this project's record. Checked on the
+// magnitude because units are not carried in the file: kilometres come in three
+// orders low, a double conversion three orders high.
+inline void check_sun_metres(const double* sun, int n_sun, const char* where) {
+    constexpr double kMinM = 1.3e11, kMaxM = 1.7e11;
+    for (int k = 0; k < n_sun; ++k) {
+        const double x = sun[3 * k], y = sun[3 * k + 1], z = sun[3 * k + 2];
+        const double d = std::sqrt(x * x + y * y + z * z);
+        if (!(d >= kMinM && d <= kMaxM)) {
+            std::fprintf(stderr,
+                "%s: sun sample %d has magnitude %.6e m, outside [%.3e, %.3e]. "
+                "SPICE spkpos returns kilometres; this project works in metres.\n",
+                where, k, d, kMinM, kMaxM);
+            std::exit(2);
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         std::fprintf(stderr, "usage: %s <params.json>\n", argv[0]);
@@ -156,6 +178,7 @@ int main(int argc, char** argv) {
     const int n_sun = p.integer("n_sun");
     const double sun_dt = p.num("sun_dt_hours");
     const auto sun = read_raw<double>(p.str("sun_path"), 3u * n_sun);
+    check_sun_metres(sun.data(), n_sun, "replay");
     auto sun_at = [&](double t) {
         double u = t / sun_dt;
         int k = static_cast<int>(std::floor(u));

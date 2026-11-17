@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import examples.plan_pilot as P                                    # noqa: E402
 from examples.build_intervals import PHASE_OFFSET_DAYS, cache_path  # noqa: E402
+from src.sun import sun_positions_m                               # noqa: E402
 from src.cost import surface_gradient                              # noqa: E402
 from src.frames import cell_position, local_frame                   # noqa: E402
 from src.gzmap import HEIGHTMAP_N, PX, REGION_N                     # noqa: E402
@@ -38,8 +39,12 @@ def sun_unit_at(tag, t_hours):
         sp.furnsh(str(ROOT / "data" / "kernels" / k))
     et = (sp.str2et(f"{date}T00:00:00")
           + PHASE_OFFSET_DAYS[int(phase)] * 86400.0 + t_hours * 3600.0)
-    pos = np.asarray(sp.spkpos("SUN", et, P.FRAME, "LT+S", "MOON")[0], dtype=float)
+    pos = sun_positions_m(et, P.FRAME)[0]
     sp.kclear()
+    # A direction, not a position: every consumer renormalises it, in irradiance
+    # below and in verify_gazebo.sun_direction_world, so the 1000 is a scale
+    # nothing reads. Kept rather than dropped so the returned value is bit for
+    # bit what it was before the units fix, which never touched this path.
     return pos * 1000.0 / np.linalg.norm(pos)
 
 

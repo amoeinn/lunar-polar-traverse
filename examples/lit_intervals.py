@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 from src.frames import horizon_lookup                      # noqa: E402
 from src.frames import azimuth_elevation_from_frame        # noqa: E402
 from src.illumination import RegionCells, sun_angles       # noqa: E402
+from src.sun import sun_positions_m  # noqa: E402
 
 DATA = ROOT / "data"
 WORK = DATA / "work"
@@ -50,7 +51,7 @@ def build_inputs(year, cadence_h, rows):
     t0 = sp.str2et(f"{year}-01-01T00:00:00")
     t1 = sp.str2et(f"{year + 1}-01-01T00:00:00")
     ets = np.arange(t0, t1 + 1.0, cadence_h * 3600.0)
-    suns = np.array([sp.spkpos("SUN", et, FRAME, "LT+S", "MOON")[0] for et in ets])
+    suns = sun_positions_m(ets, FRAME)
     sp.kclear()
     (WORK / "sun.f64").write_bytes(np.ascontiguousarray(suns, dtype=np.float64).tobytes())
 

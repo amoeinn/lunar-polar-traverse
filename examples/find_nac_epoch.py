@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.frames import local_frame                       # noqa: E402
 from src.illumination import RegionCells, scan_epochs, sun_angles  # noqa: E402
+from src.sun import sun_positions_m  # noqa: E402
 
 DATA = ROOT / "data"
 KERNELS = ["naif0012.tls", "pck00010.tpc", "moon_pa_de421_1900-2050.bpc",
@@ -76,7 +77,7 @@ def main():
     if args.limit:
         ets = ets[:args.limit]
     print(f"scanning {ets.size} epochs, {sp.et2utc(ets[0],'C',0)} to {sp.et2utc(ets[-1],'C',0)}")
-    suns = np.array([sp.spkpos("SUN", et, FRAME, "LT+S", "MOON")[0] for et in ets])
+    suns = sun_positions_m(ets, FRAME)
 
     t0 = time.time()
     agreement, baseline = scan_epochs(cells, suns, profiles, dark)

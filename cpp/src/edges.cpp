@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -130,6 +131,27 @@ struct SunTable {
     }
 };
 
+// The sun table arrives in METRES. az_el subtracts c.origin, built from
+// radius_m on the 1737400 m sphere, so a kilometre table mixes units and drops
+// the sun about 0.67 deg in elevation while leaving the azimuth exact, which is
+// why it survived every azimuth check in this project's record. Checked on the
+// magnitude because units are not carried in the file: kilometres come in three
+// orders low, a double conversion three orders high.
+inline void check_sun_metres(const double* sun, int n_sun, const char* where) {
+    constexpr double kMinM = 1.3e11, kMaxM = 1.7e11;
+    for (int k = 0; k < n_sun; ++k) {
+        const double x = sun[3 * k], y = sun[3 * k + 1], z = sun[3 * k + 2];
+        const double d = std::sqrt(x * x + y * y + z * z);
+        if (!(d >= kMinM && d <= kMaxM)) {
+            std::fprintf(stderr,
+                "%s: sun sample %d has magnitude %.6e m, outside [%.3e, %.3e]. "
+                "SPICE spkpos returns kilometres; this project works in metres.\n",
+                where, k, d, kMinM, kMaxM);
+            std::exit(2);
+        }
+    }
+}
+
 inline double g_of(const Cell& c, const float* prof, int n_az, const Vector3d& sun,
                    double* az_out = nullptr, double* el_out = nullptr) {
     double az, el;
@@ -162,6 +184,7 @@ int main(int argc, char** argv) {
     const auto height = read_raw<float>(p.str("height_path"), ncell);
     const int n_sun = static_cast<int>(p.num("n_sun"));
     const auto sunbuf = read_raw<double>(p.str("sun_path"), 3u * n_sun);
+    check_sun_metres(sunbuf.data(), n_sun, "edges");
     const SunTable sun{sunbuf.data(), n_sun, p.num("sun_dt_hours")};
 
     std::vector<Cell> cells(ncell);

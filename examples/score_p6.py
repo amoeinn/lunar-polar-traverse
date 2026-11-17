@@ -23,6 +23,7 @@ from scipy.ndimage import distance_transform_edt
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.illumination import RegionCells, shadow_mask, sun_angles   # noqa: E402
+from src.sun import sun_positions_m  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("cp", ROOT / "examples" / "compare_published.py")
 cp = importlib.util.module_from_spec(spec)
@@ -93,7 +94,7 @@ def main():
     for k_ in KERNELS:
         sp.furnsh(str(DATA / "kernels" / k_))
     et = sp.str2et(EPOCH)
-    sun = sp.spkpos("SUN", et, FRAME, "LT+S", "MOON")[0]
+    sun = sun_positions_m(et, FRAME)[0]
 
     xs = x0 + (np.arange(n) + 0.5) * px
     ys = y1 - (np.arange(n) + 0.5) * px

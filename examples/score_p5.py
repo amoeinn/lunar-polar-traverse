@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.frames import horizon_lookup                       # noqa: E402
 from src.illumination import RegionCells, sun_angles        # noqa: E402
+from src.sun import sun_positions_m  # noqa: E402
 
 DATA = ROOT / "data"
 KERNELS = ["naif0012.tls", "pck00010.tpc", "moon_pa_de421_1900-2050.bpc",
@@ -43,7 +44,7 @@ def sun_track(step_s):
     for k in KERNELS:
         sp.furnsh(str(DATA / "kernels" / k))
     ets = np.arange(sp.str2et(CYCLE[0]), sp.str2et(CYCLE[1]), step_s)
-    pos = np.array([sp.spkpos("SUN", et, FRAME, "LT+S", "MOON")[0] for et in ets])
+    pos = sun_positions_m(ets, FRAME)
     sp.kclear()
     return ets, pos
 

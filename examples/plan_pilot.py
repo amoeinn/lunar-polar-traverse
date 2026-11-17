@@ -30,6 +30,7 @@ from src.illumination import RegionCells                            # noqa: E402
 from src.intervals import LitIntervals, SunTable, g_at              # noqa: E402
 from src.planner import Graph, plan                                 # noqa: E402
 from src.reference import plan_time_expanded                        # noqa: E402
+from src.sun import sun_positions_m  # noqa: E402
 
 DATA = ROOT / "data"
 KERNELS = ["naif0012.tls", "pck00010.tpc", "moon_pa_de421_1900-2050.bpc",
@@ -70,7 +71,7 @@ def sun_table(horizon_h, cadence_h=0.25):
         sp.furnsh(str(DATA / "kernels" / k))
     t0 = sp.str2et(EPOCH)
     ets = np.arange(t0, t0 + (horizon_h + cadence_h) * 3600.0, cadence_h * 3600.0)
-    pos = np.array([sp.spkpos("SUN", e, FRAME, "LT+S", "MOON")[0] for e in ets])
+    pos = sun_positions_m(ets, FRAME)
     sp.kclear()
     return SunTable(pos, cadence_h)
 

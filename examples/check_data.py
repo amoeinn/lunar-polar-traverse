@@ -5,6 +5,7 @@ import numpy as np
 import rasterio
 import spiceypy as sp
 from rasterio.windows import Window
+from src.sun import sun_positions_m
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
@@ -60,8 +61,12 @@ def check_sun():
     lat = np.empty(ets.size)
     lon = np.empty(ets.size)
     for i, et in enumerate(ets):
-        p, _ = sp.spkpos("SUN", et, FRAME, "LT+S", "MOON")
-        _, lon[i], lat[i] = sp.reclat(p)
+        # Metres rather than kilometres. reclat's radius is discarded here and
+        # its longitude and latitude are scale invariant, so this reads the same
+        # either way; it goes through the one conversion so there is no second
+        # place in the project where spkpos is called raw.
+        pos = sun_positions_m(et, FRAME)[0]
+        _, lon[i], lat[i] = sp.reclat(pos)
     elev_pole = -np.degrees(lat)  # at the south pole, local up is -z
     rate = np.abs(np.diff(np.degrees(np.unwrap(lon))))  # deg per hour
     print(f"hours sampled: {ets.size} (2027 to 2028)")

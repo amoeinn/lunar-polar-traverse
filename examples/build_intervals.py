@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 import examples.plan_pilot as P                                  # noqa: E402
 from src.cost import Rover                                       # noqa: E402
 from src.intervals import LitIntervals, SunTable                 # noqa: E402
+from src.sun import sun_positions_m  # noqa: E402
 
 DATES = ("2028-02-15", "2028-05-15", "2028-08-15", "2028-11-15")
 PHASE_OFFSET_DAYS = (0.0, 9.84, 19.69)          # a third of a synodic month apart
@@ -39,7 +40,7 @@ def sun_table_at(base_utc, offset_days, cadence_h=0.25):
         sp.furnsh(str(P.DATA / "kernels" / k))
     t0 = sp.str2et(base_utc) + offset_days * 86400.0
     ets = np.arange(t0, t0 + (HORIZON_H + cadence_h) * 3600.0, cadence_h * 3600.0)
-    pos = np.array([sp.spkpos("SUN", e, P.FRAME, "LT+S", "MOON")[0] for e in ets])
+    pos = sun_positions_m(ets, P.FRAME)
     sp.kclear()
     return SunTable(pos, cadence_h)
 

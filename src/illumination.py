@@ -56,7 +56,8 @@ def scan_epochs(cells, sun_positions, profiles, dark_observed, edge_deg=0.0):
     each, and the agreement of the always-lit predictor, which marks nothing
     shadowed and is the baseline any real result has to beat.
     """
-    sun_positions = np.atleast_2d(np.asarray(sun_positions, dtype=float))
+    from src.sun import check_sun_metres
+    sun_positions = check_sun_metres(sun_positions, where="scan_epochs")
     dark_observed = np.asarray(dark_observed, dtype=bool)
     if dark_observed.shape != (len(cells),):
         raise ValueError(f"dark_observed has shape {dark_observed.shape}, "

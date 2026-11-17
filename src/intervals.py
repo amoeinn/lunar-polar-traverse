@@ -30,6 +30,12 @@ class SunTable:
     """
 
     def __init__(self, positions, dt_hours):
+        # Metres, not kilometres. g_at subtracts a cell origin on the 1737400 m
+        # sphere, so a km table mixes units and drops the sun 0.67 deg. Seven
+        # producers did exactly that until 2026-11-16; this is the gate that
+        # makes a repeat loud instead of a 0.67 deg bias nobody sees.
+        from src.sun import check_sun_metres
+        check_sun_metres(positions, where="SunTable")
         self.p = np.asarray(positions, dtype=float)
         self.dt = float(dt_hours)
 

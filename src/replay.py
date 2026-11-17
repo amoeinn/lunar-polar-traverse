@@ -32,6 +32,10 @@ def replay(plans, starts, grid, rover, sun_positions, sun_dt_h, shadow_tol_h,
     geometry. Returns arrays over plans, plus the checker's own per-step pitch
     and roll with offsets, which is what the tolerance measurement needs.
     """
+    # Metres. cpp/src/replay.cpp subtracts an eye position built from R + h,
+    # so the units have to match before the array is written to disk.
+    from src.sun import check_sun_metres
+    check_sun_metres(sun_positions, where="replay")
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
     out_keys = ("arrival", "shadow", "verdict", "illegal", "step_pitch",
