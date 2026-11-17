@@ -34,7 +34,19 @@ KERNELS = ["naif0012.tls", "pck00010.tpc", "moon_pa_de421_1900-2050.bpc",
            "moon_080317.tf", "de421.bsp"]
 FRAME = "MOON_ME_DE421"
 EPOCH = "2010-09-21T17:34:00.5"        # label midpoint, PLAN.md
-LABEL_AZ, LABEL_EL = 8.989, 1.105      # recorded in PLAN.md step 8
+# The label epoch's own geometry, which this file asserts before scoring so a
+# frame or units change cannot pass unnoticed. It did its job on 2026-11-16:
+# the sun was being passed to SPICE's frame decomposition in kilometres against
+# a cell origin in metres, and this assertion is what stopped the re-score.
+#
+#   step 8, with the kilometre sun   azimuth 8.989   elevation 1.105
+#   corrected, metres                azimuth 8.9888  elevation 1.7654
+#
+# The azimuth moved by -0.0002 deg and the elevation by +0.6604. That split is
+# the signature of the fault rather than a coincidence: the cell origin is
+# radial, so mixing its units perturbs only the up component and leaves the
+# bearing exact. The step 8 pair stays in PLAN.md as recorded.
+LABEL_AZ, LABEL_EL = 8.9888, 1.7654
 SOLAR_RADIUS_DEG = 0.2666
 EDGES = (("first light", +SOLAR_RADIUS_DEG), ("point source", 0.0),
          ("full sun", -SOLAR_RADIUS_DEG))
