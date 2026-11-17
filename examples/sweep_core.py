@@ -40,6 +40,7 @@ CAP_S = 30.0
 # twelve epochs in five batches and drew a different instance set in each.
 # 2028-05-15_p1 and 2028-05-15_p2 ended with their planner stages scored on one
 # draw and their mean-map stages on another.
+STAGES = ("planner", "mean-map", "replay")
 REGISTERED_EPOCHS = tuple(t for t, _, _ in epochs())
 _DRAW_LABEL = {t: i for i, t in enumerate(REGISTERED_EPOCHS)}
 TOLERANCE_H = 2.0
@@ -76,6 +77,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=int, default=12)
     ap.add_argument("--tags", default="all")
+    ap.add_argument("--stages", default="all",
+                    help="which stages to run: all, or a comma-separated "
+                         "subset of planner, mean-map, replay. Splitting a "
+                         "long epoch into --stages planner and then "
+                         "--stages mean-map,replay is two runs that each fit a "
+                         "timeout, instead of one that is killed partway. A "
+                         "run without the planner stage reads its results back "
+                         "from disk and refuses if any are missing.")
     ap.add_argument("--resume", action="store_true",
                     help="read back planner jobs whose outputs are already "
                          "complete on disk, and replay verdicts already "
@@ -92,6 +101,20 @@ def main():
         print(f"not registered epochs: {unknown}; known: "
               f"{list(REGISTERED_EPOCHS)}")
         return 2
+    if args.stages == "all":
+        stages = set(STAGES)
+    else:
+        stages = {t.strip() for t in args.stages.split(",") if t.strip()}
+        bad = sorted(stages - set(STAGES))
+        if bad or not stages:
+            print(f"unknown stages {bad or ['(none given)']}; choose all, or a "
+                  f"comma-separated subset of {list(STAGES)}")
+            return 2
+        if "replay" in stages and "mean-map" not in stages:
+            print("--stages replay needs mean-map in the same run: the mean-map "
+                  "stage keeps nothing on disk, so its plans have to be "
+                  "recomputed in the process that replays them")
+            return 2
     rover = Rover(v_flat=50.0)
     p, n, px, dem, horizon, cells, gx, gy, edges, graph = P.load(rover)
     xs, ys = gx.ravel(), gy.ravel()
@@ -120,7 +143,7 @@ def main():
           f"{PAIRS_PER_BAND*len(P.BANDS)} pairs per epoch, {len(tags)} epochs")
 
     # --- stage 1: prepare and launch every planner job in parallel ---
-    jobs, meta = [], {}
+    jobs, meta, missing = [], {}, []
     t0 = time.time()
     for tag in tags:
         iv = LitIntervals.load(cache_path(tag))
@@ -135,11 +158,18 @@ def main():
         froz = frozen_intervals(iv, 0.0)
         for kind, table in (("td", iv), ("snap", froz)):
             work = P.DATA / "work" / "sweep" / f"{tag}_{kind}"
-            have = P.finished_job(work, want_paths=True) if args.resume else None
+            have = (P.finished_job(work, want_paths=True)
+                    if (args.resume or "planner" not in stages) else None)
             if have is not None:
                 # Read back, and do not touch the directory: run_cpp would
                 # rewrite the inputs and the params even when deferring.
                 jobs.append((tag, kind, None, have))
+                continue
+            if "planner" not in stages:
+                # Nothing is written for a job this run will not plan: run_cpp
+                # writes 41 MB of inputs and a params file before it defers,
+                # which would leave a directory that looks started and is not.
+                missing.append((tag, kind))
                 continue
             cmd, params = P.run_cpp(graph, table, pairs, TOLERANCE_H, 0.0, HORIZON_H,
                                     CAP_S, work, components=comp_all,
@@ -149,6 +179,14 @@ def main():
         meta[tag] = dict(pairs=pairs, iv=iv, pool=pool.size,
                          lit0=float(iv.lit0.mean()),
                          trans=float(np.diff(iv.offsets).mean()))
+    if missing:
+        print(f"\n--stages {args.stages} does not run the planner, and "
+              f"{len(missing)} job(s) have no complete output on disk:")
+        for tag, kind in missing:
+            print(f"  {tag} {kind}")
+        print("run --stages planner for those epochs first; nothing was "
+              "written for them here")
+        return 2
     done = [j for j in jobs if j[2] is None]
     todo = [j for j in jobs if j[2] is not None]
     print(f"prepared {len(jobs)} planner jobs in {time.time()-t0:.0f} s; "
@@ -174,6 +212,24 @@ def main():
         running = still
     print(f"planner stage done in {time.time()-t0:.0f} s")
 
+    if "mean-map" not in stages:
+        print(f"\n=== per epoch, planner outcomes (feasible / infeasible / "
+              f"aborted), cap {CAP_S:.0f} s ===")
+        print(f"  {'epoch':<16}{'lit t0':>8}{'time-dependent':>18}{'snapshot':>18}")
+        for tag in tags:
+            row = []
+            for kind in ("td", "snap"):
+                r = results[(tag, kind)]
+                ab = r["aborted"]
+                row.append(f"{int((~ab & np.isfinite(r['arrival'])).sum()):5d} /"
+                           f"{int((~ab & ~np.isfinite(r['arrival'])).sum()):5d} /"
+                           f"{int(ab.sum()):4d}")
+            print(f"  {tag:<16}{meta[tag]['lit0']:>7.2%}{row[0]:>18}{row[1]:>18}")
+        print(f"\nstages run: {sorted(stages)}. The mean-map and replay stages "
+              f"were not run, so no replay verdict or mean-map exponent is "
+              f"reported here. Finish with --stages mean-map,replay.")
+        return 0
+
     # --- stage 2: mean-map, swept over the weighting exponent ---
     t0 = time.time()
     for tag in tags:
@@ -190,6 +246,13 @@ def main():
         meta[tag]["meanmap"] = mm
     print(f"mean-map stage done in {time.time()-t0:.0f} s "
           f"({len(tags)} epochs x {len(EXPONENTS)} exponents)")
+
+    if "replay" not in stages:
+        print(f"\nstages run: {sorted(stages)}. Nothing was replayed, so no "
+              f"verdict is reported. The mean-map plans are not written to "
+              f"disk, so finishing needs --stages mean-map,replay rather than "
+              f"--stages replay.")
+        return 0
 
     # --- stage 3: replay everything, judged twice ---
     t0 = time.time()

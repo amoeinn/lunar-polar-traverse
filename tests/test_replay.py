@@ -142,18 +142,23 @@ def test_the_checker_sees_the_sun_rather_than_assuming_it():
         assert dark["shadow"][0] > 0.1
 
 
-def test_reuse_reads_the_cached_run_and_is_keyed_on_the_work_directory_alone():
-    """Protects the sweep's resume path, and names the hazard it carries.
+def test_reuse_reads_a_finished_run_back_and_refuses_a_different_one():
+    """Protects the sweep's resume path, and the hazard it used to carry.
 
     A sweep piece that outlives its session must not lose the plans it already
     integrated, so replay(reuse=True) returns a finished run's outputs from its
-    work directory instead of repeating the integration. The cache is keyed on
-    that directory and on nothing else: it does not know which plans produced
-    it. So a caller that reuses a directory for a different plan gets the old
-    answer, which is why every sweep driver puts the point, the epoch, the
-    planner and the tolerance label in the path. Both halves are asserted here,
-    the second deliberately: if reuse ever started checking the plans, the
-    drivers would be relying on something the function does not promise.
+    work directory instead of repeating the integration.
+
+    Until 2026-11-17 that cache was keyed on the directory and on nothing else:
+    it did not know which plans produced it, so a caller that reused a
+    directory for different plans silently got the old answer. The run killed
+    on 2026-11-16 left exactly that on disk, a directory whose params described
+    a call that never wrote beside outputs from the call before it, and a
+    resumed sweep would have read 120 mean-map verdicts back as a 64-plan
+    time-dependent result. reuse now compares the plan inputs on disk with the
+    ones the call would write, and the output sizes with the ones they must
+    have, so a directory holding another call's work is integrated afresh
+    rather than returned. Both halves are asserted.
     """
     import tempfile
     from pathlib import Path
@@ -169,11 +174,36 @@ def test_reuse_reads_the_cached_run_and_is_keyed_on_the_work_directory_alone():
         again = replay([short], [0.0], grid, rover, suns, dt, 2.0, work, reuse=True)
         for k in ("arrival", "shadow", "verdict", "illegal", "step_offsets"):
             assert np.array_equal(first[k], again[k]), k
-        # reuse is not the default: a different plan in the same directory is
-        # integrated afresh and gives that plan's own arrival.
+
+        # a different plan in the same directory is integrated afresh, with or
+        # without reuse, and gives that plan's own arrival
         fresh = replay([long_], [0.0], grid, rover, suns, dt, 2.0, work)
         assert fresh["arrival"][0] > first["arrival"][0] * 1.5, (
             fresh["arrival"][0], first["arrival"][0])
-        # and with reuse it answers from the cache, which is now the long plan
-        stale = replay([short], [0.0], grid, rover, suns, dt, 2.0, work, reuse=True)
-        assert stale["arrival"][0] == pytest.approx(fresh["arrival"][0])
+        # the directory now holds the long plan's work. Asking for the short
+        # plan with reuse must NOT return it.
+        back = replay([short], [0.0], grid, rover, suns, dt, 2.0, work, reuse=True)
+        assert back["arrival"][0] == pytest.approx(first["arrival"][0]), (
+            "reuse returned another call's outputs")
+        assert back["arrival"][0] != pytest.approx(fresh["arrival"][0])
+
+
+def test_reuse_refuses_a_call_killed_while_writing():
+    """A short output file is the signature of a killed call, and reading one
+    back is a wrong answer rather than a crash."""
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        grid = scene(td, flat())
+        suns, dt = sun_table(5.0)
+        rover = Rover(v_flat=50.0)
+        work = td / "run"
+        plan = straight_plan(30, 10, 20)
+        first = replay([plan], [0.0], grid, rover, suns, dt, 2.0, work)
+        f = work / "out_step_pitch.bin"
+        f.write_bytes(f.read_bytes()[:-8])
+        again = replay([plan], [0.0], grid, rover, suns, dt, 2.0, work, reuse=True)
+        assert np.array_equal(first["arrival"], again["arrival"])
+        assert f.stat().st_size == len(f.read_bytes()), "it was rewritten"
+        assert again["step_pitch"].size == int(first["step_offsets"][-1])

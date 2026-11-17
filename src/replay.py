@@ -15,6 +15,75 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "cpp" / "build" / "replay"
 
 
+OUT_KEYS = ("arrival", "shadow", "verdict", "illegal", "step_pitch",
+            "step_roll", "step_pitch_mean", "step_roll_mean", "step_offsets")
+# Outputs sized one per plan, and the four sized one per integration step.
+PER_PLAN = {"arrival": "f8", "shadow": "f8", "verdict": "u1", "illegal": "i4"}
+PER_STEP = ("step_pitch", "step_roll", "step_pitch_mean", "step_roll_mean")
+# The inputs that identify which call a directory holds. sun_path is excluded on
+# purpose: it is the same for every call at an epoch, so it discriminates
+# nothing, and it is the largest file here.
+IDENTIFYING = {"plan_offsets_path": np.int64, "plan_cells_path": np.int32,
+               "plan_start_path": np.float64, "plan_wait_path": np.float64}
+
+
+def reuse_problems(work, files, n_plans):
+    """Why the outputs in `work` cannot be read back as this call's result.
+
+    Existence is not completeness. cpp/build/replay writes its outputs at the
+    end, so a call killed partway leaves either nothing or short files, and a
+    short file read back is a wrong answer rather than a crash. Worse, a
+    directory can hold a *different* call's outputs: the sweep driver used to
+    pass one directory for all twelve of an epoch's calls, and the run killed on
+    2026-11-16 left params describing a call that never wrote beside outputs
+    from the call before it. So the inputs on disk must also be the ones this
+    call would write, which is what ties the outputs to these plans.
+    """
+    work = Path(work)
+    probs = []
+    for key, dt in IDENTIFYING.items():
+        if key not in files:
+            continue
+        f = work / f"{key}.bin"
+        want = np.asarray(files[key], dtype=dt)
+        if not f.exists():
+            probs.append(f"{f.name} missing, so the outputs cannot be tied to "
+                         f"these plans")
+            continue
+        got = np.fromfile(f, dtype=dt)
+        if got.size != want.size:
+            probs.append(f"{f.name} holds {got.size} values against "
+                         f"{want.size} this call would write")
+        elif not np.array_equal(got, want):
+            probs.append(f"{f.name} is not the input this call would write, so "
+                         f"the outputs belong to a different call")
+    if probs:
+        return probs
+    off = work / "out_step_offsets.bin"
+    if not off.exists():
+        return ["out_step_offsets.bin missing"]
+    if off.stat().st_size != (n_plans + 1) * 8:
+        return [f"out_step_offsets.bin is {off.stat().st_size} bytes against "
+                f"{(n_plans + 1) * 8} for {n_plans} plans"]
+    steps = int(np.fromfile(off, dtype=np.int64)[-1])
+    for k, dt in PER_PLAN.items():
+        f = work / f"out_{k}.bin"
+        want = n_plans * np.dtype(dt).itemsize
+        if not f.exists():
+            probs.append(f"out_{k}.bin missing")
+        elif f.stat().st_size != want:
+            probs.append(f"out_{k}.bin is {f.stat().st_size} bytes against "
+                         f"{want} for {n_plans} plans")
+    for k in PER_STEP:
+        f = work / f"out_{k}.bin"
+        if not f.exists():
+            probs.append(f"out_{k}.bin missing")
+        elif f.stat().st_size != steps * 4:
+            probs.append(f"out_{k}.bin is {f.stat().st_size} bytes against "
+                         f"{steps * 4} for {steps} steps")
+    return probs
+
+
 @dataclass
 class ReplaySettings:
     integration_step_m: float = 1.0
@@ -38,15 +107,6 @@ def replay(plans, starts, grid, rover, sun_positions, sun_dt_h, shadow_tol_h,
     check_sun_metres(sun_positions, where="replay")
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
-    out_keys = ("arrival", "shadow", "verdict", "illegal", "step_pitch",
-                "step_roll", "step_pitch_mean", "step_roll_mean", "step_offsets")
-    if reuse:
-        # A finished run left its outputs here. Reading them back rather than
-        # repeating the integration is what lets a long sweep resume after an
-        # interruption without losing what it had already done.
-        found = {f"out_{k}": str(work / f"out_{k}.bin") for k in out_keys}
-        if all(Path(v).exists() for v in found.values()):
-            return _read_outputs(found)
     offsets = np.zeros(len(plans) + 1, dtype=np.int64)
     for i, pl in enumerate(plans):
         offsets[i + 1] = offsets[i] + len(pl)
@@ -62,6 +122,14 @@ def replay(plans, starts, grid, rover, sun_positions, sun_dt_h, shadow_tol_h,
     if waits is not None:
         files["plan_wait_path"] = np.concatenate(
             [np.asarray(w, dtype=np.float64) for w in waits])
+
+    if reuse and not reuse_problems(work, files, len(plans)):
+        # A finished call left its outputs here, for these plans, at the sizes
+        # they must have. Reading them back rather than repeating the
+        # integration is what lets a long sweep resume after an interruption
+        # without losing what it had already done.
+        return _read_outputs({f"out_{k}": str(work / f"out_{k}.bin")
+                              for k in OUT_KEYS})
     params = dict(grid)
     for key, arr in files.items():
         path = work / f"{key}.bin"
@@ -73,8 +141,7 @@ def replay(plans, starts, grid, rover, sun_positions, sun_dt_h, shadow_tol_h,
     params.update(v_flat=rover.v_flat, mu=rover.mu, cap_ratio=rover.cap_ratio,
                   roll_ref=rover.roll_ref, roll_exponent=rover.roll_exponent,
                   pitch_max=rover.pitch_max, roll_max=rover.roll_max)
-    for k in ("arrival", "shadow", "verdict", "illegal", "step_pitch", "step_roll",
-              "step_pitch_mean", "step_roll_mean", "step_offsets"):
+    for k in OUT_KEYS:
         params[f"out_{k}"] = str(work / f"out_{k}.bin")
     (work / "replay_params.json").write_text(json.dumps(params, indent=2))
     subprocess.run([str(BINARY), str(work / "replay_params.json")], check=True,

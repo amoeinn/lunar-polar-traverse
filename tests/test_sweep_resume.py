@@ -198,13 +198,17 @@ def test_every_replay_call_gets_its_own_directory(monkeypatch):
 
 def test_the_driver_skips_run_cpp_when_resuming():
     """Read the source rather than run the sweep: the resume branch must reach
-    finished_job and `continue` before run_cpp, since run_cpp writes."""
+    finished_job and `continue` before run_cpp, since run_cpp writes.
+
+    Matched on the call rather than on an assignment's exact spelling, so
+    reformatting the line does not fail this.
+    """
     src = (ROOT / "examples" / "sweep_core.py").read_text()
-    i = src.index("have = P.finished_job(")
+    i = src.index("P.finished_job(")
     j = src.index("cmd, params = P.run_cpp(", i)
     between = src[i:j]
     assert "continue" in between, "the resume branch falls through into run_cpp"
-    assert "args.resume" in src[max(0, i - 200):i + 100]
+    assert "args.resume" in between, "the read-back is not tied to --resume"
 
 
 def test_reuse_is_tied_to_the_resume_flag():
