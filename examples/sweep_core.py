@@ -32,11 +32,30 @@ from src.replay import ReplaySettings, replay                   # noqa: E402
 
 SEED = 20260924
 CAP_S = 30.0
+# The epoch order the draw is keyed on. It is the registered twelve, and the
+# key is an epoch's own place in that list rather than its place in --tags.
+# Keying it on the --tags position made the pairs an epoch got depend on which
+# other epochs shared the run: the original sweep passed --tags all, so the two
+# agreed and nothing showed, and the sun-units regeneration then ran the same
+# twelve epochs in five batches and drew a different instance set in each.
+# 2028-05-15_p1 and 2028-05-15_p2 ended with their planner stages scored on one
+# draw and their mean-map stages on another.
+REGISTERED_EPOCHS = tuple(t for t, _, _ in epochs())
+_DRAW_LABEL = {t: i for i, t in enumerate(REGISTERED_EPOCHS)}
 TOLERANCE_H = 2.0
 EXPONENTS = (0.0, 0.5, 1.0, 2.0)
 PITCH_ROLL_TOL_DEG = 3.206      # registered 2026-10-01 from the first batch
 ARRIVAL_CRITERION = 0.01        # registered 2026-10-02
 PAIRS_PER_BAND = 24
+
+
+def draw_label(tag):
+    """The rng key for an epoch's pair draw: its index among the registered
+    twelve, independent of how the run was batched."""
+    if tag not in _DRAW_LABEL:
+        raise KeyError(f"{tag} is not one of the registered epochs "
+                       f"{list(REGISTERED_EPOCHS)}")
+    return _DRAW_LABEL[tag]
 
 
 def draw(pool, xs, ys, label):
@@ -64,6 +83,15 @@ def main():
                          "stage keeps nothing on disk, so it is always redone; "
                          "at 17 s an epoch that is not worth caching.")
     args = ap.parse_args()
+    # Validated before anything is loaded or written: a mistyped tag should not
+    # cost a region load, and must never reach the draw, where an unregistered
+    # epoch has no key.
+    tags = (list(REGISTERED_EPOCHS) if args.tags == "all" else args.tags.split(","))
+    unknown = [t for t in tags if t not in _DRAW_LABEL]
+    if unknown:
+        print(f"not registered epochs: {unknown}; known: "
+              f"{list(REGISTERED_EPOCHS)}")
+        return 2
     rover = Rover(v_flat=50.0)
     p, n, px, dem, horizon, cells, gx, gy, edges, graph = P.load(rover)
     xs, ys = gx.ravel(), gy.ravel()
@@ -72,7 +100,6 @@ def main():
                        shape=(n * n, n * n))
     _, comp_all = connected_components(g_all, directed=False)
     positions = cell_position(gx, gy, dem, p["radius_m"]).reshape(-1, 3)
-    tags = ([t for t, _, _ in epochs()] if args.tags == "all" else args.tags.split(","))
     grid = dict(radius_m=p["radius_m"], region_ox=p["region_ox"],
                 region_oy=p["region_oy"], region_px=p["region_px"],
                 region_nx=p["region_nx"], near_path=p["near_path"],
@@ -95,7 +122,7 @@ def main():
     # --- stage 1: prepare and launch every planner job in parallel ---
     jobs, meta = [], {}
     t0 = time.time()
-    for ei, tag in enumerate(tags):
+    for tag in tags:
         iv = LitIntervals.load(cache_path(tag))
         changing = np.diff(iv.offsets) >= 2
         sel = ok & changing[edges["a"]] & changing[edges["b"]]
@@ -104,7 +131,7 @@ def main():
         _, lab = connected_components(gc, directed=False)
         sz = np.bincount(lab)
         pool = np.flatnonzero(lab == np.argsort(sz)[::-1][0])
-        pairs = draw(pool, xs, ys, label=ei)
+        pairs = draw(pool, xs, ys, label=draw_label(tag))
         froz = frozen_intervals(iv, 0.0)
         for kind, table in (("td", iv), ("snap", froz)):
             work = P.DATA / "work" / "sweep" / f"{tag}_{kind}"
