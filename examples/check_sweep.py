@@ -21,11 +21,14 @@ The per-epoch outcome triple is printed beside the pre-fix run where a copy
 exists under data/work/pre_sunfix/sweep, since the direction of the change is
 what D132-3 is scored on.
 
-Read only; writes nothing. It does not check the replay stage: sweep_core
-replays every planner and both tolerance labels into one shared
-<tag>_replay directory, so only the last write survives there by construction,
-and the replay verdicts are recomputed into keyed directories by
-examples/score_phase3.py.
+The replay stage is checked by presence only, per planner and tolerance label.
+sweep_core now gives each of the twelve calls its own directory, so a count of
+how many carry a verdict says how far the stage got; a tag with none is a run
+whose replay stage did not start. A planner with no feasible plan at an epoch
+produces no directory, which is why a partial count is reported rather than
+failed.
+
+Read only; writes nothing.
 """
 import json
 import sys
@@ -35,7 +38,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+import examples.plan_pilot as P                                 # noqa: E402
 from examples.build_intervals import cache_path                 # noqa: E402
+from examples.sweep_core import EXPONENTS                       # noqa: E402
 from src.intervals import LitIntervals                          # noqa: E402
 
 SWEEP = ROOT / "data" / "work" / "sweep"
@@ -48,9 +53,10 @@ KINDS = ("td", "snap")
 EXPECTED = {"n_cells": 250000, "n_instances": 120, "shadow_tol_h": 2.0,
             "t_start_h": 0.0, "horizon_h": 720.0, "time_limit_s": 30.0,
             "v_cap": 75.0, "shadow_grid_h": 0.0, "relax_dominance": 0.0}
-OUTPUTS = {"out_arrival.bin": ("f8", 1), "out_seconds.bin": ("f8", 1),
-           "out_flags.bin": ("u1", 1), "out_pathlen.bin": ("i4", 1),
-           "out_stats.bin": ("i8", 4)}
+# Every planner and tolerance label sweep_core replays into its own directory.
+REPLAY_KEYS = tuple(f"{k}_{lbl}"
+                    for k in ("td", "snap") + tuple(f"mm{e}" for e in EXPONENTS)
+                    for lbl in ("tol", "zero"))
 
 
 def transitions_now(tag):
@@ -85,15 +91,11 @@ def check_job(d, tag, kind, expect_trans, table_mtime):
     elif expect_trans is not None and got != expect_trans:
         probs.append(f"n_transitions {got} != {expect_trans} in the interval "
                      f"table now on disk -- this job used a superseded table")
-    n = EXPECTED["n_instances"]
-    for name, (dt, w) in OUTPUTS.items():
+    probs += P.output_problems(params, want_paths=True)
+    for name in [f"out_{k}.bin" for k in P.OUT_WIDTH]:
         f = d / name
         if not f.exists():
-            probs.append(f"{name} missing")
             continue
-        a = np.fromfile(f, dtype=dt)
-        if a.size != n * w:
-            probs.append(f"{name} has {a.size} values, expected {n * w}")
         if f.stat().st_mtime < pf.stat().st_mtime:
             probs.append(f"{name} is older than its inputs, so it is stale")
         elif table_mtime is not None and f.stat().st_mtime < table_mtime:
@@ -135,12 +137,12 @@ def main():
 
     print(f"  {'epoch':<16}{'planner':<7}{'feas/inf/abort':>17}"
           f"{'  was (pre-fix)':>17}{'search s':>10}  status")
-    bad = 0
+    bad, bad_replay = 0, 0
     for tag in tags:
         et, tm = transitions_now(tag)
         if et is None:
             print(f"  {tag:<16}  no interval table on disk; build it first")
-            bad += 1
+            bad += 2
             continue
         for kind in KINDS:
             d = SWEEP / f"{tag}_{kind}"
@@ -156,17 +158,32 @@ def main():
                   f"{'ok' if not probs else 'BAD'}")
             for p in probs:
                 print(f"      {p}")
-        if not (SWEEP / f"{tag}_replay").is_dir():
-            print(f"  {tag:<16}  note: no {tag}_replay directory, so the replay "
-                  f"stage did not finish")
-            bad += 1
+        keyed = [k for k in REPLAY_KEYS
+                 if (SWEEP / f"{tag}_replay_{k}" / "out_verdict.bin").exists()]
+        if not keyed:
+            print(f"  {tag:<16}  REPLAY STAGE DID NOT RUN: none of the "
+                  f"{len(REPLAY_KEYS)} {tag}_replay_<planner>_<label> "
+                  f"directories holds a verdict")
+            bad_replay += 1
+        else:
+            miss = [k for k in REPLAY_KEYS if k not in keyed]
+            print(f"  {tag:<16}  replay: {len(keyed)} of {len(REPLAY_KEYS)} "
+                  f"planner-label directories"
+                  + (f"; absent {miss}" if miss else ", all present"))
+        orphan = SWEEP / f"{tag}_replay"
+        if orphan.is_dir():
+            print(f"  {tag:<16}  note: {orphan.name} is a leftover from the "
+                  f"single-shared-directory layout and is no longer read; "
+                  f"remove it so it cannot be mistaken for a result")
     print()
     print(f"{2 * len(tags) - bad} of {2 * len(tags)} planner jobs verified "
-          f"over {len(tags)} epochs")
+          f"over {len(tags)} epochs; "
+          + (f"{bad_replay} epoch(s) have no replay stage"
+             if bad_replay else "every epoch has a replay stage"))
     done = sorted({p.name.rsplit('_', 1)[0] for p in SWEEP.glob("*_td")})
     print(f"{len(done)} of {len(REGISTERED)} registered epochs have planner "
           f"output; absent: {[t for t in REGISTERED if t not in done] or 'none'}")
-    return 1 if bad else 0
+    return 1 if (bad or bad_replay) else 0
 
 
 if __name__ == "__main__":

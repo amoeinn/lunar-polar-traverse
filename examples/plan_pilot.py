@@ -122,6 +122,72 @@ def run_cpp(graph, intervals, pairs, tol, t_start, horizon_h, limit_s, work,
     return read_cpp(params, want_paths)
 
 
+# Widths of the planner's fixed-size outputs: dtype and values per instance.
+OUT_WIDTH = {"arrival": ("f8", 1), "seconds": ("f8", 1), "flags": ("u1", 1),
+             "pathlen": ("i4", 1), "stats": ("i8", 4)}
+
+
+def output_problems(params, want_paths=False):
+    """What is wrong with a planner job's outputs on disk, if anything.
+
+    One implementation, used both by the resume path in the sweep drivers to
+    decide whether a job can be read back, and by examples/check_sweep.py to
+    report. Existence alone is not enough: a job killed while writing leaves
+    short files, and a short file read back is a silently wrong result.
+    """
+    probs = []
+    n = int(params["n_instances"])
+    for k, (dt, w) in OUT_WIDTH.items():
+        key = f"out_{k}"
+        if key not in params:
+            probs.append(f"params carries no {key}")
+            continue
+        f = Path(params[key])
+        if not f.exists():
+            probs.append(f"{f.name} missing")
+            continue
+        want = n * w * np.dtype(dt).itemsize
+        if f.stat().st_size != want:
+            probs.append(f"{f.name} is {f.stat().st_size} bytes, expected {want}")
+    if want_paths:
+        off = Path(params["out_path_offsets"]) if "out_path_offsets" in params else None
+        if off is None or not off.exists():
+            probs.append("out_path_offsets.bin missing")
+        elif off.stat().st_size != (n + 1) * 8:
+            probs.append(f"out_path_offsets.bin is {off.stat().st_size} bytes, "
+                         f"expected {(n + 1) * 8}")
+        else:
+            total = int(np.fromfile(off, dtype=np.int64)[-1])
+            for k, itemsize in (("path_cells", 4), ("path_times", 8)):
+                f = Path(params[f"out_{k}"])
+                if not f.exists():
+                    probs.append(f"{f.name} missing")
+                elif f.stat().st_size != total * itemsize:
+                    probs.append(f"{f.name} holds {f.stat().st_size // itemsize} "
+                                 f"values against {total} the offsets declare")
+    return probs
+
+
+def finished_job(work, want_paths=False):
+    """A completed planner job's params as written on disk, or None.
+
+    Nothing is rewritten. run_cpp rewrites planner_params.json and tens of
+    megabytes of inputs even when it only defers the launch, which costs time a
+    resume is meant to save and, worse, makes the params newer than the outputs
+    they describe, so a later staleness check would call a good job stale.
+    """
+    pf = Path(work) / "planner_params.json"
+    if not pf.exists():
+        return None
+    try:
+        params = json.loads(pf.read_text())
+    except (ValueError, OSError):
+        return None
+    if "n_instances" not in params:
+        return None
+    return None if output_problems(params, want_paths=want_paths) else params
+
+
 def read_cpp(params, want_paths=False):
     """Read back what the planner binary wrote."""
     return dict(

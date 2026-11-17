@@ -57,6 +57,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=int, default=12)
     ap.add_argument("--tags", default="all")
+    ap.add_argument("--resume", action="store_true",
+                    help="read back planner jobs whose outputs are already "
+                         "complete on disk, and replay verdicts already "
+                         "computed, instead of recomputing them. The mean-map "
+                         "stage keeps nothing on disk, so it is always redone; "
+                         "at 17 s an epoch that is not worth caching.")
     args = ap.parse_args()
     rover = Rover(v_flat=50.0)
     p, n, px, dem, horizon, cells, gx, gy, edges, graph = P.load(rover)
@@ -102,6 +108,12 @@ def main():
         froz = frozen_intervals(iv, 0.0)
         for kind, table in (("td", iv), ("snap", froz)):
             work = P.DATA / "work" / "sweep" / f"{tag}_{kind}"
+            have = P.finished_job(work, want_paths=True) if args.resume else None
+            if have is not None:
+                # Read back, and do not touch the directory: run_cpp would
+                # rewrite the inputs and the params even when deferring.
+                jobs.append((tag, kind, None, have))
+                continue
             cmd, params = P.run_cpp(graph, table, pairs, TOLERANCE_H, 0.0, HORIZON_H,
                                     CAP_S, work, components=comp_all,
                                     positions=positions, v_cap=rover.v_cap,
@@ -110,11 +122,16 @@ def main():
         meta[tag] = dict(pairs=pairs, iv=iv, pool=pool.size,
                          lit0=float(iv.lit0.mean()),
                          trans=float(np.diff(iv.offsets).mean()))
-    print(f"prepared {len(jobs)} planner jobs in {time.time()-t0:.0f} s; launching "
+    done = [j for j in jobs if j[2] is None]
+    todo = [j for j in jobs if j[2] is not None]
+    print(f"prepared {len(jobs)} planner jobs in {time.time()-t0:.0f} s; "
+          f"{len(done)} already complete on disk, {len(todo)} to run, launching "
           f"{args.jobs} at a time")
     t0 = time.time()
     running, results = [], {}
-    queue = list(jobs)
+    for tag, kind, _, params in done:
+        results[(tag, kind)] = P.read_cpp(params, want_paths=True)
+    queue = list(todo)
     while queue or running:
         while queue and len(running) < args.jobs:
             tag, kind, cmd, params = queue.pop(0)
@@ -152,6 +169,13 @@ def main():
     report = {}
     for tag in tags:
         suns = fine_sun(tag)
+        # One directory per planner and tolerance label, the convention
+        # examples/sweep_axes.py and examples/score_phase3.py already use. The
+        # single shared directory this used to pass kept only the last of the
+        # twelve calls, which is why phase 3 step 12 had to rebuild the mean-map
+        # replay from scratch, and it made resuming unsafe: reuse checks that
+        # the outputs exist, so the first call of a resumed run would have read
+        # back whichever call happened to write there last.
         work = P.DATA / "work" / "sweep" / f"{tag}_replay"
         per_planner = {}
         for kind in ("td", "snap"):
@@ -193,9 +217,10 @@ def main():
             out = {}
             for label, tol in (("tol", PITCH_ROLL_TOL_DEG), ("zero", 0.0)):
                 out[label] = replay(d["plans"], d["starts"], grid, rover, suns,
-                                    FINE_SUN_DT_H, TOLERANCE_H, work,
+                                    FINE_SUN_DT_H, TOLERANCE_H,
+                                    Path(f"{work}_{kind}_{label}"),
                                     ReplaySettings(limit_tolerance_deg=tol),
-                                    waits=d["waits"])
+                                    waits=d["waits"], reuse=args.resume)
             judged[kind] = out
         report[tag] = dict(per_planner=per_planner, judged=judged)
     print(f"replay stage done in {time.time()-t0:.0f} s")
