@@ -110,6 +110,17 @@ def check_job(d, tag, kind, expect_trans, table_mtime):
     return probs, triple, secs
 
 
+def replayable_plans(d):
+    """How many of a planner job's instances carry a path long enough to
+    replay, by the driver's own rule that a path of fewer than two cells is
+    not a plan. A planner that found nothing has no replay directory, and that
+    is a recorded outcome rather than a missing artifact."""
+    f = Path(d) / "out_path_offsets.bin"
+    if not f.exists():
+        return None
+    return int((np.diff(np.fromfile(f, dtype=np.int64)) >= 2).sum())
+
+
 def old_triple(tag, kind):
     d = OLD / f"{tag}_{kind}"
     try:
@@ -160,16 +171,25 @@ def main():
                 print(f"      {p}")
         keyed = [k for k in REPLAY_KEYS
                  if (SWEEP / f"{tag}_replay_{k}" / "out_verdict.bin").exists()]
-        if not keyed:
+        counts = {k: replayable_plans(SWEEP / f"{tag}_{k}") for k in KINDS}
+        empty = sorted(k for k, c in counts.items() if c == 0)
+        miss = [k for k in REPLAY_KEYS if k not in keyed]
+        # Saying "absent" of a planner that produced no plan reads as a
+        # missing artifact when it is the outcome: nothing to replay.
+        unexplained = [k for k in miss if k.rsplit("_", 1)[0] not in empty]
+        if not keyed and unexplained:
             print(f"  {tag:<16}  REPLAY STAGE DID NOT RUN: none of the "
                   f"{len(REPLAY_KEYS)} {tag}_replay_<planner>_<label> "
                   f"directories holds a verdict")
             bad_replay += 1
         else:
-            miss = [k for k in REPLAY_KEYS if k not in keyed]
+            note = ("; " + " and ".join(empty) + " produced 0 plans, "
+                    "nothing to replay") if empty else ""
             print(f"  {tag:<16}  replay: {len(keyed)} of {len(REPLAY_KEYS)} "
                   f"planner-label directories"
-                  + (f"; absent {miss}" if miss else ", all present"))
+                  + note
+                  + (f"; UNEXPLAINED absent {unexplained}" if unexplained
+                     else ("" if note else ", all present")))
         orphan = SWEEP / f"{tag}_replay"
         if orphan.is_dir():
             print(f"  {tag:<16}  note: {orphan.name} is a leftover from the "
