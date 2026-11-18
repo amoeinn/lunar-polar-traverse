@@ -216,3 +216,77 @@ def test_reuse_is_consulted_before_the_binary_runs():
     assert src.index("if reuse and not reuse_problems(") < src.index("subprocess.run(")
     # and the old existence-only test is gone
     assert "if all(Path(v).exists() for v in found.values())" not in src
+
+
+# -------------------------------------------------------------- the axes driver
+
+import examples.sweep_axes as X                                   # noqa: E402
+
+
+@pytest.mark.parametrize("arg,why", [
+    ("bogus", "an unknown stage name"),
+    ("", "an empty selection"),
+    ("replay", "replay without mean-map, whose plans are never on disk"),
+    ("planner,replay", "replay without mean-map, with the planner"),
+])
+def test_axes_refuses_a_bad_stage_selection_before_loading(
+        monkeypatch, no_load, arg, why):
+    """The rate and tolerance axes do not fit a 30 minute timeout whole, so
+    they are split by stage; the same validation applies as for the core, and
+    it must refuse before the region load, not after it."""
+    monkeypatch.setattr(sys, "argv",
+                        ["sweep_axes.py", "--axis", "rate", "--stages", arg])
+    assert X.main() == 2, why
+
+
+@pytest.mark.parametrize("arg", ["all", "planner", "mean-map",
+                                 "planner,mean-map", "mean-map,replay"])
+def test_axes_accepts_a_good_stage_selection(monkeypatch, arg):
+    reached = []
+    monkeypatch.setattr(P, "load", lambda *a, **k: reached.append(1) or (
+        _ for _ in ()).throw(SystemExit(99)))
+    monkeypatch.setattr(sys, "argv",
+                        ["sweep_axes.py", "--axis", "rate", "--stages", arg])
+    with pytest.raises(SystemExit) as e:
+        X.main()
+    assert e.value.code == 99 and reached, f"{arg} was refused"
+
+
+def test_axes_stage_guards_are_in_place():
+    """Each guard must guard its own stage's body, asserted by position rather
+    than by presence anywhere in the file: the validation block mentions
+    mean-map too, so a whole-file search passes with the stage-2 guard gone.
+    Positions are taken against each stage's first statement, not against a
+    comment, since the stage-3 comment's last line sits after its guard.
+    """
+    src = (ROOT / "examples" / "sweep_axes.py").read_text()
+    # the planner guard, before run_cpp writes anything
+    assert src.index('if "planner" not in stages:') < \
+        src.index("cmd, params = P.run_cpp("), \
+        "inputs are written for a job this run will not plan"
+    # mean-map: two occurrences, the validation one and the guard, and the
+    # guard must come before the stage's own first statement
+    mm = [i for i in range(len(src))
+          if src.startswith('"mean-map" not in stages', i)]
+    assert len(mm) == 2, f"expected a validation mention and a guard, got {len(mm)}"
+    assert mm[1] < src.index("    mm = {}"), \
+        "nothing stops the mean-map stage running when it was not asked for"
+    # replay: the validation block says "replay" in stages, so the only
+    # "not in" occurrence is the guard
+    assert src.count('"replay" not in stages') == 1
+    assert src.index('"replay" not in stages') < src.index("    rows = []"), \
+        "nothing stops the replay stage running when it was not asked for"
+
+
+def test_axes_judges_a_planner_job_by_size_not_by_one_file():
+    """It checked only that out_arrival.bin existed, which a job killed while
+    writing also satisfies."""
+    src = (ROOT / "examples" / "sweep_axes.py").read_text()
+    assert "P.finished_job(" in src
+    assert 'Path(params["out_arrival"]).exists()' not in src, \
+        "the existence-only completeness test is back"
+
+
+def test_axes_and_core_agree_on_the_stage_names():
+    """One vocabulary, so a command written for one driver reads on the other."""
+    assert X.STAGES == S.STAGES

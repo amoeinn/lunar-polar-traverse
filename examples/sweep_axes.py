@@ -38,6 +38,7 @@ from src.replay import ReplaySettings, replay                    # noqa: E402
 
 SEED = 20260924
 CAP_S = 30.0
+STAGES = ("planner", "mean-map", "replay")
 EPOCHS = ("2028-02-15_p0", "2028-05-15_p1", "2028-08-15_p2", "2028-11-15_p2")
 EXPONENTS = (0.0, 0.5, 1.0, 2.0)
 PITCH_ROLL_TOL_DEG = 3.206
@@ -76,7 +77,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--axis", required=True, choices=sorted(AXES))
     ap.add_argument("--jobs", type=int, default=12)
+    ap.add_argument("--stages", default="all",
+                    help="which stages to run: all, or a comma-separated "
+                         "subset of planner, mean-map, replay. The rate and "
+                         "tolerance axes do not fit a 30 minute timeout whole, "
+                         "so they are run as --stages planner and then "
+                         "--stages mean-map,replay. A run without the planner "
+                         "stage reads its results back and refuses if any are "
+                         "incomplete.")
     args = ap.parse_args()
+    # Validated before anything is loaded: the same rules sweep_core applies,
+    # and for the same reason. Replay cannot run without mean-map because the
+    # mean-map stage keeps nothing on disk.
+    if args.stages == "all":
+        stages = set(STAGES)
+    else:
+        stages = {t.strip() for t in args.stages.split(",") if t.strip()}
+        bad = sorted(stages - set(STAGES))
+        if bad or not stages:
+            print(f"unknown stages {bad or ['(none given)']}; choose all, or a "
+                  f"comma-separated subset of {list(STAGES)}")
+            return 2
+        if "replay" in stages and "mean-map" not in stages:
+            print("--stages replay needs mean-map in the same run: the mean-map "
+                  "stage keeps nothing on disk, so its plans have to be "
+                  "recomputed in the process that replays them")
+            return 2
     base = Rover(v_flat=50.0)
     p, n, px, dem, horizon, cells, gx, gy, edges, _ = P.load(base)
     xs, ys = gx.ravel(), gy.ravel()
@@ -129,7 +155,7 @@ def main():
         return cache_pool[key]
 
     # --- stage 1: launch every planner job for this axis ---
-    jobs, meta = [], {}
+    jobs, meta, missing = [], {}, []
     for pi, point in enumerate(AXES[args.axis]):
         rover = Rover(v_flat=point["v_flat"], pitch_max=point["pitch_max"],
                       roll_max=point["roll_max"])
@@ -140,6 +166,16 @@ def main():
             froz = frozen_intervals(ivs[tag], 0.0)
             for kind, table in (("td", ivs[tag]), ("snap", froz)):
                 work = P.DATA / "work" / "axes" / f"{args.axis}_{pi}_{tag}_{kind}"
+                have = P.finished_job(work, want_paths=True)
+                if have is not None:
+                    # Read back, and do not touch the directory: run_cpp
+                    # rewrites the inputs and the params even when deferring,
+                    # which would make them newer than the outputs.
+                    jobs.append((pi, tag, kind, None, have))
+                    continue
+                if "planner" not in stages:
+                    missing.append((pi, tag, kind))
+                    continue
                 cmd, params = P.run_cpp(graph, table, pairs, point["tol"], 0.0,
                                         HORIZON_H, CAP_S, work, components=comp,
                                         positions=positions, v_cap=rover.v_cap,
@@ -149,9 +185,19 @@ def main():
     # Resume rather than restart: a job whose outputs are already on disk is
     # read back instead of rerun. A sweep piece that outlives its session
     # otherwise loses everything it had finished.
-    done = [(pi, tag, kind, cmd, params) for (pi, tag, kind, cmd, params) in jobs
-            if Path(params["out_arrival"]).exists()]
-    todo = [j for j in jobs if j not in done]
+    if missing:
+        print(f"\n--stages {args.stages} does not run the planner, and "
+              f"{len(missing)} job(s) have no complete output on disk:")
+        for pi, tag, kind in missing:
+            print(f"  point {pi} {tag} {kind}")
+        print("run --stages planner for this axis first; nothing was written "
+              "for them here")
+        return 2
+    # Completeness is judged by finished_job, on the size every output must
+    # have rather than on one file existing: a job killed mid-write leaves
+    # short files, and a short file read back is a wrong answer not a crash.
+    done = [j for j in jobs if j[3] is None]
+    todo = [j for j in jobs if j[3] is not None]
     print(f"\nprepared {len(jobs)} planner jobs; {len(done)} already on disk, "
           f"{len(todo)} to run, launching {args.jobs} at a time")
     t0 = time.time()
@@ -173,6 +219,26 @@ def main():
         running = still
     print(f"planner stage done in {time.time()-t0:.0f} s")
 
+    if "mean-map" not in stages:
+        print(f"\n=== {args.axis} axis: planner outcomes per epoch "
+              f"(feasible / infeasible / aborted), cap {CAP_S:.0f} s ===")
+        print(f"  {'point':<16}{'epoch':<16}{'time-dependent':>18}{'snapshot':>18}")
+        for pi, point in enumerate(AXES[args.axis]):
+            for tag in EPOCHS:
+                cols = []
+                for kind in ("td", "snap"):
+                    r = results[(pi, tag, kind)]
+                    ab = r["aborted"]
+                    cols.append(
+                        f"{int((~ab & np.isfinite(r['arrival'])).sum()):4d} /"
+                        f"{int((~ab & ~np.isfinite(r['arrival'])).sum()):4d} /"
+                        f"{int(ab.sum()):4d}")
+                print(f"  {point['label']:<16}{tag:<16}{cols[0]:>18}{cols[1]:>18}")
+        print(f"\nstages run: {sorted(stages)}. No replay verdict and no "
+              f"mean-map figure is reported. Finish this axis with "
+              f"--stages mean-map,replay.")
+        return 0
+
     # --- stage 2: mean-map. Its route depends on the graph and the lit fraction
     # only, so on the rate and tolerance axes it is the core's route reused.
     t0 = time.time()
@@ -193,6 +259,11 @@ def main():
 
     # --- stage 3: replay, judged twice, per point because timing and verdict
     # both depend on the point ---
+    if "replay" not in stages:
+        print(f"\nstages run: {sorted(stages)}. Nothing was replayed, so no "
+              f"verdict is reported. Finishing needs --stages mean-map,replay "
+              f"rather than --stages replay.")
+        return 0
     t0 = time.time()
     rows = []
     for pi, point in enumerate(AXES[args.axis]):
