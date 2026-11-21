@@ -1,9 +1,13 @@
 """Write our own illumination as an unlit texture for the Gazebo terrain.
 
-PLAN.md records that Gazebo's shadows are never a source of truth here, so the
-scene's light casts none and the brightness on screen comes from this file. The
-texture carries our model's irradiance: zero where our horizon model says the
-cell is shadowed, and the Lambertian cos(incidence) the published _MODEL
+Gazebo's shadows are never a source of truth for illumination here: the scene's
+light casts none, and the brightness on screen comes entirely from this file.
+The renderer's own shadowing is a rasterisation of a simplified scene and has no
+horizon model behind it, so agreeing with it would say nothing about whether our
+illumination is right.
+
+The texture carries our model's irradiance: zero where our horizon model says
+the cell is shadowed, and the Lambertian cos(incidence) the published _MODEL
 products were matched against where it is lit.
 
 It must be applied as an emissive, unlit map. As a diffuse map it would be
