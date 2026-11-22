@@ -106,6 +106,14 @@ inline Vec3 map_to_unit(double x, double y, double R) {
     return {st * cl, st * sl, -ct};
 }
 
+// Map distance over true distance at (x, y). With rho = 2R tan(t/2),
+// drho / (R dt) = sec^2(t/2) = 1 + (rho / 2R)^2, and the projection is
+// conformal, so this holds in every direction. At most 1.3e-5 over this region.
+inline double map_scale(double x, double y, double R) {
+    const double q = std::hypot(x, y) / (2.0 * R);
+    return 1.0 + q * q;
+}
+
 inline void local_frame(double x, double y, double R, Vec3& up, Vec3& east, Vec3& north) {
     up = map_to_unit(x, y, R);
     const double r = std::hypot(x, y);
@@ -340,7 +348,14 @@ int main(int argc, char** argv) {
                 if (std::fabs(pitch) > rover.pitch_max + limit_tol
                     || std::fabs(roll) > rover.roll_max + limit_tol) ++illegal;
                 const double v = rover.speed(pitch, roll);
-                const double dt = (seg / nsub) / v;
+                // The speed is along the slope, so the distance must be too:
+                // the map step, to true horizontal metres, then along the
+                // slope at this sub-step's own pitch. Dividing the map step by
+                // v, as this did until 2026-11-22, ran every traverse short by
+                // cos(pitch), about 1% early on this terrain.
+                const double ds = (seg / nsub) / map_scale(x, y, R)
+                                  / std::cos(pitch / kDeg);
+                const double dt = ds / v;
                 if (t >= next_vis) {
                     const bool was = lit_now;
                     lit_now = lit_at(x, y, h0, t);

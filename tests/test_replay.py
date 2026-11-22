@@ -18,13 +18,12 @@ NEAR = 120             # near raster side, cells
 pytestmark = pytest.mark.skipif(not BINARY.exists(), reason="replay binary not built")
 
 
-def scene(tmp_path, height):
+def scene(tmp_path, height, ox=4000.0, oy=11000.0):
     """A synthetic near raster and the geometry describing it.
 
     The reach is cut to 400 m and the far field is pushed past it, so only the
     near raster is needed and a test does not have to synthesise 238 km of DEM.
     """
-    ox, oy = 4000.0, 11000.0
     near_ox = ox - (NEAR - N) / 2 * PX
     near_oy = oy + (NEAR - N) / 2 * PX
     near = tmp_path / "near.f32"
@@ -207,3 +206,73 @@ def test_reuse_refuses_a_call_killed_while_writing():
         assert np.array_equal(first["arrival"], again["arrival"])
         assert f.stat().st_size == len(f.read_bytes()), "it was rewritten"
         assert again["step_pitch"].size == int(first["step_offsets"][-1])
+
+
+def true_along_x(x, y):
+    """True horizontal distance from map x = 0 to x along a line of constant y.
+
+    The stereographic scale is k = 1 + (x^2 + y^2) / 4R^2, so the true length
+    is the integral of dx / k, which is (4R^2 / c) atan(x / c) with
+    c^2 = 4R^2 + y^2. Exact, and written from the projection, not from the
+    checker.
+    """
+    c = np.sqrt(4.0 * MOON_RADIUS_M ** 2 + y ** 2)
+    return 4.0 * MOON_RADIUS_M ** 2 / c * np.arctan(x / c)
+
+
+def inclined(theta_deg, ox=4000.0, oy=11000.0):
+    """A surface rising at theta per TRUE metre along map +x, a row plan's direction.
+
+    Rising per map metre would not do: away from the pole a map metre is
+    shorter than a true one, and the slope would be atan(k tan theta).
+    """
+    x = ox - (NEAR - N) / 2 * PX + (np.arange(NEAR) + 0.5) * PX
+    y = oy + (NEAR - N) / 2 * PX - (np.arange(NEAR) + 0.5) * PX
+    s = true_along_x(x[None, :], y[:, None])
+    return np.tan(np.radians(theta_deg)) * (s - s[:, :1])
+
+
+@pytest.mark.parametrize("theta_deg, ox", [(10.0, 4000.0), (-10.0, 4000.0),
+                                           (15.0, 4000.0), (10.0, 300000.0)])
+def test_time_on_a_slope_is_distance_along_the_slope_over_speed(tmp_path, theta_deg, ox):
+    """Protects the checker's time integration against stepping the map distance.
+
+    The speed model gives speed along the slope, and the planner's edge time is
+    the 3D length along the slope over that speed. Until 2026-11-22 the checker
+    divided the map-plane distance by that speed, so every step was short by
+    cos(pitch) and every checker time ran about 1% early on this terrain, which
+    was read for seven weeks as the planner being optimistic. On a plane the
+    answer is analytic: the horizontal distance over cos(theta), over the speed
+    at pitch theta and zero roll. Uphill and downhill both, because downhill
+    runs at the speed cap and the error is in the length, not the speed.
+
+    The map scale is checked too, which the region itself cannot do: there it
+    is at most 1.3e-5, below this tolerance and below the disc fit's own
+    scatter of about 8e-5, so a scale multiplied where it should divide passed.
+    300 km from the pole the scale is 0.75%, well above both.
+    """
+    rover = Rover(v_flat=50.0)
+    th = np.radians(theta_deg)
+    rel_tol = 2e-4
+    # The fixture can only catch the fault if cos(theta) is far from one
+    # against the tolerance; a shallow plane would pass the broken code.
+    assert 1.0 - np.cos(th) > 20 * rel_tol
+    grid = scene(tmp_path, inclined(theta_deg, ox=ox), ox=ox)
+    suns, dt = sun_table(30.0, n=64)
+    c0, c1, row = 10, 30, 30
+    plan = straight_plan(row, c0, c1)
+    r = replay([plan], [0.0], grid, rover, suns, dt, 1e9, tmp_path)
+    # the analytic traverse: centre to centre along the row, in true metres
+    xa = grid["region_ox"] + (c0 + 0.5) * PX
+    xb = grid["region_ox"] + (c1 + 0.5) * PX
+    y = grid["region_oy"] - (row + 0.5) * PX
+    horizontal = true_along_x(xb, y) - true_along_x(xa, y)
+    # the far case must make the scale visible against the tolerance
+    assert ox < 1e5 or (xb - xa) / horizontal - 1.0 > 20 * rel_tol
+    drive = np.sin(th) + rover.mu * np.cos(th)
+    v = min(rover.v_flat * rover.mu / drive if drive > 0 else np.inf, rover.v_cap)
+    expected = horizontal / np.cos(th) / v
+    assert r["illegal"][0] == 0
+    assert np.median(r["step_pitch_mean"]) == pytest.approx(theta_deg, abs=0.05)
+    assert r["arrival"][0] == pytest.approx(expected, rel=rel_tol), (
+        r["arrival"][0], expected, r["arrival"][0] / expected, np.cos(th))
