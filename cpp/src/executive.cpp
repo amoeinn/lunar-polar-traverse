@@ -92,7 +92,10 @@ struct Ctx {
     // The contradiction rule, selectable so both the first rule and its
     // registered replacement come from one binary and one sample.
     bool contra_bounded = true;
-    double contra_horizon_h = 0.7250;   // registered, the held-out p99
+    // H has one definition, CONTRA_HORIZON_H in src/executive.py, and reaches
+    // this binary only through the params file. There is deliberately no
+    // value here: a copy would drift from the registered one unseen.
+    double contra_horizon_h = std::numeric_limits<double>::quiet_NaN();
     // An optional per-plan-step ternary correction for the step from plan[i]
     // to plan[i+1]:
     //   0  believe the model's interval table, as before the stream existed
@@ -289,7 +292,14 @@ int main(int argc, char** argv) {
     c.replan_cap_s = p.num("replan_cap_s", 30.0);
     c.vis_cadence_h = p.num("vis_cadence_h", 1.0 / 60.0);
     c.contra_bounded = p.num("contradiction_bounded", 1.0) != 0.0;
-    c.contra_horizon_h = p.num("contradiction_horizon_h", 0.7250);
+    c.contra_horizon_h = p.num("contradiction_horizon_h",
+                               std::numeric_limits<double>::quiet_NaN());
+    if (!(c.contra_horizon_h > 0.0)) {
+        std::fprintf(stderr,
+                     "contradiction_horizon_h must be given and positive; the "
+                     "binary carries no default\n");
+        return 2;
+    }
     c.planner_bin = p.str("planner_bin");
     c.scratch = p.str("scratch_dir");
     c.tmpl_params = p.str("template_planner_params");

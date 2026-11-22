@@ -5,11 +5,15 @@ and from nothing else. Run before that rule exists and before P8 was written,
 so the number comes from the terrain rather than from what makes a bar pass.
 
 Two sources, and which one sets the horizon matters. --source held-out measures
-the 50 m/hr axis point's plans: the same configuration as the monitored set,
-2 h budget and limits (20, 15), on a disjoint draw, because the axis draw takes
-8 pairs per band from the same seed against the core's 24 and keys its epochs
-differently. Those plans are not in the sample P8 is scored on, so a horizon
-taken from them is not fitted to the data it will be tested against.
+the plans of all nine axis points, HELD_OUT_STEMS, pooled; the comment there
+says why pooling is sound. They come from the axis draw, 8 pairs per band
+against the core's 24, so they are not the sample the executive is scored on
+and a horizon taken from them is not fitted to the data it will be tested
+against. The separation is not complete. At 2028-02-15_p0 both draws are keyed
+on label 0, so the axis's 40 pairs are a prefix of the core's 120; at the other
+three epochs the keys differ and no pair is shared. On the corrected sun, 7 of
+the 68 held-out plans that enter shadow sit on a shared pair, and leaving them
+out moves the p99 by 0.0010 h, 3.6 s.
 --source sample measures the monitored set itself and is reported beside it as
 a check, never as the source.
 """

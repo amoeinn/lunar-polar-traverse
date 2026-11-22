@@ -21,6 +21,13 @@ EXEC_BIN = ROOT / "cpp" / "build" / "executive"
 REPLAY_BIN = ROOT / "cpp" / "build" / "replay"
 PLANNER_BIN = ROOT / "cpp" / "build" / "planner"
 
+# H, the contradiction rule's horizon: the one definition, shared with the C++
+# executive through its params file, which carries no value of its own.
+# Registered 2026-11-22 as the held-out p99 of the disagreements the rule acts
+# on (world dark, model lit), measured by examples/disagreement.py on the
+# corrected sun. It replaced 0.7250 h, measured the same way before the fix.
+CONTRA_HORIZON_H = 0.7105
+
 TRAJ_KEYS = ("t", "shadow", "index", "kind", "lit", "offsets")
 LOG_KEYS = (("tick", np.int64), ("t", np.float64), ("s_exec", np.float64),
             ("s_world", np.float64), ("s_pred", np.float64),
@@ -109,7 +116,7 @@ def simulate(replay_template, plan, start_h, waits, work):
 
 def run_leg(planner_template, graph_paths, plan, plan_times, holds, world, work,
             budget_h, replan_limit, replan_cap_s, replans_so_far,
-            contra_bounded=True, contra_horizon_h=0.7250, correction=None):
+            contra_bounded=True, contra_horizon_h=CONTRA_HORIZON_H, correction=None):
     """One pass of the tree over one world."""
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
@@ -169,7 +176,7 @@ def run_leg(planner_template, graph_paths, plan, plan_times, holds, world, work,
 
 def run_instance(planner_template, replay_template, graph_paths, plan, plan_times,
                  work, budget_h, replan_limit=2, replan_cap_s=30.0,
-                 contra_bounded=True, contra_horizon_h=0.7250,
+                 contra_bounded=True, contra_horizon_h=CONTRA_HORIZON_H,
                  correction_fn=None):
     """Every leg of one instance, chaining after each adopted replan."""
     work = Path(work)

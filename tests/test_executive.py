@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from src import auditor as A
+from src.executive import CONTRA_HORIZON_H
 
 ROOT = Path(__file__).resolve().parents[1]
 EXEC_BIN = ROOT / "cpp" / "build" / "executive"
@@ -110,7 +111,7 @@ def corridor_with_annex(td, annex=1200, edge_h=EDGE_H, annex_edge_h=0.01):
 
 
 def run(td, graph, iv, wrld, plan, times, holds=None, budget=1.0,
-        replan_limit=2, replan_cap_s=30.0, bounded=True, horizon=0.7250,
+        replan_limit=2, replan_cap_s=30.0, bounded=True, horizon=CONTRA_HORIZON_H,
         correction=None, expect_rc=0):
     holds = np.zeros(len(plan)) if holds is None else holds
     (td / "plan.bin").write_bytes(np.array(plan, np.int32).tobytes())
@@ -138,6 +139,8 @@ def run(td, graph, iv, wrld, plan, times, holds=None, budget=1.0,
              plan_holds_path=str(td / "plan_holds.bin"),
              contradiction_bounded=1.0 if bounded else 0.0,
              contradiction_horizon_h=horizon)
+    if horizon is None:
+        del p["contradiction_horizon_h"]   # as a params file that omits it
     if correction is not None:
         (td / "correction.bin").write_bytes(
             np.asarray(correction, np.uint8).tobytes())
@@ -434,6 +437,24 @@ def test_the_contradiction_horizon_bounds_what_an_observation_projects(tmp_path)
     assert bounded["log"]["s_pred"].max() < 1.0, bounded["log"]["s_pred"]
     assert bounded["outcome"] == "ran_to_end", bounded
     assert bounded["log"]["fired"].sum() == 0
+
+
+def test_the_binary_refuses_to_run_without_a_horizon(tmp_path):
+    """Protects the single definition of H against a copy inside the binary.
+
+    H lived in six places across two languages, two of them in this binary: a
+    member initialiser and a fallback for a missing params key. A fallback is a
+    second registered value that nothing exercises, so when H is re-registered
+    it keeps the old one and a params file that omits the key runs under it
+    silently. The binary now has no value of its own, and a params file without
+    the key must be refused, not run.
+    """
+    g = line_graph(tmp_path)
+    iv = intervals(tmp_path, lit0={c: True for c in range(N)}, transitions={})
+    w = world(tmp_path, all_lit_walk())
+    plan, times = list(range(N)), [float(i) for i in range(N)]
+    r = run(tmp_path, g, iv, w, plan, times, horizon=None, expect_rc=2)
+    assert "contradiction_horizon_h" in r["stderr"], r["stderr"]
 
 
 def test_no_correction_stream_is_identical_to_an_all_zero_one(tmp_path):

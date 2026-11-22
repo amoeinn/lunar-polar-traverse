@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from examples.build_intervals import epochs                      # noqa: E402
 from src import auditor as A                                     # noqa: E402
-from src.executive import run_instance, simulate, plan_waits      # noqa: E402
+from src.executive import (CONTRA_HORIZON_H, run_instance,       # noqa: E402
+                           simulate, plan_waits)
 
 WORK = ROOT / "data" / "work" / "sweep"
 OUT = ROOT / "data" / "work" / "executive"
@@ -33,7 +34,6 @@ DECL_CAP_S = 300.0          # the bounded measurement's cap, registered, for the
 BAR_MISSES = 0
 BAR_UNNECESSARY = 0.25
 BAR_MCC = 0.5
-CONTRA_HORIZON_H = 0.7250   # registered, the held-out p99 of the disagreements
 RULES = (("unbounded", False), ("bounded", True))
 
 
