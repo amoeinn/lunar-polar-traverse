@@ -175,3 +175,15 @@ def test_the_subjects_window_spans_every_route_drawn_not_only_its_own(monkeypatc
     assert D.zoom_window({"td": routes["td"]}) != D.zoom_window(routes)
     zx, zy = D.subject_window("t", {}, "mm1.0")
     assert zx[0] <= 1.0 - 0.35 and zx[1] >= 2.2 + 0.35
+
+
+def test_the_hero_crop_refuses_to_take_in_the_next_panel():
+    """Protects the hero crop against the 26 px right margin that took in the
+    zoom panel's y-axis label, at its measured place, column 478 of 1760."""
+    a = np.zeros((990, 1760, 3))
+    a[300:400, 478:490] = 0.8                    # the next panel's label
+    a[300:600, 459] = 0.5                        # the region panel's frame line
+    box = MF.region_crop_box(a.shape)
+    assert box[3] < 478 and MF.spill(a, box) == []
+    wide = (box[0], box[1], box[2], box[3] + 14)  # the old 26 px margin
+    assert MF.spill(a, wide)[:1] == [478]

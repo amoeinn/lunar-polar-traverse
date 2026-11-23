@@ -35,7 +35,10 @@ HERO_STRIDES = (1, 2)
 HERO_MAX_BYTES = 3 * 1024 * 1024
 HERO_WIDTH = 460           # readable at README width without a click
 HERO_MS = 130              # per frame
-HERO_MARGIN = (24, 40, 44, 26)   # top, bottom, left, right, in source pixels
+# top, bottom, left, right, in source pixels. The right margin was 26 and took
+# in the zoom panel's y-axis label, which starts 19 px right of the region
+# panel's frame at 1760 px wide; spill() refuses a crop that does that.
+HERO_MARGIN = (24, 40, 44, 12)
 
 
 def dashboard_frame(tl):
@@ -124,9 +127,29 @@ def region_crop_box(shape):
             int(round((x0 + dx) * w)) + right)
 
 
+def spill(a, box, guard=6):
+    """Inked columns in the crop's strip right of the region panel's frame.
+
+    The region panel draws nothing there beyond its frame line and the last
+    tick label, so ink in the strip is the next panel's label."""
+    import examples.demo_traverse as D
+    r0, r1, c0, c1 = box
+    w = a.shape[1]
+    edge = int(round((D.REGION_RECT[0] + D.REGION_RECT[2]) * w)) + guard
+    strip = a[r0:r1, edge:c1]
+    bg = a[0, 0]
+    ink = np.abs(strip - bg).sum(axis=2) > 0.05
+    return [edge + int(c) for c in np.flatnonzero(ink.any(axis=0))]
+
+
 def write_hero(frames, dst, stride):
     from PIL import Image
-    r0, r1, c0, c1 = region_crop_box(read_rgb(frames[0]).shape)
+    first = read_rgb(frames[0])
+    r0, r1, c0, c1 = region_crop_box(first.shape)
+    bad = spill(first, (r0, r1, c0, c1))
+    if bad:
+        raise SystemExit(f"the hero crop takes in columns {bad[:3]}... of the next "
+                         f"panel; reduce HERO_MARGIN's right margin")
     out = []
     for f in frames[::stride]:
         a = read_rgb(f)[r0:r1, c0:c1]
