@@ -45,7 +45,6 @@ OUT = ROOT / "data" / "work" / "demo"
 
 BUDGET_H = 2.0              # the monitored configuration's shadow budget
 ARRIVAL_MIN_H = 24.0        # R1's clause, which is P2's own registered regime
-MEANMAP_ARM = "mm2.0"       # the mean-map baseline at its reported best exponent
 # Nearest-neighbour replication of the illumination texture, measured 2026-10-06
 # and recorded in PLAN.md. Each 20 m cell becomes an 8 x 8 block of identical
 # texels, so the renderer's filter can only blend at block edges. Costs 0.37 s
@@ -470,6 +469,18 @@ def p3_record(path=None):
     return json.loads(path.read_text())["P3"]
 
 
+def meanmap_arm(p3):
+    """The mean-map replay the demo draws: the exponent P3's registered
+    criterion selected, read from its record. The demo carried "mm2.0" as a
+    constant, the pre-fix selection, after the corrected scorer selected 1.0;
+    there is deliberately no default."""
+    return f"mm{float(p3['exponent'])}"
+
+
+def meanmap_label(p3):
+    return f"mean-map e={float(p3['exponent']):g}"
+
+
 def c3_record(path=None):
     """C3's measured figures as examples/verify_gazebo.py checkpointed them."""
     path = C3_RECORD if path is None else Path(path)
@@ -529,14 +540,16 @@ TEXT_RECT = [0.700, 0.150, 0.275, 0.265]
 C_LIT_ARM, C_BUDGET, C_FIRE = "#7ee787", "#ff5c5c", "#ff5c5c"
 
 
-def route_rows(tag, instance):
-    """The three planners' rows for one instance, where each produced a plan."""
+def route_rows(tag, instance, mm_kind):
+    """The three planners' rows for one instance, where each produced a plan.
+    mm_kind is meanmap_arm(p3_record()), carried in the rows as "mm_kind"."""
     out = {}
     td = planner_out(tag, "td")
     out["td"] = td["index"].index(instance) if instance in td["index"] else None
     sn = planner_out(tag, "snap")
     out["snap"] = sn["index"].index(instance) if instance in sn["index"] else None
-    mm = replay_out(tag, MEANMAP_ARM)
+    mm = replay_out(tag, mm_kind)
+    out["mm_kind"] = mm_kind
     # The mean-map planner produced a plan for every instance, so its replay row
     # is the instance index. Asserted rather than assumed, since a short plan
     # would have been dropped and shifted every row after it.
@@ -564,9 +577,15 @@ def panel_lines(tag, instance, rows, curves, same=(), pc=None, p3=None):
     """
     lines = [f"epoch {tag}   instance {instance}", ""]
     lines.append(f"{'planner':<14}{'verdict':>9}{'arrive':>9}{'shadow':>8}")
+    if p3 is None:
+        raise ValueError("panel_lines needs the P3 record: the mean-map row is "
+                         "the exponent it selected")
+    mm_kind = meanmap_arm(p3)
+    if rows.get("mm_kind", mm_kind) != mm_kind:
+        raise ValueError(f"rows hold {rows['mm_kind']} but P3 selected {mm_kind}")
     for key, label, kind in (("td", "time-dependent", "td"),
                              ("snap", "snapshot", "snap"),
-                             ("mm", "mean-map e=2", MEANMAP_ARM)):
+                             ("mm", meanmap_label(p3), mm_kind)):
         r = rows[key]
         if r is None:
             lines.append(f"{label:<14}{'no plan':>9}{'-':>9}{'-':>8}")
@@ -586,12 +605,19 @@ def panel_lines(tag, instance, rows, curves, same=(), pc=None, p3=None):
                   "cell for cell" + (", and the checker accepted both."
                                      if both_ok else ".")]
     if pc is not None:
+        # "0 one only" read as "no instance has one planner's plan only", which
+        # is false: 5 have only a time-dependent plan and 122 only a snapshot
+        # plan. The disagreement count is over shared pairs, so it says so, and
+        # the unpaired instances are stated beside it.
         b = pc["both"]
         n, split = sum(b.values()), b["ar"] + b["ra"]
-        lines += ["", f"paired on {n} shared pairs: {b['aa']} both",
-                  f"accepted, {b['rr']} both rejected, {split} one only."]
-        if split == 0:
-            lines += ["The planners never disagree on feasibility."]
+        lines += ["", f"on the {n} instances both planned: {b['aa']} both accepted,",
+                  f"{b['rr']} both rejected; "
+                  + ("no pair accepted by one planner" if split == 0
+                     else f"{split} accepted by one planner"),
+                  "and rejected by the other.",
+                  f"not paired: {pc['only_td']} with only a time-dependent plan,",
+                  f"{pc['only_snap']} with only a snapshot plan."]
     if p3 is not None:
         c = p3["clause2"]
         lines += ["", f"P3 clause 2 is scored {c['verdict']}:",
@@ -1051,6 +1077,181 @@ def label_faults(boxes, points, obst=None):
     return bad
 
 
+def _line_geometry(line):
+    """A plotted line as drawn, in display coordinates: (segments, markers,
+    marker radius, half line width), both in pixels. Step draw styles are
+    expanded to their steps, and axhline/axvline go through their own blended
+    transforms, so what is checked is what is drawn."""
+    from matplotlib.cbook import STEP_LOOKUP_MAP
+    xy = np.asarray(line.get_xydata(), float)
+    if xy.size == 0:
+        return np.zeros((0, 2, 2)), np.zeros((0, 2)), 0.0, 0.0
+    ds = line.get_drawstyle()
+    if ds in STEP_LOOKUP_MAP and ds != "default":
+        sx, sy = STEP_LOOKUP_MAP[ds](xy[:, 0], xy[:, 1])
+        path = np.column_stack([sx, sy])
+    else:
+        path = xy
+    disp = line.get_transform().transform(path)
+    dpi = line.figure.dpi
+    seg = np.zeros((0, 2, 2))
+    if line.get_linestyle() not in ("None", "", " ") and len(disp) > 1:
+        seg = np.stack([disp[:-1], disp[1:]], axis=1)
+        seg = seg[np.isfinite(seg).all(axis=(1, 2))]
+    mk = np.zeros((0, 2))
+    if line.get_marker() not in (None, "None", "", " "):
+        mk = line.get_transform().transform(xy)
+        mk = mk[np.isfinite(mk).all(axis=1)]
+    return (seg, mk, line.get_markersize() * dpi / 72.0 / 2.0,
+            line.get_linewidth() * dpi / 72.0 / 2.0)
+
+
+def note_faults(ax, notes, pad_px=1.0):
+    """Every plotted line that crosses a note: (note text, line label). Segments
+    are tested exactly against the note's drawn text box widened by the line's
+    half width and pad_px, and markers by their radius. Every visible line
+    counts, the time cursor included."""
+    r = ax.figure.canvas.get_renderer()
+    bad = []
+    for note in notes:
+        bb = note.get_window_extent(r)
+        for line in ax.get_lines():
+            if not line.get_visible():
+                continue
+            seg, mk, mr, hw = _line_geometry(line)
+            e = hw + pad_px
+            box = (bb.x0 - e, bb.y0 - e, bb.x1 + e, bb.y1 + e)
+            hit = any(_crosses(tuple(a), tuple(b), box) or
+                      (box[0] < a[0] < box[2] and box[1] < a[1] < box[3])
+                      for a, b in seg)
+            hit = hit or any(bb.x0 - mr - pad_px < p[0] < bb.x1 + mr + pad_px and
+                             bb.y0 - mr - pad_px < p[1] < bb.y1 + mr + pad_px
+                             for p in mk)
+            if hit:
+                bad.append((note.get_text(), line.get_gid() or line.get_label()))
+    return bad
+
+
+NOTE_GRID = 200
+
+
+def place_note(ax, text, prefer, ha="right", avoid=(), margin=0.015, pad=0.012,
+               **kw):
+    """A note on a plot, at the clear position nearest `prefer` (axes fraction,
+    the anchor for `ha` at the text's baseline row), where no plotted line,
+    marker, legend or other text in `avoid` or on the axes lies. Lines with gid
+    "cursor" are not avoided here, because the cursor sweeps every time; it is
+    drawn by draw_cursor with a gap at each note instead. Checked after drawing
+    with note_faults; raises rather than draw a crossed note.
+
+    The executive panel's false-alarm note and the shadow panel's budget note
+    were fixed positions, and the traces ran through both."""
+    fig = ax.figure
+    r = fig.canvas.get_renderer()
+    axb = ax.get_window_extent(r)
+    g = NOTE_GRID
+    occ = np.zeros((g, g), bool)
+    m = int(np.ceil(margin * g))
+    occ[:m, :] = occ[-m:, :] = occ[:, :m] = occ[:, -m:] = True
+
+    def to_frac(p):
+        return np.column_stack([(p[:, 0] - axb.x0) / axb.width,
+                                (p[:, 1] - axb.y0) / axb.height])
+
+    def mark_points(fp, rad):
+        rj = int(np.ceil(rad / axb.width * g)) + 1
+        ri = int(np.ceil(rad / axb.height * g)) + 1
+        j = np.floor(fp[:, 0] * g).astype(int)
+        i = np.floor(fp[:, 1] * g).astype(int)
+        ok = (j >= -rj) & (j < g + rj) & (i >= -ri) & (i < g + ri)
+        for di in range(-ri, ri + 1):
+            for dj in range(-rj, rj + 1):
+                ii, jj = i[ok] + di, j[ok] + dj
+                inb = (ii >= 0) & (ii < g) & (jj >= 0) & (jj < g)
+                occ[ii[inb], jj[inb]] = True
+    for line in ax.get_lines():
+        if not line.get_visible() or line.get_gid() == "cursor":
+            continue
+        seg, mk, mr, hw = _line_geometry(line)
+        if len(seg):
+            p, q = to_frac(seg[:, 0]), to_frac(seg[:, 1])
+            L = np.hypot(*(q - p).T)
+            n = np.ceil(L * g * 2).astype(int) + 2
+            idx = np.repeat(np.arange(len(p)), n)
+            start = np.repeat(np.cumsum(n) - n, n)
+            t = (np.arange(n.sum()) - start) / np.repeat(n - 1, n)
+            fp = p[idx] + t[:, None] * (q[idx] - p[idx])
+            mark_points(fp, hw + 1.0)
+        if len(mk):
+            mark_points(to_frac(mk), mr + 1.0)
+    others = [a for a in list(ax.texts) + list(avoid)]
+    for a in others:
+        bb = a.get_window_extent(r)
+        _mark_box(occ, ((bb.x0 - axb.x0) / axb.width - pad, (bb.y0 - axb.y0) / axb.height - pad,
+                        (bb.x1 - axb.x0) / axb.width + pad, (bb.y1 - axb.y0) / axb.height + pad))
+    probe = ax.text(0, 0, text, transform=ax.transAxes, **kw)
+    tb = probe.get_window_extent(r)
+    probe.remove()
+    w, h = tb.width / axb.width, tb.height / axb.height
+    ok, _, _ = _clear_boxes(occ, w + 2 * pad, h + 2 * pad)
+    ii, jj = np.nonzero(ok)
+    if ii.size == 0:
+        raise RuntimeError(f"no place on the axes where no line crosses {text!r}")
+    x0, y0 = jj / g + pad, ii / g + pad
+    ax_ = {"right": x0 + w, "left": x0, "center": x0 + w / 2}[ha]
+    k = int(np.argmin(np.hypot(ax_ - prefer[0], y0 - prefer[1])))
+    note = ax.text(float(ax_[k]), float(y0[k]), text, ha=ha, va="bottom",
+                   transform=ax.transAxes, gid="note", **kw)
+    bad = [b for b in note_faults(ax, [note]) if b[1] != "cursor"]
+    if bad:
+        raise RuntimeError(f"note placed across plotted lines: {bad}")
+    return note
+
+
+def draw_cursor(ax, t, notes, gap_px=3.0, **kw):
+    """The current-time line, broken where it would cross a note."""
+    import matplotlib.transforms as mtrans
+    r = ax.figure.canvas.get_renderer()
+    axb = ax.get_window_extent(r)
+    tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
+    xd = ax.transData.transform((t, 0.0))[0]
+    gaps = []
+    for n in notes:
+        bb = n.get_window_extent(r)
+        if bb.x0 - gap_px <= xd <= bb.x1 + gap_px:
+            gaps.append(((bb.y0 - gap_px - axb.y0) / axb.height,
+                         (bb.y1 + gap_px - axb.y0) / axb.height))
+    lo, pieces = 0.0, []
+    for a, b in sorted(gaps):
+        if a > lo:
+            pieces.append((lo, a))
+        lo = max(lo, b)
+    if lo < 1.0:
+        pieces.append((lo, 1.0))
+    return [ax.plot([t, t], [a, b], transform=tr, gid="cursor", label="_nolegend_",
+                    **kw)[0] for a, b in pieces]
+
+
+def check_text_clear(fig, panel, others):
+    """Refuse a frame whose text panel overlaps any of `others` (the captions)
+    or runs past the figure's right edge."""
+    r = fig.canvas.get_renderer()
+    pb = panel.get_window_extent(r)
+    hit = [o.get_text()[:40] for o in others
+           if _overlap((pb.x0, pb.y0, pb.x1, pb.y1),
+                       tuple(o.get_window_extent(r).extents))]
+    if hit or pb.x1 > fig.bbox.x1:
+        raise RuntimeError(f"the text panel runs into {hit or 'the right edge'}")
+
+
+def check_notes(ax, notes):
+    """Refuse a frame on which any plotted line, the cursor included, crosses a
+    note."""
+    bad = note_faults(ax, notes)
+    if bad:
+        raise RuntimeError(f"plotted lines cross notes: {bad}")
+
+
 TRACE_Z, FIRE_Z = 4, 3
 
 
@@ -1114,6 +1315,10 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
     fields = np.load(stack["path"], mmap_mode="r")
     litm = np.load(stack["lit_path"], mmap_mode="r")
     peak = stack["peak"]
+    p3 = p3_record() if p3 is None else p3
+    mm_kind = meanmap_arm(p3)
+    if rows.get("mm_kind", mm_kind) != mm_kind:
+        raise ValueError(f"rows hold {rows['mm_kind']} but P3 selected {mm_kind}")
     ext_km = (REGION_OX / 1000.0, (REGION_OX + REGION_N * PX) / 1000.0,
               (REGION_OY - REGION_N * PX) / 1000.0, REGION_OY / 1000.0)
     rep_td = replay_out(tag, "td")
@@ -1123,7 +1328,7 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
     lo, hi = int(off[instance]), int(off[instance + 1])
     tsteps = pt["times"][lo:hi]
     routes, same = {}, []
-    for key, kind in (("td", "td"), ("snap", "snap"), ("mm", MEANMAP_ARM)):
+    for key, kind in (("td", "td"), ("snap", "snap"), ("mm", mm_kind)):
         if rows[key] is None:
             continue
         pl, _, _ = plan_at(replay_out(tag, kind), rows[key])
@@ -1172,7 +1377,6 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
                                          for g in legs])
     epochs_rows = select_r4()
 
-    p3 = p3_record() if p3 is None else p3
     lines = panel_lines(tag, instance, rows, curves, same, pc, p3)
     clip_zero = lit_cells = 0
     for q in range(litm.shape[0]):
@@ -1203,7 +1407,7 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
                       origin="upper", interpolation="nearest")
             for key, (style, col, lw, lab) in (
                     ("snap", ("-", C_SNAP, 5.0, "snapshot plan (same route)")),
-                    ("mm", (":", C_MM, 1.8, "mean-map plan")),
+                    ("mm", (":", C_MM, 1.8, f"{meanmap_label(p3)} plan")),
                     ("td", ("-", C_TD, 1.8, "time-dependent, driven"))):
                 if key in routes:
                     ax.plot(*routes[key], style, color=col, lw=lw,
@@ -1268,7 +1472,6 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
             axe.annotate(f"forecast {fire_s:.2f} h", xy=(fire_t, fire_s),
                          xytext=(fire_t + 2.0, fire_s + 0.12), color=C_FIRE,
                          fontsize=7.5)
-        axe.axvline(t, color=C_ROVER, lw=1.2, alpha=0.8)
         axe.set_xlim(-0.6, t_end + 0.6)
         # Explicit, because the firing marker sits at the trace's maximum and an
         # auto-scaled axis clipped both it and its label off the top.
@@ -1286,9 +1489,14 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
         le = axe.legend(loc="upper left", fontsize=6.8, facecolor="#101218",
                         edgecolor="#30343c", labelcolor="#d6d9de", ncol=2)
         le.get_frame().set_alpha(0.92)
-        axe.text(0.985, 0.13, f"the world never exceeds {wrun.max():.2f} h, so "
-                 f"the firing is a false alarm", color="#7e848e", fontsize=7.5,
-                 ha="right", transform=axe.transAxes)
+        # Placed where no trace runs, and the cursor broken around it; the
+        # fixed position it had sat on the lit arm's trace.
+        exec_note = place_note(axe, f"the world never exceeds {wrun.max():.2f} h, "
+                               f"so the firing is a false alarm", (0.985, 0.13),
+                               ha="right", avoid=[le], color="#7e848e",
+                               fontsize=7.5)
+        draw_cursor(axe, t, [exec_note], color=C_ROVER, lw=1.2, alpha=0.8)
+        check_notes(axe, [exec_note])
 
         # --- all twelve epochs, no selection ---
         axp = fig.add_axes(EPOCH_RECT)
@@ -1325,7 +1533,6 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
         axs.plot(wtr["t"], wsh, ".", color=C_TD, ms=4)
         axs.plot(wtr["t"], wrun, "--", color="#d6d9de", lw=1.2,
                  label="its running maximum")
-        axs.axvline(t, color=C_ROVER, lw=1.2, alpha=0.8)
         axs.set_xlim(-0.6, t_end + 0.6)
         axs.set_ylim(0.0, float(wrun.max()) * 1.45 + 1e-6)
         axs.set_xlabel("time since departure (h)", color="#9aa0aa", fontsize=7.5)
@@ -1338,22 +1545,30 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
         ls = axs.legend(loc="upper left", fontsize=6.8, facecolor="#101218",
                         edgecolor="#30343c", labelcolor="#d6d9de")
         ls.get_frame().set_alpha(0.92)
-        axs.text(0.985, 0.04, f"the {BUDGET_H:.1f} h budget is "
-                 f"{BUDGET_H / max(float(wrun.max()), 1e-9):.0f}x off the top "
-                 f"of this axis", color="#7e848e", fontsize=7, ha="right",
-                 transform=axs.transAxes)
+        # Placed where no trace runs: at the fixed position it had, the
+        # running maximum's dashed line ran through it.
+        shadow_note = place_note(axs, f"the {BUDGET_H:.1f} h budget is "
+                                 f"{BUDGET_H / max(float(wrun.max()), 1e-9):.0f}x "
+                                 f"off the top of this axis", (0.985, 0.04),
+                                 ha="right", avoid=[ls], color="#7e848e",
+                                 fontsize=7)
+        draw_cursor(axs, t, [shadow_note], color=C_ROVER, lw=1.2, alpha=0.8)
+        check_notes(axs, [shadow_note])
 
         axt = fig.add_axes(TEXT_RECT)
         axt.axis("off")
-        axt.text(0.0, 1.0, "\n".join(lines), color="#d6d9de", fontsize=7.6,
-                 family="monospace", va="top", transform=axt.transAxes)
+        panel = axt.text(0.0, 1.0, "\n".join(lines), color="#d6d9de", fontsize=7.6,
+                         family="monospace", va="top", transform=axt.transAxes)
 
         fig.text(0.025, 0.955, f"{tag}   instance {instance}   t = {t:+.2f} h   "
                  f"{stack['lit_fraction'][k]:.2%} of the region lit   "
                  f"plan step {step + 1} of {plan.size}", color="#9aa0aa",
                  fontsize=10)
-        for q, line in enumerate(caption):
-            fig.text(0.025, 0.068 - q * 0.024, line, color="#7e848e", fontsize=7)
+        caps = [fig.text(0.025, 0.068 - q * 0.024, line, color="#7e848e", fontsize=7)
+                for q, line in enumerate(caption)]
+        # The text panel grows with what it reports; a longer pairing statement
+        # ran its last line into the first caption. Refused rather than drawn.
+        check_text_clear(fig, panel, caps)
         out = outdir / f"frame{k:04d}.png"
         fig.savefig(out, facecolor=fig.get_facecolor())
         plt.close(fig)
@@ -1966,7 +2181,9 @@ def main():
     print(f"  departs {dep:.4f} h, checker arrival {arr:.4f} h, "
           f"{plan.size} cells, {times.size} frames at {CADENCE_H} h")
 
-    rows = route_rows(tag, instance)
+    # The mean-map route is the exponent P3 selected, so the record is read
+    # for every stage that draws or replays a route.
+    rows = route_rows(tag, instance, meanmap_arm(p3_record()))
     curves = {}
     if {"fields", "frames", "video", "gazebo"} & set(want):
         for key, kind in (("td", "td"), ("snap", "snap")):

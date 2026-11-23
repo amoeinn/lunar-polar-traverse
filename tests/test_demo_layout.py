@@ -273,3 +273,139 @@ def test_no_leader_crosses_the_route():
     assert leader_crosses((occ, np.zeros_like(lead))), "the fixture cannot express it"
     assert not leader_crosses((occ, lead))
     plt.close(fig)
+
+
+# --- notes on the executive and shadow panels -------------------------------------
+#
+# On 2026-11-22 the executive panel's false-alarm note and the shadow panel's
+# budget note sat at fixed positions, and the lit arm's trace and the world's
+# shadow trace ran through them. These protect a note being placed where no
+# plotted line crosses it, the time cursor being broken around a note, and the
+# check that refuses a crossed note finding every kind of crossing.
+
+def drawn_crossings(ax, note):
+    """The test's own geometry: every line's drawn path (matplotlib's, steps
+    included), transformed to the screen and sampled every half pixel, and its
+    marker centres, against the note's text box. Names each line that enters."""
+    r = ax.figure.canvas.get_renderer()
+    bb = note.get_window_extent(r)
+    hits = []
+    for line in ax.get_lines():
+        v = line.get_transform().transform(line.get_path().vertices)
+        v = v[np.isfinite(v).all(axis=1)]
+        if len(v) == 0:
+            continue
+        pts = [v]
+        if line.get_linestyle() not in ("None", "", " "):
+            for a, b in zip(v[:-1], v[1:]):
+                n = int(np.hypot(*(b - a)) * 2) + 2
+                pts.append(a + np.linspace(0, 1, n)[:, None] * (b - a))
+        p = np.vstack(pts)
+        if np.any((p[:, 0] > bb.x0) & (p[:, 0] < bb.x1) &
+                  (p[:, 1] > bb.y0) & (p[:, 1] < bb.y1)):
+            hits.append(line.get_gid() or line.get_label())
+    return hits
+
+
+def busy_axes():
+    """A panel shaped like the executive one: a step trace along the bottom that
+    rises through the lower right, a budget line, a marker-only series."""
+    fig = plt.figure(figsize=(16, 9), dpi=110)
+    ax = fig.add_axes(D.EXEC_RECT)
+    ax.set_xlim(-0.6, 12.6)
+    ax.set_ylim(-0.2, 4.0)
+    t = np.linspace(0, 12, 49)
+    ax.step(t, np.where((t > 8) & (t < 11), 1.2, 0.3), where="post", gid="step")
+    ax.axhline(2.0, ls="--", gid="budget")
+    ax.plot(t[::4], 0.1 + 0.02 * t[::4], "o", gid="markers")
+    leg = ax.legend(["a", "b"], loc="upper left")
+    return fig, ax, leg
+
+
+TEXT = "the world never exceeds 1.00 h, so the firing is a false alarm"
+
+
+def test_a_note_is_moved_off_the_lines_through_its_preferred_spot():
+    """Protects the placement. The discriminating property first: at the
+    preferred spot, where the note used to be fixed, a line crosses it."""
+    fig, ax, leg = busy_axes()
+    fixed = ax.text(0.985, 0.13, TEXT, ha="right", va="bottom",
+                    transform=ax.transAxes, fontsize=7.5)
+    assert drawn_crossings(ax, fixed), "the fixture cannot express a crossing"
+    fixed.remove()
+    note = D.place_note(ax, TEXT, (0.985, 0.13), ha="right", avoid=[leg], fontsize=7.5)
+    assert drawn_crossings(ax, note) == []
+    lb, nb = leg.get_window_extent(), note.get_window_extent()
+    assert not overlap(tuple(lb.extents), tuple(nb.extents)), "note on the legend"
+    plt.close(fig)
+
+
+def test_the_cursor_is_broken_around_a_note():
+    """Protects the cursor: it sweeps every time, so it would cross any note in
+    some frame. Discriminating property first: an unbroken cursor at that
+    time crosses the note."""
+    fig, ax, leg = busy_axes()
+    note = D.place_note(ax, TEXT, (0.985, 0.13), ha="right", avoid=[leg], fontsize=7.5)
+    bb = note.get_window_extent()
+    t = float(ax.transData.inverted().transform(((bb.x0 + bb.x1) / 2, 0))[0])
+    full = ax.axvline(t)
+    assert drawn_crossings(ax, note) == [full.get_label()]
+    full.remove()
+    pieces = D.draw_cursor(ax, t, [note])
+    assert len(pieces) == 2 and drawn_crossings(ax, note) == []
+    assert D.note_faults(ax, [note]) == []
+    plt.close(fig)
+
+
+def test_the_note_check_finds_each_kind_of_crossing():
+    """Protects check_notes and note_faults, which refuse a crossed note: a
+    plain segment, a step, an axhline, a marker, and the cursor are each found,
+    and a clear note is not refused."""
+    fig = plt.figure(figsize=(16, 9), dpi=110)
+    ax = fig.add_axes(D.SHADOW_RECT)
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 1)
+    note = ax.text(0.5, 0.5, "a note in the middle", ha="center", va="center",
+                   transform=ax.transAxes, gid="note")
+    assert D.note_faults(ax, [note]) == []
+    D.check_notes(ax, [note])
+    for gid, draw in (("segment", lambda: ax.plot([0, 10], [0.2, 0.8], gid="segment")[0]),
+                      # Only the drawn step enters the note; the straight
+                      # line between the same points passes below it.
+                      ("step", lambda: ax.step([0, 5, 10], [0.5, 0.0, 0.0],
+                                               where="post", gid="step")[0]),
+                      ("budget", lambda: ax.axhline(0.5, gid="budget")),
+                      ("marker", lambda: ax.plot([5], [0.5], "o", gid="marker")[0]),
+                      ("cursor", lambda: ax.axvline(5.0, gid="cursor"))):
+        line = draw()
+        assert [b[1] for b in D.note_faults(ax, [note])] == [gid], gid
+        with pytest.raises(RuntimeError, match="cross"):
+            D.check_notes(ax, [note])
+        line.remove()
+    plt.close(fig)
+
+
+def test_a_note_with_no_room_is_refused():
+    """Protects the refusal: no clear place raises rather than draw it crossed."""
+    fig = plt.figure(figsize=(16, 9), dpi=110)
+    ax = fig.add_axes(D.SHADOW_RECT)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    for y in np.linspace(0, 1, 60):
+        ax.axhline(y, lw=1.0)
+    with pytest.raises(RuntimeError, match="no place"):
+        D.place_note(ax, TEXT, (0.985, 0.04), ha="right", fontsize=7)
+    plt.close(fig)
+
+
+def test_the_text_panel_may_not_run_into_the_captions():
+    """Protects check_text_clear: the longer pairing statement ran the text
+    panel's last line into the first caption."""
+    fig = plt.figure(figsize=(16, 9), dpi=110)
+    panel = fig.text(0.7, 0.20, "\n".join(["a line"] * 12), va="top", fontsize=7.6)
+    cap = fig.text(0.025, 0.068, "x" * 300, fontsize=7)
+    with pytest.raises(RuntimeError, match="runs into"):
+        D.check_text_clear(fig, panel, [cap])
+    panel.set_y(0.40)
+    D.check_text_clear(fig, panel, [cap])
+    plt.close(fig)

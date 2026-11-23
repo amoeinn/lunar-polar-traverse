@@ -27,9 +27,10 @@ from src.intervals import CADENCE_H
 ROOT = Path(__file__).resolve().parents[1]
 NUM = re.compile(r"(?<![\w.])[-+]?\d+(?:\.\d+)?%?(?![\w])")
 
-P3 = dict(margin_required=0.13, share_required=0.29,
+P3 = dict(margin_required=0.13, share_required=0.29, exponent=0.7,
           clause2=dict(verdict="PASS", at_margin=37, n=711, median=0.0347))
-PC = dict(both=dict(aa=311, ar=2, ra=1, rr=7))
+PC = dict(both=dict(aa=311, ar=2, ra=1, rr=7), only_td=13, only_snap=171)
+PC0 = dict(both=dict(aa=311, ar=0, ra=0, rr=7), only_td=13, only_snap=171)
 
 
 def sourced(text, values):
@@ -79,17 +80,54 @@ def test_the_caption_does_not_claim_what_the_run_does_not_show():
 
 
 def test_the_text_panel_numbers_are_the_contingency_and_the_record(monkeypatch):
-    """Protects the text panel's pairing and P3 lines."""
-    monkeypatch.setattr(D, "replay_out", lambda tag, kind: dict(
-        verdict=[True], arrival=[1.5], shadow=[0.25]))
+    """Protects the text panel's pairing, mean-map and P3 lines. The mean-map
+    row read "mean-map e=2" after P3's corrected criterion selected 1.0, and
+    this test did not see it: the budget, 2.0, was among the sources, so the
+    literal 2 matched it. The budget and the exponent are sentinels now, and
+    the replay the row reads is recorded."""
+    kinds = []
+
+    def replay(tag, kind):
+        kinds.append(kind)
+        return dict(verdict=[True], arrival=[1.5], shadow=[0.25])
+    monkeypatch.setattr(D, "replay_out", replay)
+    monkeypatch.setattr(D, "BUDGET_H", 2.35)
     rows = dict(td=0, snap=0, mm=0)
     lines = D.panel_lines("t", 3, rows, {}, ("snap",), PC, P3)
     text = " ".join(lines[2:])           # past the epoch header
-    vals = [311, 2 + 1, 7, 311 + 2 + 1 + 7, 1.5, 0.25, D.BUDGET_H] + p3_values(P3)
+    vals = [311, 2 + 1, 7, 311 + 2 + 1 + 7, 13, 171, 1.5, 0.25, 2.35, 0.7] \
+        + p3_values(P3)
     assert sourced(text, vals) == [], sourced(text, vals)
-    assert "paired on 321 shared pairs: 311 both" in text, text
-    assert "3 one only." in text and "never disagree" not in text, text
+    assert "mean-map e=0.7" in text and "mm0.7" in kinds, (text, kinds)
+    assert not any(k.startswith("mm") and k != "mm0.7" for k in kinds), kinds
+    assert "on the 321 instances both planned: 311 both accepted," in text, text
+    assert "3 accepted by one planner and rejected by the other." in text, text
+    assert "not paired: 13 with only a time-dependent plan, 171 with only a " \
+        "snapshot plan." in text, text
+    assert "one only" not in text and "never disagree" not in text, text
     assert "P3 clause 2 is scored PASS:" in text, text
+
+
+def test_no_disagreement_is_stated_over_shared_pairs_only(monkeypatch):
+    """Protects the wording that replaced "0 one only", which read as "no
+    instance has one planner's plan only" while 5 had only a time-dependent
+    plan and 122 only a snapshot plan."""
+    monkeypatch.setattr(D, "replay_out", lambda tag, kind: dict(
+        verdict=[True], arrival=[1.5], shadow=[0.25]))
+    text = " ".join(D.panel_lines("t", 3, dict(td=0, snap=0, mm=0), {}, (), PC0, P3))
+    assert "7 both rejected; no pair accepted by one planner and rejected by " \
+        "the other." in text, text
+    assert "not paired: 13 with only a time-dependent plan" in text, text
+    assert "0 one only" not in text and "never disagree" not in text, text
+
+
+def test_the_mean_map_row_refuses_rows_from_another_exponent(monkeypatch):
+    """Protects the rows and the record agreeing: a route read at one exponent
+    and labelled with another is refused."""
+    monkeypatch.setattr(D, "replay_out", lambda tag, kind: dict(
+        verdict=[True], arrival=[1.5], shadow=[0.25]))
+    with pytest.raises(ValueError, match="mm2.0"):
+        D.panel_lines("t", 3, dict(td=0, snap=0, mm=0, mm_kind="mm2.0"), {}, (), PC, P3)
 
 
 def test_the_r4_footnote_counts_its_own_rows():
