@@ -2,12 +2,14 @@
 
 PLAN.md registers that no bar on an agreement metric is written until the
 constant predictor's score on the same data has been computed. This runs first,
-before any threshold for phase 6 exists, and it also fixes the sample by rule
-rather than by outcome: the monitored set is every core plan that enters shadow
-at all, the control set is every core plan that does not.
+before any threshold is written for a host, and it fixes the sample by rule
+rather than by outcome: the monitored set is every plan of the host that enters
+shadow at all, the control set is every plan that does not, and a bust is
+shadow above the host's own budget.
 
-Reads the cached replay outputs of the core sweep and nothing else. Scores
-nothing about the executive, which does not exist yet.
+Reads the cached replay outputs of the host and nothing else. Scores nothing
+about the executive. --host core is the sample phase 6 registered on; --host
+tol05 is the primary branch's host.
 """
 import sys
 from pathlib import Path
@@ -17,22 +19,37 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-BUDGET_H = 2.0              # the core's registered shadow tolerance
-WORK = ROOT / "data" / "work" / "sweep"
+import argparse                                                  # noqa: E402
+from math import comb                                            # noqa: E402
+
+import examples.run_executive as R                               # noqa: E402
 
 
-def load():
-    """Per-plan checker outputs for the core's feasible time-dependent plans."""
+def load(host):
+    """Per-plan checker outputs for the host's feasible time-dependent plans.
+
+    The partition and the bust label come from run_executive.sample, the same
+    function the executive and the correction arm read, so the sample these
+    base rates describe is the sample those runs score and not a second copy of
+    its definition.
+    """
     rows = []
-    for d in sorted(WORK.glob("*_replay_td_tol")):
-        tag = d.name[: -len("_replay_td_tol")]
-        sh = np.fromfile(d / "out_shadow.bin", dtype=np.float64)
-        ar = np.fromfile(d / "out_arrival.bin", dtype=np.float64)
-        il = np.fromfile(d / "out_illegal.bin", dtype=np.int32)
-        for i in range(sh.size):
-            rows.append(dict(tag=tag, plan=i, shadow=float(sh[i]),
-                             arrival=float(ar[i]), illegal=int(il[i])))
+    recs = R.sample(host)
+    illegal = {}
+    for r in recs:
+        if r["tag"] not in illegal:
+            d = Path(r["replay_params"]).parent
+            illegal[r["tag"]] = np.fromfile(d / "out_illegal.bin", dtype=np.int32)
+        rows.append(dict(tag=r["tag"], plan=r["plan_index"], shadow=r["world_shadow"],
+                         busted=r["busted"], monitored=r["monitored"],
+                         illegal=int(illegal[r["tag"]][r["plan_index"]])))
     return rows
+
+
+def mcnemar_p(b, c):
+    """One-sided exact McNemar p for b removed against c added."""
+    n = b + c
+    return sum(comb(n, k) for k in range(c + 1)) / 2 ** n if n else 1.0
 
 
 def contingency(fired, busted):
@@ -64,16 +81,21 @@ def report(name, fired, busted):
     print(f"    MISS, not fired  {fn:3d}   correctly quiet              {tn:3d}")
     print(f"    accuracy {(tp+tn)/n:.4f}   miss rate {fn/(tp+fn) if (tp+fn) else float('nan'):.4f}"
           f"   unnecessary rate {fp/(fp+tn) if (fp+tn) else float('nan'):.4f}")
-    print(f"    Matthews {mcc(tp,fp,fn,tn):+.4f}   Youden J {j:+.4f}"
+    den = float(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    m = f"{mcc(tp,fp,fn,tn):+.4f}" if den else "undefined, zero denominator"
+    print(f"    Matthews {m}   Youden J {j:+.4f}"
           f"   (TPR {tpr:.4f}, FPR {fpr:.4f})")
 
 
 def main():
-    rows = load()
-    sh = np.array([r["shadow"] for r in rows])
-    monitored = [r for r in rows if r["shadow"] > 0.0]
-    controls = [r for r in rows if r["shadow"] == 0.0]
-    print(f"core feasible time-dependent plans: {len(rows)}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", choices=sorted(R.HOSTS), default="core")
+    host = R.HOSTS[ap.parse_args().host]
+    budget = float(host["budget_h"])
+    rows = load(host)
+    monitored = [r for r in rows if r["monitored"]]
+    controls = [r for r in rows if not r["monitored"]]
+    print(f"host {host['name']}, budget {budget:g} h: feasible time-dependent plans: {len(rows)}")
     print(f"  monitored set, plans entering shadow at all: {len(monitored)}")
     print(f"  control set, plans with exactly zero shadow: {len(controls)}")
     print(f"  illegal steps across all plans: {sum(r['illegal'] for r in rows)}")
@@ -81,33 +103,51 @@ def main():
           f"{np.median([r['shadow'] for r in monitored]):.4f}, max "
           f"{max(r['shadow'] for r in monitored):.4f}")
 
-    epochs = {}
-    for r in monitored:
-        epochs.setdefault(r["tag"], [0, 0])
-        epochs[r["tag"]][0] += 1
-        epochs[r["tag"]][1] += int(r["shadow"] > BUDGET_H)
-    print(f"\n  epochs contributing to the monitored set, reported not chosen:")
-    for tag in sorted(epochs):
-        n, b = epochs[tag]
-        print(f"    {tag:<16} {n:3d} monitored, {b} busting")
+    tags = sorted({r["tag"] for r in rows})
+    print(f"\n  per epoch, reported not chosen:")
+    for tag in tags:
+        g = [r for r in rows if r["tag"] == tag]
+        m = [r for r in g if r["monitored"]]
+        print(f"    {tag:<16} {len(g):3d} plans, {len(m):3d} monitored, "
+              f"{len(g) - len(m):3d} controls, {sum(r['busted'] for r in m)} busting")
 
-    busted = np.array([r["shadow"] > BUDGET_H for r in monitored])
+    busted = np.array([r["busted"] for r in monitored])
     print(f"\n  ground truth on the monitored set, from the checker's own "
           f"integration of the executed trajectory:")
-    print(f"    plans that bust the {BUDGET_H:.1f} h budget: {int(busted.sum())} "
-          f"of {busted.size} = {busted.mean():.2%}")
+    print(f"    plans that bust the {budget:g} h budget: {int(busted.sum())} "
+          f"of {busted.size} = {busted.mean():.2%} (of all plans "
+          f"{int(busted.sum()) / len(rows):.2%})")
     print(f"    so the positive class is {int(busted.sum())} plans; any rate on "
           f"it is a rate over that many cases")
+    for r in monitored:
+        if r["busted"]:
+            print(f"      case: {r['tag']} replay plan {r['plan']}, shadow "
+                  f"{r['shadow']:.4f} h, illegal {r['illegal']}")
 
     print(f"\nthe two constant predictors, scored before any bar is written:")
     report("never fire", np.zeros_like(busted), busted)
     report("fire at the first tick", np.ones_like(busted), busted)
-    print(f"\n  what this says about thresholds. An accuracy bar is unusable: "
-          f"'never fire'\n  already scores "
-          f"{(~busted).mean():.4f} and no executive worth having needs to beat "
-          f"that.\n  Both constant predictors score Matthews 0.0000 and Youden "
-          f"J 0.0000, which is\n  why the registered bar goes on those and on "
-          f"the miss count, not on accuracy.")
+    print(f"    on the {len(controls)} controls: never fire fires on 0, fire at "
+          f"the first tick on {len(controls)}")
+
+    print(f"\n  leaving one epoch out, what a monitor that fires on exactly the "
+          f"busts would score:")
+    for tag in tags:
+        m = [r for r in monitored if r["tag"] != tag]
+        b = np.array([r["busted"] for r in m], bool)
+        tp, fp, fn, tn = contingency(b, b)
+        den = float(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+        print(f"    without {tag:<16} monitored {len(m):3d}  busts {int(b.sum())}  "
+              f"Matthews {f'{mcc(tp, fp, fn, tn):+.4f}' if den else 'UNDEFINED'}")
+
+    quiet = int((~busted).sum())
+    print(f"\n  the paired McNemar test is played on the {quiet} non-bust monitored "
+          f"plans: b and c are\n  counted there, so b + c <= {quiet}. The smallest "
+          f"b reaching one-sided p <= 0.05, per c:")
+    for c in range(0, 7):
+        b = next((b for b in range(0, 200) if mcnemar_p(b, c) <= 0.05), None)
+        print(f"    c = {c}  b >= {b:2d}  p = {mcnemar_p(b, c):.4f}  "
+              f"{'reachable' if b + c <= quiet else 'UNREACHABLE on this host'}")
     return 0
 
 

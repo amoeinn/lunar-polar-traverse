@@ -4,6 +4,10 @@ The test is registered in PLAN.md on 2026-10-05, before this existed: paired
 against the bounded rule on the same 45 monitored plans, passing if the
 candidate removes enough of the bounded rule's 17 false alarms to reach
 one-sided exact p <= 0.05, with zero busts lost and control firings still 0.
+That was the core host. --host tol05 runs the same arms on the primary branch's
+host, the tolerance axis at 0.5 h, with the bars PLAN.md registers for it.
+--arms selects arms; "none", the bounded rule every arm is paired against,
+always runs.
 
 B3b as a monitor correction is "the model says the cell the rover is on is lit
 but the next cell on the path is dark at that moment". That is the interval
@@ -29,7 +33,11 @@ from src import auditor as A                                     # noqa: E402
 from src.disagree import FlatIntervals                           # noqa: E402
 from src.executive import run_instance                           # noqa: E402
 
-OUT = ROOT / "data" / "work" / "executive_correction"
+# One output directory per host, beside the executive's own, so the core's
+# record and the primary branch's never share a results.json.
+OUT = {"core": ROOT / "data" / "work" / "executive_correction",
+       "tol05": ROOT / "data" / "work" / "executive_correction_tol05"}
+ARMS = ("none", "dark", "lit", "both", "model")
 SUNDIR = ROOT / "data" / "work" / "sunpos"
 _CTX = {}
 
@@ -112,7 +120,7 @@ def b3b_correction(graph, plan, times, arm):
 
 def one(arg):
     rec, kind = arg
-    work = OUT / kind / rec["tag"] / f"plan{rec['plan_index']:03d}"
+    work = OUT[rec["host"]] / kind / rec["tag"] / f"plan{rec['plan_index']:03d}"
     plan = np.array(rec["plan"], np.int32)
     times = np.array(rec["times"], np.float64)
     if kind == "none":
@@ -122,7 +130,7 @@ def one(arg):
     else:
         fn = lambda p, t: b3b_correction(rec["graph"], p, t, kind)
     legs = run_instance(rec["planner_params"], rec["replay_params"],
-                        rec["graph"], plan, times, work, R.BUDGET_H,
+                        rec["graph"], plan, times, work, rec["budget_h"],
                         R.REPLAN_LIMIT, R.REPLAN_CAP_S, True,
                         R.CONTRA_HORIZON_H, fn)
     fired_any, fired_warranted = False, False
@@ -130,7 +138,7 @@ def one(arg):
         wd = work / f"leg{n}_world"
         traj_sh = np.fromfile(wd / "out_traj_shadow.bin", np.float64)
         w = dict(traj=dict(shadow=traj_sh), shadow=leg.world_shadow_max)
-        a = A.audit_leg(leg, w, R.BUDGET_H)
+        a = A.audit_leg(leg, w, rec["budget_h"])
         if bool(a["fired"].any()):
             fired_any = True
             k = int(np.flatnonzero(a["fired"])[0])
@@ -148,30 +156,41 @@ def mcnemar(b, c):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=int, default=6)
+    ap.add_argument("--host", choices=sorted(R.HOSTS), default="core")
+    # "none" is the bounded rule every arm is paired against, so it always runs.
+    # "model" needs data/work/traversability_model.joblib, which only exists
+    # once the learned model has been trained on the current labels.
+    ap.add_argument("--arms", default=",".join(ARMS))
     args = ap.parse_args()
-    recs = R.sample()
-    OUT.mkdir(parents=True, exist_ok=True)
-    # Sun positions cached once, so no worker pays 43200 SPICE calls per epoch.
-    SUNDIR.mkdir(parents=True, exist_ok=True)
-    from examples.build_intervals import epochs, sun_table_at
-    for tag, base, off in epochs():
-        f = SUNDIR / f"{tag}.npy"
-        if not f.exists() and any(r["tag"] == tag for r in recs):
-            np.save(f, sun_table_at(base, off, cadence_h=1.0 / 60.0).p)
-            print(f"  cached sun positions for {tag}", flush=True)
-    ARMS = ("none", "dark", "lit", "both", "model")
-    jobs = [(r, k) for k in ARMS for r in recs]
-    print(f"{len(recs)} instances x {len(ARMS)} arms, {args.jobs} workers", flush=True)
+    arms_run = tuple(a for a in ARMS if a in args.arms.split(","))
+    unknown = set(args.arms.split(",")) - set(ARMS)
+    if unknown or "none" not in arms_run:
+        ap.error(f"--arms must name arms from {ARMS} and include none; got {args.arms}")
+    recs = R.sample(R.HOSTS[args.host])
+    out = OUT[args.host]
+    out.mkdir(parents=True, exist_ok=True)
+    if "model" in arms_run:
+        # Sun positions cached once, so no worker pays 43200 SPICE calls per epoch.
+        SUNDIR.mkdir(parents=True, exist_ok=True)
+        from examples.build_intervals import epochs, sun_table_at
+        for tag, base, off in epochs():
+            f = SUNDIR / f"{tag}.npy"
+            if not f.exists() and any(r["tag"] == tag for r in recs):
+                np.save(f, sun_table_at(base, off, cadence_h=1.0 / 60.0).p)
+                print(f"  cached sun positions for {tag}", flush=True)
+    jobs = [(r, k) for k in arms_run for r in recs]
+    print(f"host {args.host}, budget {recs[0]['budget_h']} h: {len(recs)} instances x "
+          f"{len(arms_run)} arms ({', '.join(arms_run)}), {args.jobs} workers", flush=True)
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
         res = list(ex.map(one, jobs))
-    (OUT / "results.json").write_text(json.dumps(res, indent=1))
+    (out / "results.json").write_text(json.dumps(res, indent=1))
 
     key = lambda r: (r["tag"], r["plan_index"])
-    arms = {k: {key(r): r for r in res if r["kind"] == k} for k in ARMS}
+    arms = {k: {key(r): r for r in res if r["kind"] == k} for k in arms_run}
     base = arms["none"]
     mon = [k for k in base if base[k]["monitored"]]
     print(f"\nmonitored {len(mon)}, controls {len(base)-len(mon)}")
-    for nm in ARMS:
+    for nm in arms_run:
         arm = arms[nm]
         TP = sum(1 for k in mon if arm[k]["busted"] and arm[k]["fired"])
         FN = sum(1 for k in mon if arm[k]["busted"] and not arm[k]["fired"])
@@ -191,7 +210,7 @@ def main():
           f"plans:")
     print(f"  {'arm':24s}{'b':>4}{'c':>4}{'busts lost':>12}{'ctl fires':>11}"
           f"{'p':>9}  verdict")
-    for nm in ("dark", "lit", "both", "model"):
+    for nm in arms_run[1:]:
         cand = arms[nm]
         b = sum(1 for k in nonbust if base[k]["fired"] and not cand[k]["fired"])
         c = sum(1 for k in nonbust if not base[k]["fired"] and cand[k]["fired"])

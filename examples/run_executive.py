@@ -1,13 +1,19 @@
-"""Run the executive over the registered sample and score it against the auditor.
+"""Run the executive over a registered host sample and score it against the auditor.
 
 PLAN.md, "The executive", registers the sample, the tick definition, the
 replan-at-a-lit-cell constraint, k, the declaration-audit cap d, the three bars
 and the five failure conditions, all before this ran.
 
-Monitored set: every core feasible time-dependent plan whose integrated
-continuous shadow is above zero, 45 plans. Control set: every one whose shadow
-is exactly zero, 142 plans. The executive must fire on the first where
-continuing busts and must never fire on the second.
+Monitored set: every feasible time-dependent plan of the host whose integrated
+continuous shadow is above zero. Control set: every one whose shadow is exactly
+zero. A plan busts when that shadow exceeds the host's own budget. The executive
+must fire on the busts and must never fire on the controls.
+
+Two hosts. "core" is the sample P8 and the paired design were registered on,
+every core epoch at the core's 2 h budget. "tol05" is the primary branch the
+registered successor condition selected on 2026-11-21: the tolerance axis point
+with a 0.5 h budget, over the axis's four epochs. Each host writes to its own
+directory, so running one never overwrites the other.
 """
 import argparse
 import json
@@ -20,13 +26,24 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from examples.build_intervals import epochs                      # noqa: E402
+from examples.sweep_axes import AXES as AXIS_POINTS, CORE, EPOCHS as AXIS_EPOCHS  # noqa: E402
 from src import auditor as A                                     # noqa: E402
 from src.executive import (CONTRA_HORIZON_H, run_instance,       # noqa: E402
                            simulate, plan_waits)
 
-WORK = ROOT / "data" / "work" / "sweep"
-OUT = ROOT / "data" / "work" / "executive"
-BUDGET_H = 2.0
+# The budget is a property of the host and travels with each record, never a
+# module constant: the executive, the auditor and the bust label must all use
+# the budget the host's plans were made and replayed under, and sample() checks
+# that against both parameter files rather than trusting this table.
+HOSTS = {
+    "core": dict(name="core", work=ROOT / "data" / "work" / "sweep", stem="",
+                 tags=None, budget_h=CORE["tol"],
+                 out=ROOT / "data" / "work" / "executive"),
+    "tol05": dict(name="tol05", work=ROOT / "data" / "work" / "axes",
+                  stem="tolerance_0_", tags=AXIS_EPOCHS,
+                  budget_h=AXIS_POINTS["tolerance"][0]["tol"],
+                  out=ROOT / "data" / "work" / "executive_tol05"),
+}
 REPLAN_LIMIT = 2            # k, registered
 REPLAN_CAP_S = 30.0         # the cap the search runs under everywhere else
 DECL_CAP = 6                # d, registered
@@ -37,29 +54,37 @@ BAR_MCC = 0.5
 RULES = (("unbounded", False), ("bounded", True))
 
 
-def sample():
-    """Every instance, with the plan, the schedule and the ground truth."""
+def sample(host=HOSTS["core"]):
+    """Every instance of the host, with the plan, the schedule and the ground truth."""
     out = []
-    for tag, _, _ in epochs():
-        pt = WORK / f"{tag}_td" / "planner_params.json"
-        rt = WORK / f"{tag}_replay_td_tol" / "replay_params.json"
+    work, stem, budget = Path(host["work"]), host["stem"], float(host["budget_h"])
+    tags = host["tags"] if host["tags"] is not None else [t for t, _, _ in epochs()]
+    for tag in tags:
+        pt = work / f"{stem}{tag}_td" / "planner_params.json"
+        rd = work / f"{stem}{tag}_replay_td_tol"
+        rt = rd / "replay_params.json"
         if not (pt.exists() and rt.exists()):
             continue
         tp = json.loads(pt.read_text())
+        made, judged = float(tp["shadow_tol_h"]), float(json.loads(rt.read_text())["shadow_tol_h"])
+        if not (made == judged == budget):
+            raise ValueError(f"{host['name']} {tag}: budget {budget} h, but the plans "
+                             f"were made at {made} h and replayed at {judged} h")
         off = np.fromfile(tp["out_path_offsets"], np.int64)
         pc = np.fromfile(tp["out_path_cells"], np.int32)
         ptm = np.fromfile(tp["out_path_times"], np.float64)
-        sh = np.fromfile(WORK / f"{tag}_replay_td_tol" / "out_shadow.bin", np.float64)
+        sh = np.fromfile(rd / "out_shadow.bin", np.float64)
         idx = [q for q in range(off.size - 1) if off[q + 1] - off[q] >= 2]
         assert len(idx) == sh.size, (tag, len(idx), sh.size)
         for i, q in enumerate(idx):
             lo, hi = off[q], off[q + 1]
-            out.append(dict(tag=tag, plan_index=i, instance=q,
+            out.append(dict(tag=tag, host=host["name"], budget_h=budget,
+                            out=str(host["out"]), plan_index=i, instance=q,
                             plan=pc[lo:hi].astype(np.int32).tolist(),
                             times=ptm[lo:hi].tolist(),
                             world_shadow=float(sh[i]),
                             monitored=bool(sh[i] > 0.0),
-                            busted=bool(sh[i] > BUDGET_H),
+                            busted=bool(sh[i] > budget),
                             planner_params=str(pt), replay_params=str(rt),
                             graph={k: tp[k] for k in
                                    ("indptr_path", "indices_path", "travel_path",
@@ -70,11 +95,12 @@ def sample():
 def one(arg):
     """Run every leg of one instance under one contradiction rule, and audit it."""
     rec, rule, bounded = arg
-    work = OUT / rule / rec["tag"] / f"plan{rec['plan_index']:03d}"
+    out_dir = Path(rec["out"])
+    work = out_dir / rule / rec["tag"] / f"plan{rec['plan_index']:03d}"
     plan = np.array(rec["plan"], np.int32)
     times = np.array(rec["times"], np.float64)
     legs = run_instance(rec["planner_params"], rec["replay_params"], rec["graph"],
-                        plan, times, work, BUDGET_H, REPLAN_LIMIT, REPLAN_CAP_S,
+                        plan, times, work, rec["budget_h"], REPLAN_LIMIT, REPLAN_CAP_S,
                         bounded, CONTRA_HORIZON_H)
     audits, fired_any, fired_warranted = [], False, False
     drift_max, ticks = 0.0, 0
@@ -82,7 +108,7 @@ def one(arg):
         wd = work / f"leg{n}_world"
         traj_sh = np.fromfile(wd / "out_traj_shadow.bin", np.float64)
         w = dict(traj=dict(shadow=traj_sh), shadow=leg.world_shadow_max)
-        a = A.audit_leg(leg, w, BUDGET_H)
+        a = A.audit_leg(leg, w, rec["budget_h"])
         fired = bool(a["fired"].any())
         fired_any |= fired
         if fired:
@@ -112,8 +138,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=int, default=12)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--host", choices=sorted(HOSTS), default="core")
     args = ap.parse_args()
-    recs = sample()
+    host = HOSTS[args.host]
+    recs = sample(host)
     if args.limit:
         mon = [r for r in recs if r["monitored"]][: args.limit]
         ctl = [r for r in recs if not r["monitored"]][: args.limit]
@@ -121,17 +149,19 @@ def main():
     mon = [r for r in recs if r["monitored"]]
     ctl = [r for r in recs if not r["monitored"]]
     print(f"sample: {len(mon)} monitored, {len(ctl)} controls, "
-          f"{sum(r['busted'] for r in mon)} busting; budget {BUDGET_H} h, "
+          f"{sum(r['busted'] for r in mon)} busting; host {host['name']}, "
+          f"budget {host['budget_h']} h, "
           f"k={REPLAN_LIMIT}, replan cap {REPLAN_CAP_S:.0f} s, "
           f"declaration audit at {DECL_CAP_S:.0f} s capped at d={DECL_CAP}")
     print(f"two contradiction rules from one binary and one sample: the first "
           f"rule, projecting to the model's next transition, and its registered "
           f"replacement at a {CONTRA_HORIZON_H:.4f} h horizon", flush=True)
-    OUT.mkdir(parents=True, exist_ok=True)
+    out = Path(host["out"])
+    out.mkdir(parents=True, exist_ok=True)
     jobs = [(r, rule, b) for rule, b in RULES for r in recs]
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
         allres = list(ex.map(one, jobs))
-    (OUT / "results.json").write_text(json.dumps(allres, indent=1, default=str))
+    (out / "results.json").write_text(json.dumps(allres, indent=1, default=str))
     by_rule = {rule: [r for r in allres if r["rule"] == rule] for rule, _ in RULES}
     for rule, _ in RULES:
         print(f"\n{'='*72}\n{rule.upper()} contradiction rule"
@@ -139,13 +169,18 @@ def main():
                  else ", projecting to the model's next transition")
               + f"\n{'='*72}")
         report(by_rule[rule])
-    side_by_side(by_rule)
+    side_by_side(by_rule, host)
     return 0
 
 
-def side_by_side(by_rule):
+def side_by_side(by_rule, host=HOSTS["core"]):
     """Both verdicts in one table, scored against the identical bars."""
-    print(f"\n{'='*72}\nBOTH RULES, the same 45 monitored plans and 142 "
+    first = next(iter(by_rule.values()))
+    n_mon = sum(r["monitored"] for r in first)
+    n_ctl = len(first) - n_mon
+    n_bust = sum(r["busted"] for r in first if r["monitored"])
+    n_quiet = n_mon - n_bust
+    print(f"\n{'='*72}\nBOTH RULES, the same {n_mon} monitored plans and {n_ctl} "
           f"controls, the same bars\n{'='*72}")
     hdr = f"  {'':<34}" + "".join(f"{r:>16}" for r, _ in RULES)
     print(hdr)
@@ -163,11 +198,11 @@ def side_by_side(by_rule):
                            ctl=sum(r["fired"] for r in ctl),
                            fires=int(fired.sum()))
     rows = [
-        ("fired and would have busted", lambda c: f"{c['tp']} of 4"),
+        ("fired and would have busted", lambda c: f"{c['tp']} of {n_bust}"),
         ("missed a bust", lambda c: f"{c['fn']}"),
-        ("fired, would not have busted", lambda c: f"{c['fp']} of 41"),
-        ("correctly quiet", lambda c: f"{c['tn']} of 41"),
-        ("control firings", lambda c: f"{c['ctl']} of 142"),
+        ("fired, would not have busted", lambda c: f"{c['fp']} of {n_quiet}"),
+        ("correctly quiet", lambda c: f"{c['tn']} of {n_quiet}"),
+        ("control firings", lambda c: f"{c['ctl']} of {n_ctl}"),
         ("", lambda c: ""),
         (f"bar 1  misses == {BAR_MISSES}",
          lambda c: f"{c['fn']}  {'PASS' if c['fn'] <= BAR_MISSES else 'FAIL'}"),
@@ -184,6 +219,13 @@ def side_by_side(by_rule):
         ok = (c["fn"] <= BAR_MISSES and c["unnec"] <= BAR_UNNECESSARY
               and c["mcc"] >= BAR_MCC and c["ctl"] == 0)
         name = "P8" if rule == "bounded" else "the first rule"
+        if host["name"] != "core":
+            # P8's bars were registered on the core and nowhere else. On any
+            # other host they are printed for comparison and decide nothing.
+            print(f"\n  {name}, P8's core bars applied for comparison only, "
+                  f"not registered on {host['name']}: "
+                  f"{'would pass' if ok else 'would fail'}")
+            continue
         print(f"\n  {name}: {'PASS' if ok else 'FAIL'} "
               f"(all three bars required; misses {c['fn']}, unnecessary "
               f"{c['unnec']:.4f}, Matthews {c['mcc']:+.4f})")
@@ -237,7 +279,7 @@ def report(results):
             break
         a = A.audit_declaration(L["decl_plan"], L["decl_index"], L["fired_at_t"],
                                 r["planner_params"],
-                                OUT / "audit" / f"{r['tag']}_{r['plan_index']}_{L['leg']}",
+                                Path(r["out"]) / "audit" / f"{r['tag']}_{r['plan_index']}_{L['leg']}",
                                 DECL_CAP_S)
         if not a["audited"]:
             print(f"    {r['tag']} plan {r['plan_index']} leg {L['leg']}: not "
