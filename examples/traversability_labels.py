@@ -102,7 +102,7 @@ def main():
     cols = {k: [] for k in ("tag_id", "cell", "t", "world", "model",
                             "sun_el", "sun_az", "hor_el", "hor_dist",
                             "margin", "b3a", "b3b", "nxt_lit", "nxt_cell",
-                            "plan_id", "frac")}
+                            "plan_id", "frac", "start", "goal")}
     tag_ids, plans_done, bad = {}, 0, 0
     for tag, gp, plan, tt, tl, ti in src:
         if tag not in ivs:
@@ -160,6 +160,10 @@ def main():
         cols["tag_id"].append(np.full(grid.size, tag_ids[tag], np.int64))
         cols["plan_id"].append(np.full(grid.size, pid, np.int64))
         cols["frac"].append(np.zeros(grid.size))
+        # The plan's start/goal pair, so a model can be trained without the
+        # pairs a host plans (traversability_model.py --exclude-host).
+        cols["start"].append(np.full(grid.size, plan[0], np.int64))
+        cols["goal"].append(np.full(grid.size, plan[-1], np.int64))
         cols["world"].append(world)
         cols["model"].append(model)
         plans_done += 1

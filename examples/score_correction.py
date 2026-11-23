@@ -62,12 +62,33 @@ def feature_ctx():
     return _CTX["cells"], _CTX["horizon"], _CTX["hdist"]
 
 
-def model_correction(graph, plan, times, tag):
-    """The learned model's ternary code at each plan step."""
+def load_model(host):
+    """The host's model, refused unless it was trained for that host.
+
+    The core's model is trained on everything. tol05's is trained without the
+    host's own start/goal pairs (PLAN.md, D132 step 13), and when that set is
+    below the registered episode minimum no model exists and the arm is not run.
+    A model trained for the other host is never substituted.
+    """
     import joblib
+    from examples.traversability_model import MODEL_PATH
+    path = ROOT / MODEL_PATH[host]
+    if not path.exists():
+        raise SystemExit(f"the {host} model arm is not run: no model at {path}; "
+                         f"see the model log for the reason")
+    b = joblib.load(path)
+    want = None if host == "core" else host
+    if b.get("exclude_host") != want:
+        raise SystemExit(f"{path} was trained with exclude_host="
+                         f"{b.get('exclude_host')!r}, the {host} arm needs {want!r}")
+    return b
+
+
+def model_correction(graph, plan, times, tag, host):
+    """The learned model's ternary code at each plan step."""
     from src.frames import azimuth_elevation_from_frame, horizon_lookup
     if "clf" not in _CTX:
-        b = joblib.load(ROOT / "data" / "work" / "traversability_model.joblib")
+        b = load_model(host)
         _CTX["clf"], _CTX["feat"] = b["model"], b["features"]
     cells, horizon, hdist = feature_ctx()
     if tag not in _CTX.setdefault("sun", {}):
@@ -126,7 +147,7 @@ def one(arg):
     if kind == "none":
         fn = None
     elif kind == "model":
-        fn = lambda p, t: model_correction(rec["graph"], p, t, rec["tag"])
+        fn = lambda p, t: model_correction(rec["graph"], p, t, rec["tag"], rec["host"])
     else:
         fn = lambda p, t: b3b_correction(rec["graph"], p, t, kind)
     legs = run_instance(rec["planner_params"], rec["replay_params"],
@@ -174,8 +195,9 @@ def main():
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--host", choices=sorted(R.HOSTS), default="core")
     # "none" is the bounded rule every arm is paired against, so it always runs.
-    # "model" needs data/work/traversability_model.joblib, which only exists
-    # once the learned model has been trained on the current labels.
+    # "model" needs the host's model (traversability_model.MODEL_PATH), which
+    # only exists once it has been trained on the current labels, and for tol05
+    # only if the excluded training set met the registered episode minimum.
     ap.add_argument("--arms", default=",".join(ARMS))
     args = ap.parse_args()
     arms_run = tuple(a for a in ARMS if a in args.arms.split(","))
@@ -186,6 +208,7 @@ def main():
     out = OUT[args.host]
     out.mkdir(parents=True, exist_ok=True)
     if "model" in arms_run:
+        load_model(args.host)       # refuse before any worker starts
         # Sun positions cached once, so no worker pays 43200 SPICE calls per epoch.
         SUNDIR.mkdir(parents=True, exist_ok=True)
         from examples.build_intervals import epochs, sun_table_at
