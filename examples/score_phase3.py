@@ -5,12 +5,16 @@ and the axes' work directories, and every replay verdict is either read from
 disk or recomputed by the same committed checker into a directory keyed on the
 point, the epoch, the planner and the tolerance label.
 
-What it recomputes rather than reads: the core sweep replayed all four mean-map
-exponents into one shared directory, so only the last of them survived on disk.
-The mean-map is scored at the exponent the registered criterion selected on that
-run, 2.0 on the core, and its routes and replay are rebuilt here. Its pass count
-reproducing the recorded 197 is the check that the reconstruction is the same
-run.
+What it rebuilds rather than reads: the mean-map routes, at every exponent,
+since the sweep stores their replays but not the routes. The registered
+criterion, the baseline at its best setting by replay feasibility, is applied
+here over all four exponents from the files. The pre-fix scorer instead carried
+the exponent the pre-fix run had selected, 2.0, as a constant and rebuilt only
+that one, so on corrected data the criterion was applied to a single candidate.
+The reconstruction check is no longer a recorded pass count either: each
+exponent's sweep replay directory holds the plans the sweep replayed, and the
+rebuilt routes must be those plans exactly, or the scorer refuses rather than
+overwrite the sweep's record with a different call.
 
 Every case count is printed beside every median, aborts are a third outcome
 everywhere, and the monotonicity bound on the tolerance axis is applied rather
@@ -40,11 +44,9 @@ from src.cost import Rover, legal                                # noqa: E402
 from src.frames import cell_position                             # noqa: E402
 from src.intervals import LitIntervals                           # noqa: E402
 from src.planner import Graph                                    # noqa: E402
-from src.replay import ReplaySettings, replay                    # noqa: E402
+from src.replay import IDENTIFYING, ReplaySettings, replay       # noqa: E402
 
 TOL_DEG = 3.206                 # registered pitch and roll tolerance
-CORE_BEST_EXPONENT = 2.0        # selected by the registered criterion on the core
-CORE_RECORDED_MM_PASS = 197     # what that run reported, as a reconstruction check
 P2_MIN_HOURS = 24.0             # P2's own threshold
 P2_MIN_INFEASIBLE = 0.30
 P3_MIN_MARGIN = 0.10
@@ -77,6 +79,48 @@ def plans_from_planner(result, pairs, graph):
         waits.append(w)
         idx.append(i)
     return plans, starts, waits, idx
+
+
+def sweep_call_status(work, plans, starts, waits):
+    """Is the replay directory the sweep left for these plans, another call, or absent.
+
+    Compares the identifying inputs the checker driver writes (src/replay.py
+    IDENTIFYING) with the ones these rebuilt plans would write.
+    """
+    work = Path(work)
+    if not (work / "plan_cells_path.bin").exists():
+        return "absent"
+    off = np.zeros(len(plans) + 1, np.int64)
+    for i, pl in enumerate(plans):
+        off[i + 1] = off[i] + len(pl)
+    files = {"plan_offsets_path": off,
+             "plan_cells_path": np.concatenate([np.asarray(p) for p in plans])
+             if plans else np.zeros(0),
+             "plan_start_path": np.asarray(starts),
+             "plan_wait_path": np.concatenate([np.asarray(w) for w in waits])
+             if waits else np.zeros(0)}
+    for key, dt in IDENTIFYING.items():
+        f = work / f"{key}.bin"
+        if not f.exists() or not np.array_equal(np.fromfile(f, dt),
+                                                np.asarray(files[key], dt)):
+            return "different"
+    return "identical"
+
+
+def rebuilt_call_status(prefix, plans, starts, waits):
+    """Both verdict directories' status, refusing a directory holding another call.
+
+    judge() replays into the sweep's own directory when it cannot reuse it, so a
+    rebuilt route that differs from the sweep's would overwrite the sweep's
+    record with a different call. That is refused rather than done.
+    """
+    status = {lbl: sweep_call_status(f"{prefix}_{lbl}", plans, starts, waits)
+              for lbl in ("tol", "zero")}
+    if "different" in status.values():
+        raise SystemExit(f"{prefix}: the rebuilt mean-map routes are not the plans "
+                         f"the sweep replayed there; refusing to overwrite the "
+                         f"sweep's record with a different call")
+    return status
 
 
 def judge(plans, starts, waits, grid, rover, suns, shadow_tol, work):
@@ -190,11 +234,12 @@ def collect(site, work_dir, stem, tag, rover, shadow_tol, pairs_label, draw_fn,
             waits.append(np.zeros(len(path)))
             idx.append(i)
             claimed.append(tt)
+        status = rebuilt_call_status(f"{out_prefix}_mm{e}", plans, starts, waits)
         j = judge(plans, starts, waits, site.grid, rover, site.sun(tag), shadow_tol,
                   f"{out_prefix}_mm{e}") if plans else None
         rec[f"mm{e}"] = dict(n=len(pairs), aborted=np.zeros(len(pairs), bool),
                              arrival=np.array([np.nan] * len(pairs)), idx=idx,
-                             plans=plans, judged=j)
+                             plans=plans, judged=j, recon=status["tol"])
         for i, tt in zip(idx, claimed):
             rec[f"mm{e}"]["arrival"][i] = tt
     return rec
@@ -231,12 +276,28 @@ def all_rows(recs, kind):
 
 
 def best_exponent(recs, exponents):
-    """The baseline at its best setting by replay feasibility, as registered."""
+    """The baseline at its best setting by replay feasibility, as registered.
+
+    Over every exponent passed, which must be every exponent the sweep ran: a
+    criterion applied to one candidate selects that candidate whatever it scores.
+    """
+    if len(exponents) < 2:
+        raise ValueError(f"the criterion needs every swept exponent, got {exponents}")
     counts = {}
     for e in exponents:
         counts[e] = sum(int(r["pass_tol"]) for r in all_rows(recs, f"mm{e}"))
     best = max(counts, key=lambda e: counts[e])
     return best, counts
+
+
+def recon_report(recs, exponents):
+    """How many rebuilt mean-map calls are the sweep's own replayed plans."""
+    st = [rec[f"mm{e}"].get("recon", "absent") for rec in recs.values()
+          for e in exponents if rec[f"mm{e}"]["judged"] is not None]
+    return (f"  reconstruction check: the rebuilt mean-map routes are the plans "
+            f"the sweep replayed in {st.count('identical')} of {len(st)} calls"
+            + (f"; {st.count('absent')} had no sweep replay on disk and were "
+               f"replayed here" if st.count("absent") else ""))
 
 
 def score_p2(name, recs, duration_key="claimed"):
@@ -306,12 +367,10 @@ def score_p3_p4(recs, exponents):
     print(f"  mean-map exponents by replay pass count: "
           + ", ".join(f"e={e}: {counts[e]}" for e in exponents)
           + f"; registered criterion selects {best}")
-    if mm_pass != CORE_RECORDED_MM_PASS:
-        print(f"  NOTE: reconstruction gives {mm_pass} passing mean-map plans "
-              f"against the recorded {CORE_RECORDED_MM_PASS}")
-    else:
-        print(f"  reconstruction check: {mm_pass} passing mean-map plans, equal to "
-              f"the recorded core run")
+    top = [e for e in exponents if counts[e] == counts[best]]
+    if len(top) > 1:
+        print(f"  NOTE: exponents {top} tie at {counts[best]}; the first is taken")
+    print(recon_report(recs, exponents))
     n_inst = sum(rec["td"]["n"] for rec in recs.values())
     snap_z = sum(int(r["pass_zero"]) for r in snap.values())
     mm_z = sum(int(r["pass_tol"] and r["pass_zero"]) for r in mm.values())
@@ -322,6 +381,8 @@ def score_p3_p4(recs, exponents):
     print(f"    snapshot {snap_pass} feasible of {n_inst} instances "
           f"({len(snap)} plans produced, {snap_pass/len(snap):.1%} of them feasible)")
     print(f"    at zero tolerance: mean-map {mm_z}, snapshot {snap_z}")
+    print(f"    margin: mean-map minus snapshot {mm_pass - snap_pass:+d} at the "
+          f"registered tolerance, {mm_z - snap_z:+d} at zero")
     print(f"    clause 1: {'PASS' if mm_pass > snap_pass else 'FAIL'} at the "
           f"registered tolerance, "
           f"{'PASS' if mm_z > snap_z else 'FAIL'} at zero")
@@ -513,11 +574,11 @@ def main():
         recs = {}
         for ei, tag in enumerate(core_tags):
             recs[tag] = collect(site, P.DATA / "work" / "sweep", "", tag, rover,
-                                CO.TOLERANCE_H, ei, CO.draw, (CORE_BEST_EXPONENT,))
+                                CO.TOLERANCE_H, ei, CO.draw, exps)
             print(f"  core {tag}: td {outcome(recs[tag], 'td')}, "
                   f"snap {outcome(recs[tag], 'snap')}", flush=True)
         score_p2("the core, tolerance 2 h, 1440 instances", recs)
-        score_p3_p4(recs, (CORE_BEST_EXPONENT,))
+        score_p3_p4(recs, exps)
 
     if "p2axis" in parts:
         # The registered fallback scores P2 at 0.5 and 2 h only. The 0.5 h point
@@ -553,6 +614,9 @@ def main():
                                     tag, rover, 2.0, ei, AX.draw, exps)
             rate_recs[rate] = recs
             print(f"  rate {rate:.0f} collected", flush=True)
+        for rate, recs in rate_recs.items():
+            print(recon_report(recs, exps).replace(
+                "  reconstruction", f"  {rate:.0f} m/hr: reconstruction"))
         score_p7(rate_recs, exps)
     return 0
 
