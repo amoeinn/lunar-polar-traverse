@@ -122,7 +122,7 @@ def frames(tmp_path_factory):
                         out / "map", pc=sel["pair_contingency"], p3=p3)
     finally:
         mp.undo()
-    return dict(got=got, tag=tag, instance=instance,
+    return dict(got=got, tag=tag, instance=instance, rows=rows,
                 litm=np.load(stack["lit_path"], mmap_mode="r"))
 
 
@@ -186,3 +186,15 @@ def test_no_plotted_line_crosses_a_note_in_any_frame(frames):
         assert len(c["notes"]) == 2, c["notes"]
         for text, hits in c["notes"]:
             assert hits == [], (c["frame"], text, hits)
+
+
+def test_the_zoom_panel_draws_the_window_the_sidecar_reports(frames):
+    """Protects the window width a caption quotes from the sidecar against the
+    width actually drawn: subject_geometry and every rendered frame's zoom axes
+    must agree, at the exponent the frames were rendered with."""
+    rows = frames["rows"]
+    g = D.subject_geometry(frames["tag"], rows, rows["mm_kind"])
+    for c in frames["got"]:
+        (x0, x1), (y0, y1) = c["xlim"], c["ylim"]
+        assert (x1 - x0) * 1000.0 == pytest.approx(g["zoom_window_m"])
+        assert (y1 - y0) * 1000.0 == pytest.approx(g["zoom_window_m"])

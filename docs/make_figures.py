@@ -2,14 +2,18 @@
 
 Nothing here draws a new claim. Each figure is a crop or a downscale of
 something a committed script already produced, so the full sequences stay out of
-the repository and these stand in for them. Run after the pipeline, from the
-repository root:
+the repository and these stand in for them. Which frames become stills, and what
+their captions say, is read from the demo's sidecar (data/work/demo/sidecar.json)
+rather than typed in: a frame index written here as a literal kept pointing at
+the previous subject's firing after the subject changed. Run after the
+pipeline, from the repository root:
 
     .venv/bin/python docs/make_figures.py
 
 Inputs are listed per figure below and the script names the missing ones rather
 than leaving a stale file in place.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -18,28 +22,75 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 DEMO = ROOT / "data" / "work" / "demo"
+SIDECAR = DEMO / "sidecar.json"
 DOCS = Path(__file__).resolve().parent
 
 # The hero: the region panel alone, animated over the traverse. Cropped from the
 # 2D sequence rather than rendered again, so it is the same pixels the demo
 # produced. The crop is derived from the figure geometry in demo_traverse rather
 # than typed in, with a margin for the panel title and the axis labels, and
-# stopping short of the figure header, which is wider than this crop.
-HERO_STRIDE = 2            # 112 frames at 0.25 h -> 56 at 0.5 h
+# stopping short of the figure header, which is wider than this crop. Every
+# frame is used if the file stays under HERO_MAX_BYTES, otherwise every second.
+HERO_STRIDES = (1, 2)
+HERO_MAX_BYTES = 3 * 1024 * 1024
 HERO_WIDTH = 460           # readable at README width without a click
 HERO_MS = 130              # per frame
 HERO_MARGIN = (24, 40, 44, 26)   # top, bottom, left, right, in source pixels
 
-FIGURES = (
-    ("dashboard.png", DEMO / "map" / "frame0028.png", 1,
-     "the full 2D view at t = +7.00 h, the frame where the bounded rule fires"),
-    ("epochs.png", DEMO / "panel_r4_epochs.png", 2,
-     "all twelve epochs, no selection"),
-    ("executive.png", DEMO / "panel_r3_false_alarm.png", 2,
-     "the executive on R3, with and without the B3b-lit correction"),
-    ("gazebo.png", DEMO / "gz" / "gz0029.png", 2,
-     "the Gazebo view at t = +7.25 h, rover on a dark cell"),
-)
+
+def dashboard_frame(tl):
+    """The first frame strictly after the bounded rule's first firing.
+
+    A firing falls between frames; the first frame after it is the first one
+    that can show it. Returns (frame index, frame time, firing time)."""
+    fires = tl["executive_firings_h"]
+    if not fires:
+        raise SystemExit("the sidecar records no firing; the dashboard still has "
+                         "no frame to show one")
+    f = min(fires)
+    t = np.asarray(tl["frame_times_h"], float)
+    after = np.flatnonzero(t > f)
+    if after.size == 0:
+        raise SystemExit(f"no frame after the firing at {f:.3f} h")
+    k = int(after[0])
+    return k, float(t[k]), float(f)
+
+
+def gazebo_frame(tl):
+    """A frame inside the world's longest dark run with the rover on a cell our
+    model calls dark: the middle such frame. Returns (frame index, frame time,
+    (run start, run end, run shadow))."""
+    runs = tl["world_dark_runs_h"]
+    if not runs:
+        raise SystemExit("the sidecar records no dark run on the world's trajectory")
+    a, b, s = max(runs, key=lambda r: r[2])
+    t = np.asarray(tl["frame_times_h"], float)
+    dark = ~np.asarray(tl["rover_cell_lit"], bool)
+    inside = np.flatnonzero((t > a) & (t < b) & dark)
+    if inside.size == 0:
+        raise SystemExit(f"no frame inside the dark run {a:.3f} to {b:.3f} h has "
+                         f"the rover on a cell the model calls dark")
+    k = int(inside[inside.size // 2])
+    return k, float(t[k]), (float(a), float(b), float(s))
+
+
+def figures(side):
+    """(name, source, downscale, caption) for every still, from the sidecar."""
+    tl = side["timeline"]
+    kd, td, fire = dashboard_frame(tl)
+    kg, tg, (a, b, s) = gazebo_frame(tl)
+    return (
+        ("dashboard.png", DEMO / "map" / f"frame{kd:04d}.png", 1,
+         f"the full 2D view at t = +{td:.2f} h, the first frame after the bounded "
+         f"rule fires at {fire:.3f} h"),
+        ("epochs.png", DEMO / "panel_r4_epochs.png", 2,
+         "all twelve epochs, no selection"),
+        ("executive.png", DEMO / "panel_r3_false_alarm.png", 2,
+         "the executive on R3, with and without the B3b-lit correction"),
+        ("gazebo.png", DEMO / "gz" / f"gz{kg:04d}.png", 2,
+         f"the Gazebo view at t = +{tg:.2f} h, inside the world's {s:.2f} h dark "
+         f"run from {a:.2f} to {b:.2f} h, rover on a cell the model calls dark"),
+    )
 
 
 def box_downscale(a, k):
@@ -73,14 +124,11 @@ def region_crop_box(shape):
             int(round((x0 + dx) * w)) + right)
 
 
-def make_hero(dst):
+def write_hero(frames, dst, stride):
     from PIL import Image
-    frames = sorted((DEMO / "map").glob("frame*.png"))
-    if not frames:
-        return None
     r0, r1, c0, c1 = region_crop_box(read_rgb(frames[0]).shape)
     out = []
-    for f in frames[::HERO_STRIDE]:
+    for f in frames[::stride]:
         a = read_rgb(f)[r0:r1, c0:c1]
         k = max(1, int(round(a.shape[1] / HERO_WIDTH)))
         a = box_downscale(a, k)
@@ -94,10 +142,29 @@ def make_hero(dst):
     return len(out), out[0].size
 
 
+def hero_stride(size_at, strides=HERO_STRIDES, limit=HERO_MAX_BYTES):
+    """The first stride whose file is under the limit, else the last tried.
+    size_at(stride) writes the file and returns its size in bytes."""
+    for s in strides:
+        b = size_at(s)
+        if b <= limit:
+            return s, b
+    return s, b
+
+
 def main():
-    missing = [str(s) for _, s, _, _ in FIGURES if not s.exists()]
-    if not sorted((DEMO / "map").glob("frame*.png")):
-        missing.append(str(DEMO / "map" / "frame*.png"))
+    if not SIDECAR.exists():
+        print(f"missing {SIDECAR}; run examples/demo_traverse.py first")
+        return 1
+    side = json.loads(SIDECAR.read_text())
+    frames = sorted((DEMO / "map").glob("frame*.png"))
+    n_side = len(side["timeline"]["frame_times_h"])
+    if len(frames) != n_side:
+        print(f"demo/map holds {len(frames)} frames and the sidecar {n_side}; "
+              f"they are not one run")
+        return 1
+    figs = figures(side)
+    missing = [str(s) for _, s, _, _ in figs if not s.exists()]
     if missing:
         print("missing inputs; run the pipeline first:")
         for m in missing:
@@ -105,18 +172,27 @@ def main():
         return 1
 
     import matplotlib.image as mpimg
-    n, size = make_hero(DOCS / "hero.gif")
-    kb = (DOCS / "hero.gif").stat().st_size / 1024.0
-    print(f"  docs/hero.gif        {size[0]:5d} x {size[1]:4d}  {kb:7.1f} KB  "
-          f"{n} frames at {HERO_MS} ms, every {HERO_STRIDE} of the sequence")
+    dst = DOCS / "hero.gif"
+    shape = {}
 
-    for name, src, k, what in FIGURES:
+    def size_at(s):
+        shape["n"], shape["size"] = write_hero(frames, dst, s)
+        return dst.stat().st_size
+
+    stride, b = hero_stride(size_at)
+    cad = side["configuration"]["cadence_h"] * stride
+    every = "every frame" if stride == 1 else f"every {stride} of the sequence"
+    print(f"  docs/hero.gif        {shape['size'][0]:5d} x {shape['size'][1]:4d}  "
+          f"{b / 1024.0:7.1f} KB  {shape['n']} frames at {HERO_MS} ms, {every}, "
+          f"one per {cad:.2f} h of the traverse")
+
+    for name, src, k, what in figs:
         a = box_downscale(read_rgb(src), k)
         mpimg.imsave(DOCS / name,
                      (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8))
         kb = (DOCS / name).stat().st_size / 1024.0
         print(f"  docs/{name:16s} {a.shape[1]:5d} x {a.shape[0]:4d}  {kb:7.1f} KB"
-              f"  (1/{k} of source)  {what}")
+              f"  (1/{k} of source, {src.name})  {what}")
     return 0
 
 

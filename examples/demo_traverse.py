@@ -1296,12 +1296,126 @@ def draw_exec_traces(ax, traces):
     return fires
 
 
+def subject_routes(tag, rows, mm_kind):
+    """The subject's time-dependent plan, every planner's route in km, and the
+    planners whose route is the time-dependent one cell for cell."""
+    plan, _, _ = plan_at(replay_out(tag, "td"), rows["td"])
+    routes, same = {}, []
+    for key, kind in (("td", "td"), ("snap", "snap"), ("mm", mm_kind)):
+        if rows[key] is None:
+            continue
+        pl, _, _ = plan_at(replay_out(tag, kind), rows[key])
+        if key != "td" and pl.size == plan.size and bool((pl == plan).all()):
+            same.append(key)
+        x, y = cells_to_map(pl)
+        routes[key] = (x / 1000.0, y / 1000.0)
+    return plan, routes, same
+
+
+ZOOM_MIN_MARGIN_KM = 0.35
+ZOOM_MARGIN_FRACTION = 0.25
+
+
+def zoom_window(routes):
+    """The zoom panel's square window, km, fixed for the whole sequence so it
+    cannot be read as a camera following anything interesting. It holds every
+    route drawn, with a margin of ZOOM_MARGIN_FRACTION of their larger span or
+    ZOOM_MIN_MARGIN_KM, whichever is larger, on every side."""
+    allx = np.concatenate([routes[k][0] for k in routes])
+    ally = np.concatenate([routes[k][1] for k in routes])
+    span = max(np.ptp(allx), np.ptp(ally))
+    mx = max(ZOOM_MIN_MARGIN_KM, ZOOM_MARGIN_FRACTION * span)
+    cx, cy = (allx.min() + allx.max()) / 2, (ally.min() + ally.max()) / 2
+    half = span / 2 + mx
+    return (cx - half, cx + half), (cy - half, cy + half)
+
+
+def subject_window(tag, rows, mm_kind):
+    """The zoom window for the subject, over every route the panel draws. The
+    frames and the sidecar both take it from here, so the width a caption
+    quotes is the width drawn."""
+    _, routes, _ = subject_routes(tag, rows, mm_kind)
+    return zoom_window(routes)
+
+
+def subject_geometry(tag, rows, mm_kind):
+    """What a caption says about the subject's size and pace, for the sidecar.
+
+    start_to_goal_m: straight line between the plan's first and last cell
+    centres. route_extent_m: the plan's span in map x and y. zoom_window_m: the
+    width of the square window the zoom panel draws. total_wait_h: the sum of
+    the planner's holds on this plan, as handed to the checker; holds_over_1s
+    counts those longer than one second, since a sum of float residue is not a
+    wait.
+    """
+    plan, _, _ = subject_routes(tag, rows, mm_kind)
+    x, y = cells_to_map(plan)
+    zx, _ = subject_window(tag, rows, mm_kind)
+    _, waits, _ = plan_at(replay_out(tag, "td"), rows["td"])
+    return dict(start_to_goal_m=float(np.hypot(x[-1] - x[0], y[-1] - y[0])),
+                route_extent_m=[float(np.ptp(x)), float(np.ptp(y))],
+                zoom_window_m=float((zx[1] - zx[0]) * 1000.0),
+                total_wait_h=float(np.sum(waits)),
+                holds_over_1s=int(np.sum(waits > 1.0 / 3600.0)))
+
+
+def dark_runs(t, shadow):
+    """Every run of continuous shadow on a sampled trajectory, as
+    (start_h, end_h, shadow_h).
+
+    shadow is the accumulator that resets when lit, sampled at t. A run is a
+    maximal block of samples with shadow > 0. Its start is the first sample's
+    time minus that sample's accumulated shadow, which is when the darkness
+    began; its end is the last dark sample's time; shadow_h is the accumulator
+    there.
+    """
+    t, s = np.asarray(t, float), np.asarray(shadow, float)
+    idx = np.flatnonzero(s > 0)
+    if idx.size == 0:
+        return []
+    out = []
+    for r in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
+        out.append((float(t[r[0]] - s[r[0]]), float(t[r[-1]]), float(s[r[-1]])))
+    return out
+
+
+def rover_cell_lit(plan, tsteps, times, litm):
+    """Our lit mask at the rover's cell, per frame: what the Gazebo rover's
+    colour shows."""
+    return [bool(np.asarray(litm[k]).reshape(-1)[int(plan[step_at(tsteps, t)])])
+            for k, t in enumerate(times)]
+
+
+def timeline(tag, instance, rows, times, litm):
+    """The per-frame facts docs/make_figures.py chooses its stills by.
+
+    executive_firings_h: every firing of the bounded rule with no correction
+    stream, over every leg, from the committed run's logs. world_dark_runs_h:
+    the world's dark runs on leg 0, from the same run. rover_cell_lit: per
+    frame, as the Gazebo rover is coloured.
+    """
+    ep = rows["exec_plan_index"]
+    fires = []
+    for g in exec_legs("none", tag, ep):
+        fires.extend(float(x) for x in np.asarray(g["t"])[
+            np.asarray(g["fired"]).astype(bool)])
+    w = world_traj("none", tag, ep)
+    plan, _, _ = plan_at(replay_out(tag, "td"), rows["td"])
+    pt = planner_out(tag, "td")
+    lo, hi = int(pt["offsets"][instance]), int(pt["offsets"][instance + 1])
+    return dict(frame_times_h=[float(x) for x in times],
+                executive_firings_h=fires,
+                world_dark_runs_h=[list(r) for r in dark_runs(w["t"], w["shadow"])],
+                rover_cell_lit=rover_cell_lit(plan, pt["times"][lo:hi], times, litm))
+
+
 def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
                   pc=None, p3=None):
     """One PNG per sun-table sample. Six panels, each carrying a measured thing.
 
     Two map axes, because one cannot carry both facts: the region is 10.24 km and
-    this traverse is 560 m of it, so a single view either shows the shadows
+    a traverse is a few hundred metres of it (the subject's own extent is in the
+    sidecar, from subject_geometry), so a single view either shows the shadows
     sweeping and loses the route to four pixels, or shows the route and loses the
     sweep. Then the executive panel, which is the reason R3 selected this
     instance at all; the world's own continuous shadow; all twelve epochs, so one
@@ -1327,25 +1441,9 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
     off = pt["offsets"]
     lo, hi = int(off[instance]), int(off[instance + 1])
     tsteps = pt["times"][lo:hi]
-    routes, same = {}, []
-    for key, kind in (("td", "td"), ("snap", "snap"), ("mm", mm_kind)):
-        if rows[key] is None:
-            continue
-        pl, _, _ = plan_at(replay_out(tag, kind), rows[key])
-        if key != "td" and pl.size == plan.size and bool((pl == plan).all()):
-            same.append(key)
-        x, y = cells_to_map(pl)
-        routes[key] = (x / 1000.0, y / 1000.0)
+    _, routes, same = subject_routes(tag, rows, mm_kind)
     rx, ry = cells_to_map(plan)
-
-    # A square zoom window, fixed for the whole sequence, so it cannot be read as
-    # a camera following anything interesting.
-    allx = np.concatenate([routes[k][0] for k in routes])
-    ally = np.concatenate([routes[k][1] for k in routes])
-    mx = max(0.35, 0.25 * max(np.ptp(allx), np.ptp(ally)))
-    cx, cy = (allx.min() + allx.max()) / 2, (ally.min() + ally.max()) / 2
-    half = max(np.ptp(allx), np.ptp(ally)) / 2 + mx
-    zx, zy = (cx - half, cx + half), (cy - half, cy + half)
+    zx, zy = subject_window(tag, rows, mm_kind)
 
     dem = stack["dem"]
     i0 = int(np.clip((REGION_OY / 1000.0 - zy[1]) * 1000.0 / PX, 0, REGION_N - 1))
@@ -1400,7 +1498,7 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
         for q, (rect, lim, title) in enumerate((
                 (REGION_RECT, None, "the planning region, 10.24 km"),
                 (ZOOM_RECT, (zx, zy),
-                 f"the traverse, {2000 * half:.0f} m across"))):
+                 f"the traverse, {1000 * (zx[1] - zx[0]):.0f} m across"))):
             ax = fig.add_axes(rect)
             ax.set_facecolor("#07070a")
             ax.imshow(shown, cmap="gray", vmin=0.0, vmax=1.0, extent=ext_km,
@@ -1781,6 +1879,7 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
     work = outdir / "worlds"
     work.mkdir(parents=True, exist_ok=True)
     written = []
+    lit_at = rover_cell_lit(plan, tsteps, times, litm)
     for k, t in enumerate(times):
         step = step_at(tsteps, t)
         wx, wy, wz, yaw = rover_world_pose(plan, step, dem)
@@ -1792,8 +1891,7 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
             r, p_, y_ = look_at(cam, tgt)
             views.append((name, cam[0], cam[1], cam[2], r, p_, y_, fov,
                           VIEW_W, VIEW_H))
-        cell_lit = bool(litm[k].reshape(-1)[int(plan[step])])
-        shade = ROVER_RGB_LIT if cell_lit else ROVER_RGB_DARK
+        shade = ROVER_RGB_LIT if lit_at[k] else ROVER_RGB_DARK
         sdf = build(side["path"], "ours", texdir / f"tex{k:04d}.png", normal,
                     side["pos_z"], [0.0, 0.0, -1.0], [], None, "vertices",
                     side["h_range"], rover_sdf, (), (), (wx, wy, wz, yaw),
@@ -1833,7 +1931,7 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
         fig.text(0.012, 0.955, f"{tag}   instance {instance}   t = {t:+.2f} h   "
                  f"plan step {step + 1} of {plan.size}   "
                  f"{stack['lit_fraction'][k]:.2%} of the region lit   "
-                 f"this cell: {'LIT' if cell_lit else 'DARK'}",
+                 f"this cell: {'LIT' if lit_at[k] else 'DARK'}",
                  color="#9aa0aa", fontsize=10)
         fig.text(0.012, 0.925, f"display curve: brightness to the power "
                  f"{DISPLAY_GAMMA:.3f}, the same for every frame",
@@ -2262,7 +2360,10 @@ def main():
                      departure_h=dep, checker_arrival_h=arr,
                      checker_shadow_h=float(rep["shadow"][plan_index]),
                      checker_verdict=bool(rep["verdict"][plan_index]),
-                     plan_cells=int(plan.size)),
+                     plan_cells=int(plan.size),
+                     **subject_geometry(tag, rows, rows["mm_kind"])),
+        timeline=timeline(tag, instance, rows, times,
+                          np.load(stack["lit_path"], mmap_mode="r")),
         selection=sel, rows=rows,
         configuration=dict(v_flat=V_FLAT, budget_h=BUDGET_H,
                            cadence_h=CADENCE_H, frames=int(times.size),
