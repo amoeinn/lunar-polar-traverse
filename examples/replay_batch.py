@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 import examples.plan_pilot as P                                  # noqa: E402
 from examples.build_intervals import (DATES, HORIZON_H, PHASE_OFFSET_DAYS,  # noqa: E402
                                       cache_path)
+from src.arrival import arrival_gap, describe, summarise         # noqa: E402
 from src.cost import Rover, build_edges, legal                   # noqa: E402
 from src.frames import cell_position                             # noqa: E402
 from src.intervals import LitIntervals                           # noqa: E402
@@ -43,6 +44,19 @@ def fine_sun(tag):
     pos = sun_positions_m(ets, P.FRAME)
     sp.kclear()
     return pos
+
+
+def arrival_report(checker, planner):
+    """The batch's arrival agreement, signed.
+
+    This line used to print the median of abs(checker - planner) / planner,
+    which is how "+1.169%, checker slower" entered the record: a magnitude with
+    a predicted sign written beside it. It now reports the signed gap and the
+    count in each direction, and the magnitude only as a figure labelled as
+    having no sign.
+    """
+    s = summarise(arrival_gap(checker, planner))
+    return f"  arrival, (checker - planner) / planner: {describe(s)}"
 
 
 def main():
@@ -182,7 +196,7 @@ def main():
 
     # --- rejudge the batch under the registered tolerance ---
     tot_ok = tot = illegal_rej = shadow_rej = near_limit = 0
-    rel_all, over_all, pl_sh, ch_sh = [], [], [], []
+    chk_arr, pln_arr, over_all, pl_sh, ch_sh = [], [], [], [], []
     for tag, grp, _, suns in results:
         r2 = replay([b["cells"] for b in grp], [float(b["times"][0]) for b in grp],
                     grid, rover, suns, FINE_SUN_DT_H, args.tolerance, work,
@@ -201,8 +215,8 @@ def main():
             wr = np.abs(r2["step_roll"][lo:hi].astype(float))
             near_limit += int(np.sum((wp > rover.pitch_max - tol_deg)
                                      | (wr > rover.roll_max - tol_deg)))
-            rel_all.append(abs(r2["arrival"][i] - b["arrival"])
-                           / max(b["arrival"], 1e-9))
+            chk_arr.append(float(r2["arrival"][i]))
+            pln_arr.append(float(b["arrival"]))
             # the planner's own shadow rule along its own schedule
             s, s_max = 0.0, 0.0
             cpath, tpath = b["cells"], b["times"]
@@ -217,14 +231,12 @@ def main():
             pl_sh.append(s_max)
             ch_sh.append(float(r2["shadow"][i]))
             over_all.append(s_max - float(r2["shadow"][i]))
-    rel = np.array(rel_all)
     print(f"\nbatch judged under that tolerance: {tot_ok} of {tot} plans replay "
           f"feasible, {tot - tot_ok} rejected")
     print(f"  rejected for illegal steps {illegal_rej}, for shadow {shadow_rej}")
     print(f"  steps within the tolerance of a limit, which the tolerance decides: "
           f"{near_limit}")
-    print(f"  arrival agreement, checker against planner: median {np.median(rel):.3%}, "
-          f"p90 {np.percentile(rel,90):.3%}, max {rel.max():.3%}")
+    print(arrival_report(chk_arr, pln_arr))
 
     pl_sh, ch_sh, over = np.array(pl_sh), np.array(ch_sh), np.array(over_all)
     print(f"\nshadow conservatism, the planner's either-endpoint edge rule against "
