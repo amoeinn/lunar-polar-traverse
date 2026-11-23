@@ -374,10 +374,12 @@ honest statement is narrower than "it fixes the snapshot's mistakes", and
 narrower than this README first made it. Where the time dependent planner
 declines, it has proved there is no path in 33 cases and run out of search time
 in 81, and whether it would rescue any of the 81 is unresolved. Which way those
-81 would resolve is not measured. The one bound available is at another point
-and does not support guessing: at the 6 h tolerance the snapshot planner aborts
-on 113 of 160 instances, and since feasibility is monotone in the shadow
-tolerance, at least 67 of those 113 are feasible.
+81 would resolve is not measured, and nothing here bounds it. A different
+planner at a different budget shows only that this engine's aborts can hide
+feasible instances: at the 6 h tolerance the snapshot planner aborts on 113 of
+160, and since feasibility is monotone in the shadow tolerance, at least 67 of
+those 113 are feasible. That says nothing about the time dependent planner's 81
+at the core's 2 h.
 
 ```bash
 .venv/bin/python examples/demo_traverse.py --stage select
