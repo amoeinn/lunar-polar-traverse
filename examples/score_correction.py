@@ -148,6 +148,22 @@ def one(arg):
                 fired=fired_any, fired_warranted=fired_warranted)
 
 
+def paired_verdict(lost, control_fires, p, n_busts, host):
+    """The registered paired test's verdict for one arm.
+
+    VOID when the sample has no bust, since "zero busts lost" is then met by
+    every arm and the test checks only the controls and the false alarms. On
+    any host but the core the test as registered on 2026-10-05 is not the
+    registered test, so it is labelled as a comparison and decides nothing.
+    """
+    ok = lost == 0 and control_fires == 0 and p <= 0.05
+    if n_busts == 0:
+        return "VOID"
+    if host != "core":
+        return f"{'would pass' if ok else 'would fail'}, core test, not registered on {host}"
+    return "PASS" if ok else "FAIL"
+
+
 def mcnemar(b, c):
     n = b + c
     return sum(comb(n, k) for k in range(0, c + 1)) / 2 ** n if n else 1.0
@@ -217,9 +233,9 @@ def main():
         lost = sum(1 for k in mon if base[k]["busted"] and not cand[k]["fired"])
         cf = sum(1 for k in base if not base[k]["monitored"] and cand[k]["fired"])
         p = mcnemar(b, c)
-        ok = (lost == 0 and cf == 0 and p <= 0.05)
+        n_busts = sum(1 for k in mon if base[k]["busted"])
         print(f"  {nm:24s}{b:4d}{c:4d}{lost:12d}{cf:11d}{p:9.4f}  "
-              f"{'PASS' if ok else 'FAIL'}")
+              f"{paired_verdict(lost, cf, p, n_busts, args.host)}")
     print(f"\n  zero-busts-lost is now a live guard and not a formality: a lit")
     print(f"  mark lowers the forecast, so it can hide a real bust. Any arm")
     print(f"  above with busts lost > 0 fails on that alone.")

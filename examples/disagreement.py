@@ -53,10 +53,21 @@ HELD_OUT_STEMS = ("rate_core_0_", "rate_0_", "rate_1_", "rate_2_",
 
 
 def from_sample():
-    """The monitored set's own trajectories, already dumped by the run."""
+    """The monitored set's own trajectories, already dumped by the run.
+
+    results.json holds one record per plan per contradiction rule, and leg 0's
+    world is the checker on the unmodified plan, identical under both rules
+    (measured: 51 of 51 byte-identical on the corrected core). Each plan is
+    yielded once, or every episode would be counted twice.
+    """
+    seen = set()
     for r in json.loads(RESULTS.read_text()):
         if not r["monitored"]:
             continue
+        key = (r["tag"], r["plan_index"])
+        if key in seen:
+            continue
+        seen.add(key)
         w = Path(r["work"]) / "leg0_world"
         yield (r["tag"], r["graph"], r["plan"],
                np.fromfile(w / "out_traj_t.bin", np.float64),

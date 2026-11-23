@@ -54,6 +54,20 @@ BAR_MCC = 0.5
 RULES = (("unbounded", False), ("bounded", True))
 
 
+def verdict(ok, n_busts):
+    """A verdict on bars that are about catching busts.
+
+    With no bust in the sample, the miss bar is met by every rule, never-fire
+    included, and Matthews has no positive class to be computed on, so the bars
+    do not test anything. The verdict is then VOID, not PASS and not FAIL. That
+    is the corrected core: P8's bars were registered on four busts and it has
+    none.
+    """
+    if n_busts == 0:
+        return "VOID"
+    return "PASS" if ok else "FAIL"
+
+
 def sample(host=HOSTS["core"]):
     """Every instance of the host, with the plan, the schedule and the ground truth."""
     out = []
@@ -205,11 +219,11 @@ def side_by_side(by_rule, host=HOSTS["core"]):
         ("control firings", lambda c: f"{c['ctl']} of {n_ctl}"),
         ("", lambda c: ""),
         (f"bar 1  misses == {BAR_MISSES}",
-         lambda c: f"{c['fn']}  {'PASS' if c['fn'] <= BAR_MISSES else 'FAIL'}"),
+         lambda c: f"{c['fn']}  {verdict(c['fn'] <= BAR_MISSES, n_bust)}"),
         (f"bar 2  unnecessary <= {BAR_UNNECESSARY:.2f}",
-         lambda c: f"{c['unnec']:.4f}  {'PASS' if c['unnec'] <= BAR_UNNECESSARY else 'FAIL'}"),
+         lambda c: f"{c['unnec']:.4f}  {verdict(c['unnec'] <= BAR_UNNECESSARY, n_bust)}"),
         (f"bar 3  Matthews >= {BAR_MCC:.2f}",
-         lambda c: f"{c['mcc']:+.4f}  {'PASS' if c['mcc'] >= BAR_MCC else 'FAIL'}"),
+         lambda c: f"{c['mcc']:+.4f}  {verdict(c['mcc'] >= BAR_MCC, n_bust)}"),
         ("       Youden J, reported", lambda c: f"{c['j']:+.4f}"),
     ]
     for label, f in rows:
@@ -226,7 +240,12 @@ def side_by_side(by_rule, host=HOSTS["core"]):
                   f"not registered on {host['name']}: "
                   f"{'would pass' if ok else 'would fail'}")
             continue
-        print(f"\n  {name}: {'PASS' if ok else 'FAIL'} "
+        if n_bust == 0:
+            print(f"\n  {name}: VOID, no busts in the sample to catch; reported as "
+                  f"false-alarm cost only: {c['fp']} of {n_quiet} monitored plans "
+                  f"fired, {c['ctl']} of {n_ctl} controls")
+            continue
+        print(f"\n  {name}: {verdict(ok, n_bust)} "
               f"(all three bars required; misses {c['fn']}, unnecessary "
               f"{c['unnec']:.4f}, Matthews {c['mcc']:+.4f})")
 
@@ -245,12 +264,12 @@ def report(results):
     print(f"  {'did not fire':<26}{fn:>20}{tn:>12}")
     unnec = fp / (fp + tn) if (fp + tn) else float("nan")
     print(f"\n  misses {fn}  (bar: {BAR_MISSES}) -> "
-          f"{'PASS' if fn <= BAR_MISSES else 'FAIL'}")
+          f"{verdict(fn <= BAR_MISSES, tp + fn)}")
     print(f"  unnecessary-intervention rate {unnec:.4f} = {fp}/{fp+tn}  "
           f"(bar: at most {BAR_UNNECESSARY:.2f}) -> "
-          f"{'PASS' if unnec <= BAR_UNNECESSARY else 'FAIL'}")
+          f"{verdict(unnec <= BAR_UNNECESSARY, tp + fn)}")
     print(f"  Matthews {m:+.4f}  (bar: at least {BAR_MCC:.2f}, both constant "
-          f"predictors score 0.0000) -> {'PASS' if m >= BAR_MCC else 'FAIL'}")
+          f"predictors score 0.0000) -> {verdict(m >= BAR_MCC, tp + fn)}")
     print(f"  Youden J {j:+.4f}, reported beside it")
 
     cf = sum(r["fired"] for r in ctl)
