@@ -36,6 +36,10 @@ from src.intervals import CADENCE_H, LitIntervals                     # noqa: E4
 from src.replay import ReplaySettings, replay                         # noqa: E402
 
 SWEEP = ROOT / "data" / "work" / "sweep"
+# Recorded results the captions quote. Read, never restated: a caption that
+# carried its numbers as literals drew pre-fix figures over corrected data.
+SCORES = ROOT / "data" / "work" / "phase3_scores.json"
+C3_RECORD = ROOT / "data" / "work" / "gazebo" / "verify" / "c3.json"
 CORR = ROOT / "data" / "work" / "executive_correction"
 OUT = ROOT / "data" / "work" / "demo"
 
@@ -390,9 +394,9 @@ def field_stack(tag, times, path):
         mm[k] = f.astype(np.float32)
         # The mask is stored, not recovered from the field being positive. At
         # this epoch the sun is about a degree up and cos(incidence) clips to
-        # exactly zero on 153188 of 168873 lit cells, so "field > 0" would call
-        # 90.7% of the lit region dark and the picture would be the inverse of
-        # the model. The committed texture writer floors by the mask for the
+        # exactly zero on most lit cells (the map caption counts them per run),
+        # so "field > 0" would call most of the lit region dark and the picture
+        # would be the inverse of the model. The committed texture writer floors by the mask for the
         # same reason and this keeps that convention rather than re-deriving it.
         ml[k] = lit.reshape(n, n).astype(np.uint8)
         lit_frac[k] = float(lit.mean())
@@ -457,18 +461,56 @@ def step_at(times, t):
 # the 2D map view, which is the load-bearing artifact
 # --------------------------------------------------------------------------
 
-CAPTION = (
-    "Shadows are our illumination model's, not Gazebo's. The greyscale reads as "
-    "lit or dark rather than as brightness: at this sun elevation cos(incidence) "
-    "clips to zero on 153188 of 168873 lit cells, so most lit cells sit exactly "
-    "on the 0.25 floor and carry no shading.",
-    "The time-dependent planner does not arrive earlier: median +0.51% over the "
-    "182 cases where both plans are feasible, P3 clause 2 scored FAIL. At this "
-    "instance the snapshot planner returned the same route, cell for cell.",
-    "One epoch is one geometry. Frames are 15 min apart; a cell lit at two "
-    "consecutive samples can be dark between them, and the frame cadence cannot "
-    "resolve the 0.18 h the checker integrated.",
-)
+def p3_record(path=None):
+    """P3 as examples/score_phase3.py recorded it."""
+    path = SCORES if path is None else Path(path)
+    if not path.exists():
+        raise SystemExit(f"{path} is missing; the captions quote P3 from it. Run "
+                         f"examples/score_phase3.py --parts core,p2axis,p7")
+    return json.loads(path.read_text())["P3"]
+
+
+def c3_record(path=None):
+    """C3's measured figures as examples/verify_gazebo.py checkpointed them."""
+    path = C3_RECORD if path is None else Path(path)
+    d = json.loads(path.read_text()) if path.exists() else {}
+    if "C3" not in d.get("figures", {}):
+        raise SystemExit(f"{path} holds no C3 figures; run examples/verify_gazebo.py "
+                         f"--parts c3, which checkpoints them")
+    return d["figures"]["C3"]
+
+
+def p3_sentence(p3):
+    """P3 clause 2, its verdict read from the record and every number with it."""
+    c = p3["clause2"]
+    return (f"P3 clause 2 is scored {c['verdict']}: {c['at_margin']} of the {c['n']} "
+            f"cases where both plans are feasible arrive at least "
+            f"{p3['margin_required']:.0%} earlier, against "
+            f"{p3['share_required']:.0%} required; median improvement "
+            f"{c['median']:+.2%}.")
+
+
+def caption_lines(clip_zero, lit_cells, frames, p3, shadow_h, same_snap):
+    """The map frames' caption, every figure from the run or the record."""
+    most = "most" if 2 * clip_zero > lit_cells else "some"
+    if shadow_h < CADENCE_H:
+        res = (f"the frame cadence cannot resolve the {shadow_h:.2f} h of "
+               f"continuous shadow the checker integrated.")
+    else:
+        res = (f"the {shadow_h:.2f} h of continuous shadow the checker integrated "
+               f"spans several frames, and darkness shorter than a frame is not "
+               f"shown.")
+    return (
+        "Shadows are our illumination model's, not Gazebo's. The greyscale reads as "
+        f"lit or dark rather than as brightness: over the {frames} frames "
+        f"cos(incidence) clips to zero on {clip_zero} of {lit_cells} lit cell-frames, "
+        f"so {most} lit cells sit exactly on the {LIT_FLOOR:.2f} floor and carry no "
+        "shading.",
+        p3_sentence(p3) + (" At this instance the snapshot planner returned the "
+                           "same route, cell for cell." if same_snap else ""),
+        f"One epoch is one geometry. Frames are {CADENCE_H * 60:.0f} min apart; a "
+        f"cell lit at two consecutive samples can be dark between them, and " + res,
+    )
 
 C_TD, C_SNAP, C_MM, C_ROVER = "#36d7e0", "#ff9436", "#d86bff", "#ffe14d"
 
@@ -514,8 +556,12 @@ def route_rows(tag, instance):
     return out
 
 
-def panel_lines(tag, instance, rows, curves, same=()):
-    """The checker's own output for every planner, verbatim, as panel text."""
+def panel_lines(tag, instance, rows, curves, same=(), pc=None, p3=None):
+    """The checker's own output for every planner, verbatim, as panel text.
+
+    The pairing and P3 lines are read from the selection's contingency table and
+    the recorded P3 score, not written in.
+    """
     lines = [f"epoch {tag}   instance {instance}", ""]
     lines.append(f"{'planner':<14}{'verdict':>9}{'arrive':>9}{'shadow':>8}")
     for key, label, kind in (("td", "time-dependent", "td"),
@@ -534,15 +580,24 @@ def panel_lines(tag, instance, rows, curves, same=()):
     if c and c["first_over"] is not None:
         lines.append(f"over budget from step {c['first_over']}")
     if "snap" in same:
+        both_ok = all(rows[k] is not None and bool(replay_out(tag, kd)["verdict"][rows[k]])
+                      for k, kd in (("td", "td"), ("snap", "snap")))
         lines += ["", "the snapshot planner returned the SAME route,",
-                  "cell for cell, and the checker accepted both.",
-                  "On this core the two planners never disagree",
-                  "on feasibility: 178 of 181 shared pairs both",
-                  "accepted, 3 both rejected, 0 either way."]
-    lines += ["", "Arrival times agree to about half a percent.",
-              "P3 clause 2 is scored FAIL: the method does not",
-              "arrive earlier. What it does is decline to emit",
-              "plans it cannot certify."]
+                  "cell for cell" + (", and the checker accepted both."
+                                     if both_ok else ".")]
+    if pc is not None:
+        b = pc["both"]
+        n, split = sum(b.values()), b["ar"] + b["ra"]
+        lines += ["", f"paired on {n} shared pairs: {b['aa']} both",
+                  f"accepted, {b['rr']} both rejected, {split} one only."]
+        if split == 0:
+            lines += ["The planners never disagree on feasibility."]
+    if p3 is not None:
+        c = p3["clause2"]
+        lines += ["", f"P3 clause 2 is scored {c['verdict']}:",
+                  f"{c['at_margin']} of {c['n']} cases at least "
+                  f"{p3['margin_required']:.0%} earlier,",
+                  f"{p3['share_required']:.0%} required; median {c['median']:+.2%}."]
     return lines
 
 
@@ -579,7 +634,8 @@ def dark_clusters(litm, i0, i1, j0, j1, min_frames=1):
     return out
 
 
-def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110):
+def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
+                  pc=None, p3=None):
     """One PNG per sun-table sample. Six panels, each carrying a measured thing.
 
     Two map axes, because one cannot carry both facts: the region is 10.24 km and
@@ -657,7 +713,15 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110):
                 float(ex["lit"]["t"][-1]) if ex["lit"] is not None else 0.0)
     epochs_rows = select_r4()
 
-    lines = panel_lines(tag, instance, rows, curves, same)
+    p3 = p3_record() if p3 is None else p3
+    lines = panel_lines(tag, instance, rows, curves, same, pc, p3)
+    clip_zero = lit_cells = 0
+    for q in range(litm.shape[0]):
+        m = np.asarray(litm[q], bool)
+        lit_cells += int(m.sum())
+        clip_zero += int((m & (np.asarray(fields[q]) == 0)).sum())
+    caption = caption_lines(clip_zero, lit_cells, int(litm.shape[0]), p3,
+                            float(rep_td["shadow"][rows["td"]]), "snap" in same)
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     written = []
@@ -830,7 +894,7 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110):
                  f"{stack['lit_fraction'][k]:.2%} of the region lit   "
                  f"plan step {step + 1} of {plan.size}", color="#9aa0aa",
                  fontsize=10)
-        for q, line in enumerate(CAPTION):
+        for q, line in enumerate(caption):
             fig.text(0.025, 0.068 - q * 0.024, line, color="#7e848e", fontsize=7)
         out = outdir / f"frame{k:04d}.png"
         fig.savefig(out, facecolor=fig.get_facecolor())
@@ -888,28 +952,50 @@ ROVER_RGB_DARK = (0.10, 0.30, 1.00)
 # curve, so the legend matches the pixels rather than the material.
 SWATCH_LIT, SWATCH_DARK = "#fcfaac", "#badcfc"
 
-GZ_CAPTION = (
-    "Rendered by Gazebo; the illumination is OUR model written as an unlit "
-    "texture, and the scene's light casts no shadow. C3 measured 2.6039% of "
-    "texture pixels disagreeing with our own lit mask.",
-    "The rendered surface is not the DEM: it differs by a slope-dependent "
-    "amount, median +0.0577 m below 2.9 deg rising to +3.0844 m above 31 deg. "
-    "The mechanism is open and unexplained.",
+# Two caption lines that carry measurements made once and recorded in PLAN.md
+# rather than in a results file: the chassis box and the display curve's levels.
+# They are sun-independent or set by the 0.25 floor, and are not on the step 14
+# list of figures the corrections made stale; the rest are computed.
+GZ_ROVER_LINE = (
     "The rover's pose is commanded, not driven. Nothing here is a claim about "
     "mobility, slip or traction. Its only visual geometry is the 1.53 x 1.53 x "
-    "0.60 m chassis box; the mast and wheels carry sensor frames and no visual.",
+    "0.60 m chassis box; the mast and wheels carry sensor frames and no visual.")
+GZ_DISPLAY_LINE = (
     "Brightness is a single fixed cube-root display curve for the whole "
     "sequence, never per frame, so frames stay comparable: lit terrain renders "
-    "at 34 of 255 before it and 130 after.",
-    "The thin dark band along the far edge of the wide view is the texture's "
-    "own margin, not terrain: the heightmap is 513 samples and the planning "
-    "region is 500, so 13 rows and columns, 260 m, lie outside it and are "
-    "written dark rather than extrapolated.",
-    "A rendered cell can sit 7 to 9 m from where the model puts it, under half "
-    "a 20 m cell. Measured at nadir and obliquely by three instruments; it is "
-    "not the slope term and the mechanism is open. So the rover may appear at "
-    "the edge of its own dark cell. The 2D map view is unaffected.",
-)
+    "at 34 of 255 before it and 130 after.")
+
+
+def gz_caption_lines(c3):
+    """The Gazebo frames' caption: C3 from its checkpoint, the surface term from
+    verify_gazebo.SLOPE_BANDS, the placement offset from
+    verify_gazebo.TEXTURE_OFFSET_NADIR_M, the margin from the grid constants."""
+    from examples.verify_gazebo import SLOPE_BANDS, TEXTURE_OFFSET_NADIR_M
+    lo, hi = SLOPE_BANDS[0], SLOPE_BANDS[-1]
+    off = list(TEXTURE_OFFSET_NADIR_M.values())
+    margin = HEIGHTMAP_N - REGION_N
+    half = "under half" if max(off) < PX / 2 else "more than half"
+    return (
+        "Rendered by Gazebo; the illumination is OUR model written as an unlit "
+        "texture, and the scene's light casts no shadow. C3 measured "
+        f"{c3['positive_disagreement']:.4%} of texture pixels disagreeing with our "
+        "own lit mask.",
+        "The rendered surface is not the DEM: it differs by a slope-dependent "
+        f"amount, median {lo[2]:+.4f} m below {lo[1]:g} deg rising to "
+        f"{hi[2]:+.4f} m above {hi[0]:g} deg. The mechanism is open and unexplained.",
+        GZ_ROVER_LINE,
+        GZ_DISPLAY_LINE,
+        "The thin dark band along the far edge of the wide view is the texture's "
+        f"own margin, not terrain: the heightmap is {HEIGHTMAP_N} samples and the "
+        f"planning region is {REGION_N}, so {margin} rows and columns, "
+        f"{margin * PX:.0f} m, lie outside it and are written dark rather than "
+        "extrapolated.",
+        f"A rendered cell can sit {min(off):.1f} to {max(off):.1f} m from where the "
+        f"model puts it, {half} a {PX:.0f} m cell. Measured at nadir and obliquely "
+        "by three instruments; it is not the slope term and the mechanism is open. "
+        "So the rover may appear at the edge of its own dark cell. The 2D map view "
+        "is unaffected.",
+    )
 
 # Sits beside the chase view rather than in the caption block, because it is
 # about that panel alone.
@@ -1010,6 +1096,7 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
     side = json.loads((ROOT / "data" / "work" / "gazebo"
                        / "region_heightmap.json").read_text())
     normal = flat_normal_png(ROOT / "data" / "work" / "gazebo" / "flat_normal.png")
+    gz_caption = gz_caption_lines(c3_record())
     rep_td = replay_out(tag, "td")
     plan, _, _ = plan_at(rep_td, rows["td"])
     pt = planner_out(tag, "td")
@@ -1078,7 +1165,7 @@ def render_gazebo(tag, instance, times, stack, rows, texdir, outdir, rover_sdf,
         fig.text(0.012, 0.925, f"display curve: brightness to the power "
                  f"{DISPLAY_GAMMA:.3f}, the same for every frame",
                  color="#7e848e", fontsize=8)
-        for q, line in enumerate(GZ_CAPTION):
+        for q, line in enumerate(gz_caption):
             fig.text(0.012, 0.204 - q * 0.0285, line, color="#7e848e",
                      fontsize=7.0)
         # The legend is the point of the colours, so it states them rather than
@@ -1193,6 +1280,14 @@ def render_exec_panel(tag, plan_index, arms, title, out, dpi=120):
     return out
 
 
+def epoch_note(rows):
+    """R4's footnote, counted from the rows it draws."""
+    per = sorted((r.get("td_plans", 0) for r in rows), reverse=True)
+    return (f"Every epoch is drawn: R4 applies no selection. {sum(per[:3])} of the "
+            f"{sum(per)} feasible time-dependent instances come from three of these "
+            f"{len(rows)} epochs, which is why one traverse is not typical.")
+
+
 def render_epoch_panel(rows, out, dpi=120):
     """R4: all twelve epochs, no selection, from the stored sweep outputs."""
     import matplotlib
@@ -1226,10 +1321,7 @@ def render_epoch_panel(rows, out, dpi=120):
         a.tick_params(colors="#9aa0aa", labelsize=8)
         for sp in a.spines.values():
             sp.set_color("#30343c")
-    fig.text(0.01, 0.015, "Every epoch is drawn: R4 applies no selection. "
-             "165 of the 187 feasible time-dependent instances come from three "
-             "of these twelve epochs, which is why one traverse is not typical.",
-             color="#7e848e", fontsize=8)
+    fig.text(0.01, 0.015, epoch_note(rows), color="#7e848e", fontsize=8)
     fig.tight_layout(rect=(0, 0.035, 1, 1))
     fig.savefig(out, facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -1400,6 +1492,10 @@ def main():
         print(f"\nsidecar {OUT / 'sidecar.json'}")
         return 0
     tag, plan_index = subject["tag"], subject["plan_index"]
+    if "frames" in want:
+        p3_record()
+    if "gazebo" in want:
+        c3_record()
     rep = replay_out(tag, "td")
     plan, _, dep = plan_at(rep, plan_index)
     instance = planner_out(tag, "td")["index"][plan_index]
@@ -1464,7 +1560,7 @@ def main():
                         np.asarray(litm[k], bool), stack["peak"],
                         texdir / f"tex{k:04d}.png")
         got = render_frames(tag, instance, times, stack, rows, curves,
-                            OUT / "map")
+                            OUT / "map", pc=sel["pair_contingency"])
         print(f"  {len(got)} map frames and {times.size} textures written")
 
     if "panels" in want:

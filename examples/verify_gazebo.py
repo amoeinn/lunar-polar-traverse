@@ -274,6 +274,37 @@ SLOPE_BANDS = ((0.0, 2.9, 0.0577), (2.9, 5.7, 0.3919), (5.7, 11.3, 0.2723),
                (11.3, 19.3, 0.0626), (19.3, 31.0, 0.2624), (31.0, 90.0, 3.0844))
 
 
+# The illumination texture's placement error, measured 2026-10-06 (PLAN.md,
+# phase 7b) at nadir, where no height term can move a feature sideways: the
+# distance from where the model puts a dark cell to where it renders, metres.
+# The reconstruction's (i, j) offsets give |(-2.8, -8.6)| and |(-2.3, -7.4)|;
+# the pinhole centroid, with the reconstruction out of the loop, 8.53 and 7.31.
+# Sun-independent: it is a property of the heightmap and the texture mapping.
+TEXTURE_OFFSET_NADIR_M = dict(
+    rover_cell_reconstruction=float(np.hypot(2.8, 8.6)),
+    cluster_reconstruction=float(np.hypot(2.3, 7.4)),
+    rover_cell_centroid=8.53, cluster_centroid=7.31)
+
+# Figures a part measured, checkpointed beside its verdicts so that anything
+# quoting them reads the run rather than a copy (examples/demo_traverse.py).
+FIGURES = {}
+
+
+def constant_predictor_line(region_lit_fraction, patch_lit, patch_n):
+    """C3's base rate, from this run's own mask, at the region and on the patch.
+
+    The region figure is the definition the record has used, the share of the
+    region's cells in the majority state; the patch figure is the same on the
+    pixels the control actually compares. Computed, because a literal here
+    carried the pre-fix epoch's 62.9084% into the corrected run.
+    """
+    region = max(region_lit_fraction, 1.0 - region_lit_fraction)
+    patch = max(patch_lit, patch_n - patch_lit) / patch_n
+    return (f"    the best constant predictor scores {region:.4%} on this epoch's "
+            f"region and {patch:.4%} on these {patch_n} pixels, which is why the "
+            f"bar is on kappa"), region, patch
+
+
 def band_term(slope_deg):
     for lo, hi, v in SLOPE_BANDS:
         if lo <= slope_deg < hi:
@@ -1268,8 +1299,9 @@ def c3(h):
     print(f"    {'gazebo dark':<22}{c_:>12}{d_:>12}")
     print(f"    disagreement {neg_dis:.4%} of {n_} pixels, raw agreement "
           f"{po:.4%}")
-    print(f"    the best constant predictor on this epoch scores 62.9084%, "
-          f"which is why the bar is on kappa")
+    line, region_base, patch_base = constant_predictor_line(
+        float(np.asarray(lit, bool).mean()), a_ + c_, n_)
+    print(line)
     print(f"    Cohen's kappa {kappa:+.4f}, bar at most {C3_KAPPA_MAX}: "
           f"{'clears' if kappa <= C3_KAPPA_MAX else 'FAILS'}")
     print(f"    disagreement ratio against the positive check "
@@ -1279,6 +1311,10 @@ def c3(h):
     print(f"    the control {'has demonstrated' if ok else 'has NOT demonstrated'} "
           f"that Gazebo's shadows differ from ours")
     print(f"  C3 -> {'PASS' if ok else 'FAIL'}")
+    FIGURES["C3"] = dict(positive_disagreement=pos_dis, pixels=int(inside.sum()),
+                         negative_disagreement=neg_dis, kappa=float(kappa),
+                         ratio=float(ratio), constant_region=region_base,
+                         constant_patch=patch_base, verdict="PASS" if ok else "FAIL")
     return dict(C3=ok)
 
 
@@ -1456,6 +1492,7 @@ def run_part(name, fn, h, outdir, resume):
         tee.close()
     jpath.write_text(json.dumps(
         {"scores": scores,
+         "figures": {k: v for k, v in FIGURES.items() if k in scores},
          "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
         indent=2) + "\n")
     print(f"=== {name} checkpointed to {jpath.name} ===", flush=True)

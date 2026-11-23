@@ -88,7 +88,7 @@ def test_the_core_hands_every_exponent_to_collect_and_to_the_score(monkeypatch):
     monkeypatch.setattr(S, "collect", collect)
     monkeypatch.setattr(S, "score_p2", lambda *a, **k: None)
     monkeypatch.setattr(S, "score_p3_p4",
-                        lambda recs, exps: seen.__setitem__("score", tuple(exps)))
+                        lambda recs, exps: seen.__setitem__("score", tuple(exps)) or {})
     monkeypatch.setattr(sys, "argv", ["x", "--parts", "core"])
     S.main()
     assert seen["collect"] == {tuple(CO.EXPONENTS)}, seen

@@ -40,23 +40,26 @@ def test_selection_is_deterministic_with_the_registered_counts():
     # R1 is empty, and the count that empties it is the pairing clause, not the
     # 24 h clause. If a later run makes R1 non-empty, this fails and the record
     # has to be re-scored rather than quietly gaining a different demo.
-    assert c1["snap_plans"] == 322
-    assert c1["snap_rejected"] == 131
+    # Re-scored 2026-11-22 on the corrected sun and checker (PLAN.md, D132 step
+    # 16). Pre-fix: snapshot plans 322, rejected 131; R2 45 monitored, 4 busts,
+    # first 2028-02-15_p0 plan 27; R3 41 non-busts, 17 false alarms, 11 removed,
+    # first 2028-08-15_p2 plan 29.
+    assert c1["snap_plans"] == 343
+    assert c1["snap_rejected"] == 114
     assert c1["td_accepted_same_pair"] == 0
     assert l1 == [] and a1 is None
 
     a2, c2, l2 = D.select_r2()
     assert (a2, c2, l2) == D.select_r2()[:1] + D.select_r2()[1:]
-    assert c2 == dict(monitored=45, busts=4)
-    assert len(l2) == 4
-    assert a2 == dict(tag="2028-02-15_p0", plan_index=27)
+    assert c2 == dict(monitored=51, busts=0)
+    assert l2 == [] and a2 is None          # an empty R2, reported as empty
 
     a3, c3, l3 = D.select_r3()
     assert (a3, c3, len(l3)) == (D.select_r3()[0], D.select_r3()[1],
                                  len(D.select_r3()[2]))
-    assert c3 == dict(monitored_nonbust=41, false_alarms=17, removed_by_lit=11)
-    assert len(l3) == 11
-    assert a3 == dict(tag="2028-08-15_p2", plan_index=29)
+    assert c3 == dict(monitored_nonbust=51, false_alarms=34, removed_by_lit=17)
+    assert len(l3) == 17
+    assert a3 == dict(tag="2028-02-15_p0", plan_index=32)
 
 
 @needs_sweep
@@ -73,26 +76,29 @@ def test_the_subject_is_a_plan_the_checker_accepted():
     assert float(rep["shadow"][choice["plan_index"]]) <= D.BUDGET_H
 
 
-@needs_sweep
-def test_a_rejected_plan_is_refused_rather_than_rendered():
+def test_a_rejected_plan_is_refused_rather_than_rendered(monkeypatch):
     """Protects: the same, as behaviour rather than as a property of one choice.
 
-    R2's bust is a plan the checker rejected. Handing it to the drive path must
-    raise, and the discriminating half of this test is the first assertion: the
-    fixture is only a fixture if the plan really is rejected, so that is checked
-    before the refusal is.
+    A plan the checker rejected handed to the drive path must raise. This is
+    about behaviour and not about the record, so the rejected plan is synthetic:
+    on the corrected core the checker rejects none of the 226 time-dependent
+    plans, and the test took R2's bust as its fixture until R2 became empty.
+    The discriminating half is the first assertion: the fixture is only a
+    fixture if the plan really is rejected, so that is checked before the
+    refusal is, and an accepted row beside it must not raise.
     """
-    bust, _, _ = D.select_r2()
-    rep = D.replay_out(bust["tag"], "td")
-    assert bool(rep["verdict"][bust["plan_index"]]) is False, \
+    import numpy as np
+    rep = dict(verdict=np.array([1, 0], np.uint8),
+               shadow=np.array([0.5, D.BUDGET_H + 0.75]),
+               illegal=np.array([-1, -1], np.int32))
+    monkeypatch.setattr(D, "replay_out", lambda tag, kind: rep)
+    assert bool(rep["verdict"][1]) is False, \
         "the fixture must be a rejected plan or this test proves nothing"
-    assert float(rep["shadow"][bust["plan_index"]]) > D.BUDGET_H
+    assert float(rep["shadow"][1]) > D.BUDGET_H
 
     with pytest.raises(SystemExit, match="checker rejected"):
-        D.assert_drivable(bust["tag"], bust["plan_index"])
-
-    ok, _, _ = D.select_r3()
-    D.assert_drivable(ok["tag"], ok["plan_index"])    # must not raise
+        D.assert_drivable("synthetic", 1)
+    D.assert_drivable("synthetic", 0)                 # must not raise
 
 
 @needs_sweep

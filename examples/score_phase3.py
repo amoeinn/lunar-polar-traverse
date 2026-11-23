@@ -312,7 +312,7 @@ def score_p2(name, recs, duration_key="claimed"):
           f"of {len(snap)} plans (traverse from the planner's own arrival)")
     if not elig:
         print("  clause 1: VACUOUS, no eligible case")
-        return
+        return dict(point=name, verdict="VACUOUS", eligible=0)
     bad = [r for r in elig if not r["pass_tol"]]
     bad0 = [r for r in elig if not r["pass_zero"]]
     frac = len(bad) / len(elig)
@@ -352,8 +352,12 @@ def score_p2(name, recs, duration_key="claimed"):
           f"p {pv:.3g} (reported, not part of the criterion)")
     print(f"  clause 2 (non-decreasing across quartiles): "
           f"{'PASS' if ok else 'FAIL'}")
-    print(f"  P2 at {name}: {'PASS' if (frac >= P2_MIN_INFEASIBLE and ok) else 'FAIL'}"
-          f" (both clauses required)")
+    verdict = 'PASS' if (frac >= P2_MIN_INFEASIBLE and ok) else 'FAIL'
+    print(f"  P2 at {name}: {verdict} (both clauses required)")
+    return dict(point=name, verdict=verdict, eligible=len(elig), infeasible=len(bad),
+                fraction=frac, clause1="PASS" if frac >= P2_MIN_INFEASIBLE else "FAIL",
+                clause2="PASS" if ok else "FAIL", quartile_fractions=fr,
+                quartile_counts=[int((which == b).sum()) for b in range(4)])
 
 
 def score_p3_p4(recs, exponents):
@@ -390,6 +394,7 @@ def score_p3_p4(recs, exponents):
             and td[k]["pass_tol"] and mm[k]["pass_tol"]]
     print(f"  clause 2 set, both the mean-map and the time-dependent plan "
           f"feasible: {len(both)} cases")
+    clause2 = {}
     if not both:
         print("  clause 2: VACUOUS on 0 cases")
         p3 = None
@@ -402,10 +407,26 @@ def score_p3_p4(recs, exponents):
                   f"{int((imp >= P3_MIN_MARGIN).sum())}/{len(imp)} = {share:.1%} "
                   f"at or above {P3_MIN_MARGIN:.0%}; "
                   f"{'PASS' if share >= P3_MIN_SHARE else 'FAIL'}")
+            clause2[key] = dict(n=len(imp), median=float(np.median(imp)),
+                                at_margin=int((imp >= P3_MIN_MARGIN).sum()),
+                                share=share,
+                                verdict="PASS" if share >= P3_MIN_SHARE else "FAIL")
             if key == "claimed":
                 p3 = share >= P3_MIN_SHARE
-    print(f"  P3: {'PASS' if (mm_pass > snap_pass and p3) else 'FAIL'}"
-          f" (both clauses required)")
+    p3_verdict = 'PASS' if (mm_pass > snap_pass and p3) else 'FAIL'
+    print(f"  P3: {p3_verdict} (both clauses required)")
+    out = dict(P3=dict(verdict=p3_verdict, exponent_counts={str(e): counts[e]
+                                                            for e in exponents},
+                       exponent=best, margin_required=P3_MIN_MARGIN,
+                       share_required=P3_MIN_SHARE, instances=n_inst,
+                       clause1=dict(mean_map=mm_pass, snapshot=snap_pass,
+                                    margin=mm_pass - snap_pass,
+                                    mean_map_zero=mm_z, snapshot_zero=snap_z,
+                                    verdict="PASS" if mm_pass > snap_pass else "FAIL"),
+                       clause2=dict(clause2.get("claimed", {}),
+                                    verdict=clause2.get("claimed", {}).get(
+                                        "verdict", "VACUOUS"),
+                                    checked=clause2.get("checked"))))
 
     print("\n--- P4 ---")
     short = [(k, t, m) for k, t, m in both if t["claimed"] < P4_MAX_HOURS]
@@ -418,7 +439,8 @@ def score_p3_p4(recs, exponents):
           f"method's own output.")
     if not short:
         print(f"  P4: VACUOUS on 0 cases, not scoreable")
-        return
+        out["P4"] = dict(verdict="VACUOUS", n=0)
+        return out
     cells = np.array([t["cells"] for _, t, _ in short])
     print(f"  median path length {np.median(cells):.0f} cells "
           f"({np.median(cells)*20:.0f} m), reported as the registered vacuity "
@@ -432,6 +454,10 @@ def score_p3_p4(recs, exponents):
               f"{'PASS' if med < P4_MAX_DIFF else 'FAIL'}")
         if key == "claimed":
             print(f"  P4: {'PASS' if med < P4_MAX_DIFF else 'FAIL'}")
+            out["P4"] = dict(verdict="PASS" if med < P4_MAX_DIFF else "FAIL",
+                             n=len(diff), median=med, max=float(diff.max()),
+                             median_cells=float(np.median(cells)))
+    return out
 
 
 def feasible_set(recs, kind):
@@ -472,11 +498,13 @@ def score_p7(rate_recs, exponents):
     print(f"  cost of the intersection: per-rate replay-pass sets of "
           + ", ".join(f"{len(pass_sets[r])}" for r in rates)
           + f" collapse to {len(inter_pass)}")
+    result = dict(exponents={str(r): best[r] for r in rates})
     for setname, inter in (("replay-pass intersection", inter_pass),
                            ("planner-feasible intersection", inter_plan)):
         print(f"  on the {setname}, {len(inter)} cases:")
         if not inter:
             print("    not scoreable: the intersection is empty")
+            result[setname] = dict(n=0, verdict="NOT SCOREABLE")
             continue
         meds = {}
         for r in rates:
@@ -507,6 +535,9 @@ def score_p7(rate_recs, exponents):
         print(f"    P7 on this set: {'PASS' if (strict and ends) else 'FAIL'} at the "
               f"strict reading, {'PASS' if (weak and ends) else 'FAIL'} at the "
               f"non-increasing reading")
+        result[setname] = dict(n=len(inter), medians={str(r): meds[r] for r in rates},
+                               strict="PASS" if (strict and ends) else "FAIL",
+                               non_increasing="PASS" if (weak and ends) else "FAIL")
         # The registered criterion gives the baseline its best exponent at each
         # point, and that setting is not the same at every rate here, so part of
         # any rate-to-rate movement could be the baseline changing rather than
@@ -527,6 +558,7 @@ def score_p7(rate_recs, exponents):
             print(f"      e={e}: " + ", ".join(f"{x:+.4%}" for x in row)
                   + f"  strict {'PASS' if st else 'FAIL'}, "
                   f"non-increasing {'PASS' if wk else 'FAIL'}")
+    return result
 
 
 def censoring_report(site, stem, point, base):
@@ -555,9 +587,12 @@ def censoring_report(site, stem, point, base):
         print(f"  monotonicity bound from the 0.5 h point's {base['f']} feasible: "
               f"at least {hidden} feasible cases are hidden in the "
               f"{tot['a']} aborts, so the resolved set is not the whole set")
+    out = dict(point=point["label"], verdict="NOT SCOREABLE", feasible=tot["f"],
+               infeasible=tot["i"], aborted=tot["a"])
     print(f"  NOT SCOREABLE, as the registered fallback states: a prediction "
           f"about infeasibility rates cannot be scored on a table whose "
           f"infeasible column is {tot['i']} of {n} with {tot['a']} unresolved")
+    return out
 
 
 def main():
@@ -566,6 +601,7 @@ def main():
     args = ap.parse_args()
     parts = args.parts.split(",")
     site = Site()
+    scores = dict(P2=[])
     core_tags = [t for t, _, _ in epochs()]
     exps = CO.EXPONENTS
 
@@ -577,8 +613,8 @@ def main():
                                 CO.TOLERANCE_H, ei, CO.draw, exps)
             print(f"  core {tag}: td {outcome(recs[tag], 'td')}, "
                   f"snap {outcome(recs[tag], 'snap')}", flush=True)
-        score_p2("the core, tolerance 2 h, 1440 instances", recs)
-        score_p3_p4(recs, exps)
+        scores["P2"].append(score_p2("the core, tolerance 2 h, 1440 instances", recs))
+        scores.update(score_p3_p4(recs, exps))
 
     if "p2axis" in parts:
         # The registered fallback scores P2 at 0.5 and 2 h only. The 0.5 h point
@@ -598,10 +634,11 @@ def main():
                 base = {k: sum(x) for k, x in
                         zip(("f", "i", "a"),
                             zip(*[outcome(r, "snap") for r in recs.values()]))}
-                score_p2(f"the tolerance axis, {point['label']}, 160 instances",
-                         recs)
+                scores["P2"].append(score_p2(
+                    f"the tolerance axis, {point['label']}, 160 instances", recs))
             else:
-                censoring_report(site, f"tolerance_{pi}_", point, base)
+                scores["P2"].append(censoring_report(site, f"tolerance_{pi}_",
+                                                     point, base))
 
     if "p7" in parts:
         rate_recs = {}
@@ -617,8 +654,34 @@ def main():
         for rate, recs in rate_recs.items():
             print(recon_report(recs, exps).replace(
                 "  reconstruction", f"  {rate:.0f} m/hr: reconstruction"))
-        score_p7(rate_recs, exps)
+        scores["P7"] = score_p7(rate_recs, exps)
+    write_scores(scores, parts)
     return 0
+
+
+SCORES = ROOT / "data" / "work" / "phase3_scores.json"
+
+
+def write_scores(scores, parts, path=None):
+    """The verdicts and figures, for anything that quotes them.
+
+    Written only for a run of all three parts, so a partial run cannot leave a
+    file that looks complete. The P2 entries are per scored point; the
+    registration has no rule combining them and none is written here.
+    """
+    path = SCORES if path is None else Path(path)
+    if set(parts) != {"core", "p2axis", "p7"}:
+        print(f"\nnot writing {path.name}: only a run of every part records scores")
+        return None
+    import subprocess
+    import time
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    scores = dict(scores, head_commit=head,
+                  written_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    path.write_text(json.dumps(scores, indent=1, default=float) + "\n")
+    print(f"\nscores written to {path}")
+    return path
 
 
 if __name__ == "__main__":
