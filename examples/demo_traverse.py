@@ -634,6 +634,467 @@ def dark_clusters(litm, i0, i1, j0, j1, min_frames=1):
     return out
 
 
+LABEL_FONT = 6.2
+
+
+def cluster_text(cl):
+    """'76 cells: 8-50': the cluster's size and how many frames its cells are
+    dark in, lowest to highest. The format is stated once, in the legend
+    (CLUSTER_KEY), not in every label: written out in full, 26 labels on R3's
+    subject needed 37% of the panel at 6.2 pt and fitted only at 4.7 pt with
+    leaders across the route."""
+    cells = f"{cl['cells']} cell" + ("s" if cl["cells"] > 1 else "")
+    if cl["lo"] == cl["frames"]:
+        span = f"all {cl['frames']}"
+    elif cl["lo"] == cl["hi"]:
+        span = f"{cl['lo']}"
+    else:
+        span = f"{cl['lo']}-{cl['hi']}"
+    return f"{cells}: {span}"
+
+
+def cluster_key(frames):
+    # No wider than the legend's widest entry: a longer key widened the legend
+    # until no spot on the panel was clear of cells and routes.
+    return f"cells: frames dark, of {frames}"
+
+
+def _overlap(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _crosses(p, q, box):
+    """Whether segment p-q passes through the open rectangle box (Liang-Barsky)."""
+    (x0, y0), (dx, dy) = p, (q[0] - p[0], q[1] - p[1])
+    lo, hi = 0.0, 1.0
+    for pk, qk in ((-dx, x0 - box[0]), (dx, box[2] - x0),
+                   (-dy, y0 - box[1]), (dy, box[3] - y0)):
+        if pk == 0:
+            if qk <= 0:
+                return False
+            continue
+        t = qk / pk
+        if pk < 0:
+            lo = max(lo, t)
+        else:
+            hi = min(hi, t)
+        if lo >= hi:
+            return False
+    return True
+
+
+def _segments_cross(p, q, a, b):
+    """Proper intersection of segments p-q and a-b (shared endpoints excluded)."""
+    def orient(u, v, w):
+        return (v[0] - u[0]) * (w[1] - u[1]) - (v[1] - u[1]) * (w[0] - u[0])
+    d1, d2 = orient(a, b, p), orient(a, b, q)
+    d3, d4 = orient(p, q, a), orient(p, q, b)
+    return d1 * d2 < 0 and d3 * d4 < 0
+
+
+def _segment_hits(grid, p, q, skip=0.0):
+    """Whether segment p-q passes over a marked cell of grid, ignoring the first
+    `skip` (axes fraction) from p."""
+    g = grid.shape[0]
+    L = float(np.hypot(q[0] - p[0], q[1] - p[1]))
+    if L <= skip:
+        return False
+    t = np.linspace(skip / L, 1.0, int(L * g * 2) + 2)
+    j = np.clip((p[0] + t * (q[0] - p[0])) * g, 0, g - 1).astype(int)
+    i = np.clip((p[1] + t * (q[1] - p[1])) * g, 0, g - 1).astype(int)
+    return bool(grid[i, j].any())
+
+
+LABEL_GRID = 256
+
+
+def label_obstacles(ax, cells_km=(), cell_m=PX, lines_km=(), avoid=(), grid=LABEL_GRID,
+                    line_px=6.0):
+    """Where on the axes a label may not sit, and where a leader may not run,
+    as two grids over axes fraction: (box, lead).
+
+    A label may not sit on a labelled dark cell (it would hide what it names), on
+    a plotted route sample widened by line_px points (enough to clear the
+    rover's marker as it moves), or on any artist in `avoid` (the legend). A
+    leader may cross dark cells, but not a route or the legend.
+    """
+    r = ax.figure.canvas.get_renderer()
+    axb = ax.get_window_extent(r)
+    occ = np.zeros((grid, grid), bool)
+    lead = np.zeros((grid, grid), bool)
+
+    def mark(fx0, fy0, fx1, fy1, also_lead=False):
+        j0, j1 = int(np.floor(fx0 * grid)), int(np.ceil(fx1 * grid))
+        i0, i1 = int(np.floor(fy0 * grid)), int(np.ceil(fy1 * grid))
+        sl = (slice(max(i0, 0), max(min(i1, grid), 0)),
+              slice(max(j0, 0), max(min(j1, grid), 0)))
+        occ[sl] = True
+        if also_lead:
+            lead[sl] = True
+
+    def to_frac(x, y):
+        p = ax.transData.transform(np.column_stack([x, y]))
+        return (p[:, 0] - axb.x0) / axb.width, (p[:, 1] - axb.y0) / axb.height
+    if len(cells_km):
+        c = np.asarray(cells_km, float)
+        h = cell_m / 2000.0
+        fx0, fy0 = to_frac(c[:, 0] - h, c[:, 1] - h)
+        fx1, fy1 = to_frac(c[:, 0] + h, c[:, 1] + h)
+        for v in zip(fx0, fy0, fx1, fy1):
+            mark(*v)
+    wpx = line_px * ax.figure.dpi / 72.0
+    hx, hy = wpx / axb.width, wpx / axb.height
+    for xs, ys in lines_km:
+        xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+        # Resampled so a long straight segment is marked along its length too.
+        d = np.hypot(np.diff(xs), np.diff(ys))
+        u = np.concatenate([[0.0], np.cumsum(d)])
+        n = max(2, int(u[-1] / max(1e-9, (ax.get_xlim()[1] - ax.get_xlim()[0]))
+                       * grid * 2) + 2)
+        uu = np.linspace(0.0, u[-1], n)
+        fx, fy = to_frac(np.interp(uu, u, xs), np.interp(uu, u, ys))
+        for x_, y_ in zip(fx, fy):
+            mark(x_ - hx, y_ - hy, x_ + hx, y_ + hy, also_lead=True)
+    for art in avoid:
+        bb = art.get_window_extent(r)
+        mark((bb.x0 - axb.x0) / axb.width, (bb.y0 - axb.y0) / axb.height,
+             (bb.x1 - axb.x0) / axb.width, (bb.y1 - axb.y0) / axb.height,
+             also_lead=True)
+    return occ, lead
+
+
+def _free(occ, box):
+    g = occ.shape[0]
+    j0, j1 = int(np.floor(box[0] * g)), int(np.ceil(box[2] * g))
+    i0, i1 = int(np.floor(box[1] * g)), int(np.ceil(box[3] * g))
+    if j0 < 0 or i0 < 0 or j1 > g or i1 > g:
+        return False
+    return not occ[i0:i1, j0:j1].any()
+
+
+def _mark_box(occ, box):
+    g = occ.shape[0]
+    j0, j1 = max(int(np.floor(box[0] * g)), 0), min(int(np.ceil(box[2] * g)), g)
+    i0, i1 = max(int(np.floor(box[1] * g)), 0), min(int(np.ceil(box[3] * g)), g)
+    occ[i0:i1, j0:j1] = True
+
+
+def _mark_segment(occ, p, q):
+    g = occ.shape[0]
+    n = int(np.hypot(q[0] - p[0], q[1] - p[1]) * g * 2) + 2
+    t = np.linspace(0.0, 1.0, n)
+    j = np.clip((p[0] + t * (q[0] - p[0])) * g, 0, g - 1).astype(int)
+    i = np.clip((p[1] + t * (q[1] - p[1])) * g, 0, g - 1).astype(int)
+    occ[i, j] = True
+
+
+def _clear_boxes(occ, w, h):
+    """Boolean grid over box lower-left corners: True where a w x h box (axes
+    fraction) at that corner holds no occupied cell. Summed-area table, so every
+    position is tested at once."""
+    g = occ.shape[0]
+    sat = np.zeros((g + 1, g + 1), np.int32)
+    sat[1:, 1:] = occ.cumsum(0).cumsum(1)
+    bw, bh = int(np.ceil(w * g)) + 1, int(np.ceil(h * g)) + 1
+    if bw > g or bh > g:
+        return np.zeros((0, 0), bool), bw, bh
+    tot = sat[bh:, bw:] - sat[:-bh, bw:] - sat[bh:, :-bw] + sat[:-bh, :-bw]
+    return tot == 0, bw, bh
+
+
+def _leaders_clear(p, cx, cy, lead, boxes, leaders, samples=64):
+    """For candidate leaders from p to each (cx, cy): True where the leader
+    passes over no marked cell of lead (sampled), through no box in boxes, and
+    across no leader in leaders. A filter, vectorised over every candidate; the
+    exact checks run after it on what survives."""
+    g = lead.shape[0]
+    ok = np.ones(cx.shape, bool)
+    t = np.linspace(0.0, 1.0, samples)[None, :]
+    xs = p[0] + t * (cx[:, None] - p[0])
+    ys = p[1] + t * (cy[:, None] - p[1])
+    ok &= ~lead[np.clip((ys * g).astype(int), 0, g - 1),
+                np.clip((xs * g).astype(int), 0, g - 1)].any(axis=1)
+    dx, dy = cx - p[0], cy - p[1]
+    for b in boxes:
+        lo, hi = np.zeros(cx.shape), np.ones(cx.shape)
+        dead = np.zeros(cx.shape, bool)
+        for pk, qk in ((-dx, p[0] - b[0]), (dx, b[2] - p[0]),
+                       (-dy, p[1] - b[1]), (dy, b[3] - p[1])):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                tt = qk / pk
+            zero = pk == 0
+            dead |= zero & (qk <= 0)
+            lo = np.where(~zero & (pk < 0), np.maximum(lo, tt), lo)
+            hi = np.where(~zero & (pk > 0), np.minimum(hi, tt), hi)
+        ok &= ~(~dead & (lo < hi))
+    for a, b in leaders:
+        def orient(ux, uy, vx, vy, wx, wy):
+            return (vx - ux) * (wy - uy) - (vy - uy) * (wx - ux)
+        d1 = orient(a[0], a[1], b[0], b[1], p[0], p[1])
+        d2 = orient(a[0], a[1], b[0], b[1], cx, cy)
+        d3 = orient(p[0], p[1], cx, cy, a[0], a[1])
+        d4 = orient(p[0], p[1], cx, cy, b[0], b[1])
+        ok &= ~((d1 * d2 < 0) & (d3 * d4 < 0))
+    return ok
+
+
+def plan_cluster_labels(ax, clusters, obst=None, fontsize=LABEL_FONT, pad=0.006,
+                        margin=0.008, max_leader=0.35):
+    """Where every cluster's label goes: (fontsize, [box per cluster]) in axes
+    fraction, none overlapping, none on an obstacle, no leader through a label.
+
+    The first placement offset each label a fixed distance from its cluster,
+    which on R3's subject (26 clusters) stacked labels on one another; a second,
+    two columns at the panel edges, kept the text apart but laid the left column
+    over the clusters it named and ran leader arrows through other labels. Here
+    each label goes to the clear position nearest its cluster: clear of the obstacles
+    (dark cells, routes, legend, from label_obstacles), of every label already
+    placed, padded, and of every leader already drawn, and with its own leader
+    through no placed label, no route, not the legend and across no other
+    leader. A label is kept within max_leader (axes fraction) of its cluster,
+    since a longer leader is a poor label, and the leader conditions are
+    applied to every candidate at once before the nearest survivor is checked
+    exactly: looping over candidates one by one took two minutes on a crowded
+    panel, and capping that loop at the nearest 600 cut off every legal spot
+    for a cluster whose near side lay across the route. Every grid position is considered, not a fixed set
+    of offsets. Two orders are tried, largest cluster first and most crowded
+    first, each with any label that found no place moved to the front, then
+    smaller text; if nothing fits it raises rather than overlap.
+    The obstacles do not change between frames, so this runs once per render.
+    """
+    if not clusters:
+        return fontsize, []
+    r = ax.figure.canvas.get_renderer()
+    axb = ax.get_window_extent(r)
+    g = LABEL_GRID
+    occ, lead = _obstacles(obst)
+    edge = np.ones((g, g), bool)
+    m = int(np.ceil(margin * g))
+    edge[m:g - m, m:g - m] = False
+    texts = [cluster_text(cl) for cl in clusters]
+    pos = []
+    for cl in clusters:
+        px_, py_ = ax.transData.transform((cl["x"], cl["y"]))
+        pos.append(((px_ - axb.x0) / axb.width, (py_ - axb.y0) / axb.height))
+    P_ = np.asarray(pos)
+    near = [(np.hypot(*(P_ - P_[q]).T) < 0.25).sum() for q in range(len(pos))]
+    orders = [sorted(range(len(pos)), key=lambda q: -clusters[q]["cells"]),
+              sorted(range(len(pos)), key=lambda q: (-near[q], -clusters[q]["cells"]))]
+
+    def attempt(fs, order):
+        wh = []
+        for txt in texts:
+            t = ax.text(0, 0, txt, fontsize=fs, transform=ax.transAxes)
+            bb = t.get_window_extent(r)
+            t.remove()
+            wh.append((bb.width / axb.width + 2 * pad, bb.height / axb.height + 2 * pad))
+        taken = occ | edge          # obstacles, placed labels (padded), leaders
+        # Each cluster's own point too: a centroid need not lie on a dark cell,
+        # and a label over one leaves that cluster no leader that misses it.
+        for p in pos:
+            _mark_box(taken, (p[0] - pad, p[1] - pad, p[0] + pad, p[1] + pad))
+        boxes, placed, leaders = [None] * len(pos), [], []
+        for q in order:
+            w, h = wh[q]
+            ok, bw, bh = _clear_boxes(taken, w, h)
+            ii, jj = np.nonzero(ok)
+            if ii.size == 0:
+                return q
+            x0, y0 = jj / g, ii / g
+            # distance from the cluster to the nearest point of each box
+            dx = np.maximum(np.maximum(x0 - pos[q][0], pos[q][0] - (x0 + w)), 0)
+            dy = np.maximum(np.maximum(y0 - pos[q][1], pos[q][1] - (y0 + h)), 0)
+            found = None
+            dist = np.hypot(dx, dy)
+            near_ = np.flatnonzero(dist <= max_leader)
+            cx_ = x0[near_] + w / 2
+            cy_ = y0[near_] + h / 2
+            keep = _leaders_clear(pos[q], cx_, cy_, lead, placed, leaders)
+            near_ = near_[keep]
+            for k in near_[np.argsort(dist[near_], kind="stable")]:
+                box = (x0[k] + pad, y0[k] + pad, x0[k] + w - pad, y0[k] + h - pad)
+                c = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+                if any(_crosses(pos[q], c, o) for o in placed):
+                    continue
+                if _segment_hits(lead, pos[q], c):
+                    continue
+                if any(_segments_cross(pos[q], c, a_, b_) for a_, b_ in leaders):
+                    continue
+                found = (box, c)
+                break
+            if found is None:
+                return q
+            box, c = found
+            boxes[q] = box
+            placed.append(box)
+            leaders.append((pos[q], c))
+            _mark_box(taken, (box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad))
+            _mark_segment(taken, pos[q], c)
+        return boxes
+
+    for fs in np.arange(fontsize, 4.3, -0.3):
+        for order in orders:
+            # A label that finds no place goes to the front and the layout is
+            # retried: clusters on the panel's edge have room on one side only,
+            # and labels placed earlier below them caught every leader.
+            for _ in range(3 * len(pos)):
+                got = attempt(float(fs), order)
+                if not isinstance(got, list):
+                    order = [got] + [q for q in order if q != got]
+                    continue
+                if not label_faults(got, pos, obst):
+                    return float(fs), got
+                break
+    raise RuntimeError(f"{len(clusters)} cluster labels do not fit the panel "
+                       f"without overlapping at any size down to 4.4 pt")
+
+
+def legend_anchor(ax, leg, obst, clusters, margin=0.012, pad=0.01):
+    """Lower-left corner, in axes fraction, for a legend that covers no dark
+    cell, route or cluster point: the clear position nearest any corner of the
+    axes. The legend must have loc='lower left' and borderaxespad=0 so the
+    anchor is its corner. Raises if nowhere is clear."""
+    r = ax.figure.canvas.get_renderer()
+    axb, bb = ax.get_window_extent(r), leg.get_window_extent(r)
+    w, h = bb.width / axb.width, bb.height / axb.height
+    occ = obst[0].copy()
+    g = occ.shape[0]
+    m = int(np.ceil(margin * g))
+    occ[:m, :] = occ[-m:, :] = occ[:, :m] = occ[:, -m:] = True
+    for cl in clusters:
+        px_, py_ = ax.transData.transform((cl["x"], cl["y"]))
+        fx, fy = (px_ - axb.x0) / axb.width, (py_ - axb.y0) / axb.height
+        _mark_box(occ, (fx - pad, fy - pad, fx + pad, fy + pad))
+    ok, _, _ = _clear_boxes(occ, w + 2 * pad, h + 2 * pad)
+    ii, jj = np.nonzero(ok)
+    if ii.size == 0:
+        raise RuntimeError("no position for the legend clear of cells and routes")
+    x0, y0 = jj / g + pad, ii / g + pad
+    d = np.min([np.hypot(x0 - cx, y0 - cy) for cx, cy in
+                ((0, 0), (1 - w, 0), (0, 1 - h), (1 - w, 1 - h))], axis=0)
+    k = int(np.argmin(d))
+    return float(x0[k]), float(y0[k])
+
+
+def _obstacles(obst):
+    g = LABEL_GRID
+    if obst is None:
+        return np.zeros((g, g), bool), np.zeros((g, g), bool)
+    return obst
+
+
+def draw_cluster_labels(ax, clusters, layout, obst=None):
+    """Draw a planned layout, then check what was drawn: the measured text
+    boxes go through label_faults again, and a fault raises."""
+    import matplotlib.text as mtext
+    fs, boxes = layout
+    if not clusters:
+        return []
+    r = ax.figure.canvas.get_renderer()
+    axb = ax.get_window_extent(r)
+    anns, pos = [], []
+    for cl, bx in zip(clusters, boxes):
+        anns.append(ax.annotate(
+            cluster_text(cl), xy=(cl["x"], cl["y"]),
+            xytext=((bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2),
+            textcoords="axes fraction", ha="center", va="center",
+            color="#e6e8ec", fontsize=fs, zorder=6,
+            bbox=dict(boxstyle="square,pad=0.15", fc="#07070a", ec="none",
+                      alpha=0.55),
+            arrowprops=dict(arrowstyle="->", color="#e6e8ec", lw=0.6, alpha=0.8,
+                            shrinkA=0, shrinkB=1)))
+        px_, py_ = ax.transData.transform((cl["x"], cl["y"]))
+        pos.append(((px_ - axb.x0) / axb.width, (py_ - axb.y0) / axb.height))
+    # An annotation's text transform is applied at draw time, so it is updated
+    # first: measured before that, every label read as one box off the axes.
+    drawn = []
+    for a in anns:
+        a.update_positions(r)
+        bb = mtext.Text.get_window_extent(a, r)
+        drawn.append(((bb.x0 - axb.x0) / axb.width, (bb.y0 - axb.y0) / axb.height,
+                      (bb.x1 - axb.x0) / axb.width, (bb.y1 - axb.y0) / axb.height))
+    bad = label_faults(drawn, pos, obst)
+    if bad:
+        raise RuntimeError(f"cluster labels drawn with faults: {bad[:5]}")
+    return anns
+
+
+def place_cluster_labels(ax, clusters, obst=None, **kw):
+    """Plan and draw in one call, for a single figure."""
+    return draw_cluster_labels(ax, clusters, plan_cluster_labels(ax, clusters, obst, **kw),
+                               obst)
+
+
+def label_faults(boxes, points, obst=None):
+    """Every way a set of drawn label boxes fails: two overlapping, one on an
+    obstacle, one over a cluster's point, one label's leader (its cluster to its
+    centre) through another label, across a route or the legend, or across
+    another leader. Empty when the layout is clean. Shared by the placer and its test."""
+    occ, lead = _obstacles(obst)
+    cen = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
+    bad = []
+    for a in range(len(boxes)):
+        if _segment_hits(lead, points[a], cen[a]):
+            bad.append(("leader on route or legend", a))
+        if not _free(occ, boxes[a]):
+            bad.append(("obstacle", a))
+        for b, p in enumerate(points):
+            if boxes[a][0] < p[0] < boxes[a][2] and boxes[a][1] < p[1] < boxes[a][3]:
+                bad.append(("covers", a, b))
+        for b in range(len(boxes)):
+            if a < b and _overlap(boxes[a], boxes[b]):
+                bad.append(("overlap", a, b))
+            if a != b and _crosses(points[a], cen[a], boxes[b]):
+                bad.append(("leader", a, b))
+            if a < b and _segments_cross(points[a], cen[a], points[b], cen[b]):
+                bad.append(("leaders cross", a, b))
+    return bad
+
+
+TRACE_Z, FIRE_Z = 4, 3
+
+
+def exec_legs(arm, tag, plan_index):
+    """Every leg's executive log for one arm, in order. A firing that replans
+    starts a new leg (leg1_exec, ...); reading leg 0 alone drops them."""
+    out = []
+    while True:
+        g = exec_log(arm, tag, plan_index, len(out))
+        if g is None:
+            return out
+        out.append(g)
+
+
+def draw_exec_traces(ax, traces):
+    """The forecast for every rule, every leg, every tick, all visible.
+
+    traces is [(arm, colour, label, legs)]. A leg that fires at its first tick
+    is one point, which a 3 px marker under a 12 px firing cross hid entirely:
+    the bounded rule on R3's subject fired at the first tick of both its legs.
+    So every tick carries a 5 px marker drawn above the firing marks, and the
+    firing marks are hollow so the tick shows through them. Returns the
+    firings, (arm, label, leg, t, forecast), in order.
+    """
+    fires = []
+    for arm, col, lab, legs in traces:
+        n = len(legs)
+        for q, g in enumerate(legs):
+            name = lab if n == 1 else f"{lab}: {n} legs, replanned after each firing"
+            ax.plot(g["t"], g["s_pred"], "-o", color=col, lw=1.6, ms=5,
+                    zorder=TRACE_Z, gid=arm,
+                    label=name if q == 0 else "_nolegend_")
+            hit = np.flatnonzero(np.asarray(g["fired"]).astype(bool))
+            if hit.size:
+                k = int(hit[0])
+                fires.append((arm, lab, q, float(g["t"][k]), float(g["s_pred"][k])))
+    for i, (arm, lab, q, ft, fs) in enumerate(fires):
+        ax.plot([ft], [fs], "X", mfc="none", mec=C_FIRE, mew=1.8, ms=14,
+                zorder=FIRE_Z, gid=f"fire:{arm}",
+                label=(f"control fires ({len(fires)}x), first at t={ft:.2f} h"
+                       if i == 0 else "_nolegend_"))
+    return fires
+
+
 def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
                   pc=None, p3=None):
     """One PNG per sun-table sample. Six panels, each carrying a measured thing.
@@ -695,22 +1156,20 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
     # nothing a viewer can see.
     cl_min = max(2, int(round(0.05 * litm.shape[0])))
     clusters = dark_clusters(litm, i0, i1, j0, j1, min_frames=cl_min)
+    nd = (~np.asarray(litm[:, i0:i1 + 1, j0:j1 + 1]).astype(bool)).sum(axis=0)
+    di, dj = np.nonzero(nd >= cl_min)
+    label_cells = np.column_stack(cell_to_map(di + i0, dj + j0)) / 1000.0
 
     # The executive, which is why R3 chose this instance. Read from the committed
     # five-arm run rather than recomputed.
-    ex = {a: exec_log(a, tag, rows["exec_plan_index"]) for a in ("none", "lit")}
+    ex = {a: exec_legs(a, tag, rows["exec_plan_index"]) for a in ("none", "lit")}
     wtr = world_traj("none", tag, rows["exec_plan_index"])
-    fire_t = fire_s = None
-    if ex["none"] is not None and ex["none"]["fired"].any():
-        k = int(np.flatnonzero(ex["none"]["fired"].astype(bool))[0])
-        fire_t, fire_s = float(ex["none"]["t"][k]), float(ex["none"]["s_pred"][k])
     wsh = wtr["shadow"]
     wrun = np.maximum.accumulate(wsh)
     # The time axes span the traverse and not the frames being rendered, so a
     # short run for a look shows the same trace the full sequence does.
-    t_end = max(float(wtr["t"][-1]),
-                float(ex["none"]["t"][-1]) if ex["none"] is not None else 0.0,
-                float(ex["lit"]["t"][-1]) if ex["lit"] is not None else 0.0)
+    t_end = max([float(wtr["t"][-1])] + [float(g["t"][-1]) for legs in ex.values()
+                                         for g in legs])
     epochs_rows = select_r4()
 
     p3 = p3_record() if p3 is None else p3
@@ -725,6 +1184,7 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     written = []
+    layout = obst = anchor = None
     for k, t in enumerate(times):
         img = np.asarray(fields[k], float)
         mask = np.asarray(litm[k], bool)
@@ -751,6 +1211,8 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
                             alpha=0.55 if key == "snap" else 1.0, label=lab)
             ax.plot([rx[step] / 1000.0], [ry[step] / 1000.0], "o", color=C_ROVER,
                     ms=10 if lim else 6, mec="#07070a", mew=1.2, label="rover")
+            if lim is not None and clusters:
+                ax.plot([], [], " ", label=cluster_key(int(litm.shape[0])))
             ax.plot([rx[0] / 1000.0], [ry[0] / 1000.0], "s", color="#ffffff", ms=4)
             ax.plot([rx[-1] / 1000.0], [ry[-1] / 1000.0], "*", color="#ffffff",
                     ms=10)
@@ -763,25 +1225,6 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
                 ax.set_ylim(*lim[1])
                 ax.contour(cgx, cgy, czz, levels=clev, colors="#4b5563",
                            linewidths=0.6, alpha=0.9)
-                # Every dark cluster is named, not only the darkest, so the
-                # grey levels in this panel have a stated meaning everywhere.
-                for ci, cl in enumerate(clusters):
-                    cells = f"{cl['cells']} cell" + ("s" if cl["cells"] > 1 else "")
-                    txt = (f"{cells}, dark in "
-                           + (f"all {cl['frames']}" if cl["lo"] == cl["frames"]
-                              else f"{cl['lo']}-{cl['hi']} of {cl['frames']}")
-                           + " frames")
-                    dy = 0.17 if ci % 2 == 0 else -0.17
-                    # Clamped inside the axes: an unclamped label on a cluster
-                    # near the edge ran over the panel title.
-                    tx = float(np.clip(cl["x"] - 0.40, zx[0] + 0.03,
-                                       zx[1] - 0.46))
-                    ty = float(np.clip(cl["y"] + dy, zy[0] + 0.05,
-                                       zy[1] - 0.05))
-                    ax.annotate(txt, xy=(cl["x"], cl["y"]), xytext=(tx, ty),
-                                color="#e6e8ec", fontsize=6.2,
-                                arrowprops=dict(arrowstyle="->", color="#e6e8ec",
-                                                lw=0.7, alpha=0.85))
             ax.set_xlabel("map x (km)", color="#9aa0aa", fontsize=7)
             ax.set_ylabel("map y (km)", color="#9aa0aa", fontsize=7)
             ax.tick_params(colors="#9aa0aa", labelsize=6.5)
@@ -790,23 +1233,38 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
             ax.set_title(title, color="#e6e8ec", fontsize=9)
             axes.append(ax)
         leg = axes[1].legend(loc="lower left", fontsize=6.5, facecolor="#101218",
-                             edgecolor="#30343c", labelcolor="#d6d9de")
+                             edgecolor="#30343c", labelcolor="#d6d9de",
+                             borderaxespad=0.0)
         leg.get_frame().set_alpha(0.92)
+        # Every dark cluster is named, not only the darkest, so the grey levels
+        # in this panel have a stated meaning everywhere. The legend goes first,
+        # where it hides no dark cell, route or cluster (in the lower left
+        # corner it covered a 10-cell cluster, which no leader could then
+        # reach), and the labels are kept clear of it and of what they would
+        # otherwise hide. Every frame has the same axes, legend, cells and
+        # routes, so both are planned on the first frame and drawn, and
+        # checked, on all of them.
+        if layout is None:
+            bare = label_obstacles(axes[1], cells_km=label_cells,
+                                   lines_km=list(routes.values()))
+            anchor = legend_anchor(axes[1], leg, bare, clusters)
+        leg.set_bbox_to_anchor(anchor, transform=axes[1].transAxes)
+        if layout is None:
+            obst = label_obstacles(axes[1], cells_km=label_cells,
+                                   lines_km=list(routes.values()), avoid=[leg])
+            layout = plan_cluster_labels(axes[1], clusters, obst)
+        draw_cluster_labels(axes[1], clusters, layout, obst)
 
         # --- the executive: the forecast against the budget, both arms ---
         axe = fig.add_axes(EXEC_RECT)
         axe.set_facecolor("#101218")
-        for arm, col, lab in (("none", C_SNAP, "bounded rule, no correction"),
-                              ("lit", C_LIT_ARM, "with the B3b-lit correction")):
-            g = ex[arm]
-            if g is None:
-                continue
-            axe.plot(g["t"], g["s_pred"], "-o", color=col, lw=1.6, ms=3, label=lab)
+        fires = draw_exec_traces(axe, [
+            ("none", C_SNAP, "bounded rule, no correction", ex["none"]),
+            ("lit", C_LIT_ARM, "with the B3b-lit correction", ex["lit"])])
         axe.axhline(BUDGET_H, color=C_BUDGET, ls="--", lw=1.3,
                     label=f"budget {BUDGET_H:.1f} h")
-        if fire_t is not None:
-            axe.plot([fire_t], [fire_s], "X", color=C_FIRE, ms=12, mec="#07070a",
-                     label=f"bounded rule FIRES, t={fire_t:.2f} h")
+        if fires:
+            fire_t, fire_s = fires[0][3], fires[0][4]
             axe.annotate(f"forecast {fire_s:.2f} h", xy=(fire_t, fire_s),
                          xytext=(fire_t + 2.0, fire_s + 0.12), color=C_FIRE,
                          fontsize=7.5)
@@ -814,8 +1272,8 @@ def render_frames(tag, instance, times, stack, rows, curves, outdir, dpi=110,
         axe.set_xlim(-0.6, t_end + 0.6)
         # Explicit, because the firing marker sits at the trace's maximum and an
         # auto-scaled axis clipped both it and its label off the top.
-        top = max(BUDGET_H, *[float(g["s_pred"].max()) for g in ex.values()
-                              if g is not None]) * 1.22
+        top = max([BUDGET_H] + [float(g["s_pred"].max()) for legs in ex.values()
+                                for g in legs]) * 1.22
         axe.set_ylim(-0.06 * top, top)
         axe.set_xlabel("time since departure (h)", color="#9aa0aa", fontsize=7.5)
         axe.set_ylabel("executive's forecast maximum (h)", color="#9aa0aa",
@@ -1240,28 +1698,27 @@ def world_traj(arm, tag, plan_index, leg=0):
 
 
 def render_exec_panel(tag, plan_index, arms, title, out, dpi=120):
-    """Forecast against the world, per arm, with the budget and the firing."""
+    """Forecast against the world, per arm, with the budget and every firing.
+
+    Every leg is drawn, the world's and the executive's: a firing that replans
+    continues in the next leg, and drawing leg 0 alone showed one point.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(12, 4.6 * len(arms)), dpi=dpi, facecolor="#07070a")
     for q, (arm, label) in enumerate(arms):
-        log, w = exec_log(arm, tag, plan_index), world_traj(arm, tag, plan_index)
+        legs = exec_legs(arm, tag, plan_index)
         ax = fig.add_subplot(len(arms), 1, q + 1)
         ax.set_facecolor("#101218")
-        ax.plot(w["t"], w["shadow"], "-", color="#6f7681", lw=1.2,
-                label="the world's accumulated shadow")
-        if log is not None:
-            ax.plot(log["t"], log["s_pred"], "-", color=C_TD, lw=1.6,
-                    label="the executive's forecast maximum")
-            fired = log["fired"].astype(bool)
-            if fired.any():
-                k = int(np.flatnonzero(fired)[0])
-                ax.axvline(log["t"][k], color="#ff5c5c", lw=1.4)
-                ax.plot([log["t"][k]], [log["s_pred"][k]], "o", color="#ff5c5c",
-                        ms=8, label=f"control fires at t = {log['t'][k]:.2f} h")
-            else:
-                ax.plot([], [], " ", label="no control fires")
+        for n in range(max(1, len(legs))):
+            w = world_traj(arm, tag, plan_index, n)
+            ax.plot(w["t"], w["shadow"], "-", color="#6f7681", lw=1.2,
+                    label="the world's accumulated shadow" if n == 0 else "_nolegend_")
+        fires = draw_exec_traces(ax, [(arm, C_TD, "the executive's forecast maximum",
+                                       legs)])
+        if not fires:
+            ax.plot([], [], " ", label="no control fires")
         ax.axhline(BUDGET_H, color="#ffa94d", ls="--", lw=1.2,
                    label=f"budget {BUDGET_H:.1f} h")
         ax.set_title(f"{label}", color="#e6e8ec", fontsize=10, loc="left")
@@ -1270,7 +1727,9 @@ def render_exec_panel(tag, plan_index, arms, title, out, dpi=120):
         ax.tick_params(colors="#9aa0aa", labelsize=8)
         for sp in ax.spines.values():
             sp.set_color("#30343c")
-        leg = ax.legend(loc="upper left", fontsize=8, facecolor="#101218",
+        # Placed where it covers the least plotted data: in the upper left it
+        # sat over R3's two firings, at the first tick of each leg.
+        leg = ax.legend(loc="best", fontsize=8, facecolor="#101218",
                         edgecolor="#30343c", labelcolor="#d6d9de")
         leg.get_frame().set_alpha(0.92)
     fig.suptitle(title, color="#e6e8ec", fontsize=12)
