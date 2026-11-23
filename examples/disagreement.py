@@ -11,9 +11,14 @@ against the core's 24, so they are not the sample the executive is scored on
 and a horizon taken from them is not fitted to the data it will be tested
 against. The separation is not complete. At 2028-02-15_p0 both draws are keyed
 on label 0, so the axis's 40 pairs are a prefix of the core's 120; at the other
-three epochs the keys differ and no pair is shared. On the corrected sun, 7 of
-the 68 held-out plans that enter shadow sit on a shared pair, and leaving them
-out moves the p99 by 0.0010 h, 3.6 s.
+three epochs the keys differ and no pair is shared. On the corrected sun and
+checker, 8 of the 70 held-out plans that enter shadow sit on a shared pair, and
+leaving them out does not move the p99.
+
+The pool also contains tolerance_0, the 0.5 h point that hosts the paired
+design. Leaving it out does not move the p99 either; leaving out every plan, at
+any point, on a pair the host also plans lowers it by 0.0534 h, on 33 episodes
+against 83.
 --source sample measures the monitored set itself and is reported beside it as
 a check, never as the source.
 """

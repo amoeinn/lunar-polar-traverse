@@ -23,10 +23,12 @@ PLANNER_BIN = ROOT / "cpp" / "build" / "planner"
 
 # H, the contradiction rule's horizon: the one definition, shared with the C++
 # executive through its params file, which carries no value of its own.
-# Registered 2026-11-22 as the held-out p99 of the disagreements the rule acts
-# on (world dark, model lit), measured by examples/disagreement.py on the
-# corrected sun. It replaced 0.7250 h, measured the same way before the fix.
-CONTRA_HORIZON_H = 0.7105
+# The held-out p99 of the disagreements the rule acts on (world dark, model
+# lit), measured by examples/disagreement.py. Registered three times, each on
+# corrected inputs to the one before: 0.7250 h before the sun units fix, 0.7105 h
+# after it, and this value after the checker's step length was corrected to run
+# along the slope, since every disagreement duration is a checker time.
+CONTRA_HORIZON_H = 0.7667
 
 TRAJ_KEYS = ("t", "shadow", "index", "kind", "lit", "offsets")
 LOG_KEYS = (("tick", np.int64), ("t", np.float64), ("s_exec", np.float64),
