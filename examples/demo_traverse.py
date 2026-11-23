@@ -254,7 +254,11 @@ def _corr_records():
 
 
 def select_r2():
-    """R2: the busts among the 45 monitored plans, first in enumeration order."""
+    """R2: the busts among the monitored core plans, first in enumeration order.
+
+    Can be empty, and is on the corrected core: an empty R2 is reported as an
+    empty set by render_panels and nothing is substituted for it.
+    """
     arms, keys = _corr_records()
     cands = [dict(tag=t, plan_index=i)
              for (t, i) in keys
@@ -1233,6 +1237,100 @@ def render_epoch_panel(rows, out, dpi=120):
 
 
 # --------------------------------------------------------------------------
+# a rule that selects nothing: reported as an empty set, never substituted
+# --------------------------------------------------------------------------
+
+EMPTY_RULE = ("Nothing is substituted: the registration says an empty set is "
+              "reported as an empty set.")
+
+
+def empty_rule_lines(rule, counts):
+    """What an empty R2 or R3 says, from its own counts.
+
+    R1 has no panel and is reported as empty in the selection text; R4 applies
+    no selection and cannot be empty. R2 and R3 each own a panel, and each can
+    come up empty on data the registration did not foresee.
+    """
+    if rule == "R2":
+        return [f"R2 is EMPTY: {counts['busts']} busts among the "
+                f"{counts['monitored']} monitored core plans.",
+                "R2 selects the busts among the monitored core plans, first in "
+                "enumeration order (registered 2026-10-05).",
+                f"No core plan busts its {BUDGET_H:.1f} h budget after the "
+                f"corrections, so there is no bust for the control to catch.",
+                EMPTY_RULE]
+    if rule == "R3":
+        why = ("the bounded rule raised no false alarm" if counts["false_alarms"] == 0
+               else "the B3b-lit correction clears none of the bounded rule's "
+                    "false alarms")
+        return [f"R3 is EMPTY: {counts['removed_by_lit']} of "
+                f"{counts['false_alarms']} false alarms cleared, among "
+                f"{counts['monitored_nonbust']} monitored core plans that do not bust.",
+                "R3 selects a monitored non-bust the bounded rule fires on and the "
+                "B3b-lit correction clears (registered 2026-10-05).",
+                f"It is empty because {why}. With no R3 there is no traverse subject.",
+                EMPTY_RULE]
+    raise ValueError(f"{rule} has no empty-set panel")
+
+
+def render_empty_panel(title, lines, out, dpi=120):
+    """A panel that states a rule is empty, in the panels' own style."""
+    import textwrap
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(12, 4.6), dpi=dpi, facecolor="#07070a")
+    body = "\n\n".join(textwrap.fill(x, 100) for x in lines)
+    fig.text(0.04, 0.86, title, color="#e6e8ec", fontsize=13, va="top")
+    fig.text(0.04, 0.72, body, color="#d6d9de", fontsize=10, va="top",
+             family="monospace")
+    fig.savefig(out, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return out
+
+
+def render_panels(sel, subject, out=None):
+    """The three static panels. An empty R2 or R3 gets a panel saying so.
+
+    The file names are kept when a rule is empty, so a panel left from an
+    earlier run, when the rule did select something, is overwritten rather than
+    shipped beside the statement that the set is now empty.
+    """
+    out = OUT if out is None else Path(out)
+    b, c2 = sel["r2"]["choice"], sel["r2"]["counts"]
+    if b is None:
+        render_empty_panel("R2, a bust: EMPTY", empty_rule_lines("R2", c2),
+                           out / "panel_r2_bust.png")
+    else:
+        render_exec_panel(b["tag"], b["plan_index"],
+                          [("none", "bounded rule, no correction stream")],
+                          f"R2, a bust: {b['tag']} plan{b['plan_index']:03d}. "
+                          f"The control fires and the correction must not stop it.",
+                          out / "panel_r2_bust.png")
+    c3 = sel["r3"]["counts"]
+    if subject is None:
+        render_empty_panel("R3, a false alarm removed: EMPTY",
+                           empty_rule_lines("R3", c3),
+                           out / "panel_r3_false_alarm.png")
+    else:
+        tag, plan_index = subject["tag"], subject["plan_index"]
+        render_exec_panel(tag, plan_index,
+                          [("none", "bounded rule, no correction stream: fires"),
+                           ("lit", "with the B3b-lit correction: does not fire")],
+                          f"R3, a false alarm removed: {tag} plan{plan_index:03d}, "
+                          f"1 of the {c3['removed_by_lit']} of "
+                          f"{c3['false_alarms']} false alarms the lit direction "
+                          f"removes on the core",
+                          out / "panel_r3_false_alarm.png")
+    render_epoch_panel(select_r4(), out / "panel_r4_epochs.png")
+    names = ("panel_r2_bust.png", "panel_r3_false_alarm.png", "panel_r4_epochs.png")
+    print(f"  wrote {', '.join(names)}"
+          + ("; R2 is EMPTY" if b is None else "")
+          + ("; R3 is EMPTY" if subject is None else ""))
+    return [out / n for n in names]
+
+
+# --------------------------------------------------------------------------
 # the run
 # --------------------------------------------------------------------------
 
@@ -1250,8 +1348,14 @@ def report_selection():
         print("     R3, itself registered on the same date before any looking.")
     print(f"  R2 counts {c2}")
     print(f"  R2 candidates {len(a2)} -> {r2}")
+    if r2 is None:
+        for line in empty_rule_lines("R2", c2):
+            print(f"     {line}")
     print(f"  R3 counts {c3}")
     print(f"  R3 candidates {len(a3)} -> {r3}")
+    if r3 is None:
+        for line in empty_rule_lines("R3", c3):
+            print(f"     {line}")
     pc = pair_contingency()
     return dict(pair_contingency=pc,r1=dict(counts=c1, n=len(a1), choice=r1),
                 r2=dict(counts=c2, n=len(a2), choice=r2),
@@ -1279,7 +1383,22 @@ def main():
     sel = report_selection()
     subject = sel["r3"]["choice"]
     if subject is None:
-        raise SystemExit("R3 selected nothing; there is no traverse to render")
+        need = [t for t in ("fields", "frames", "video", "gazebo") if t in want]
+        if need:
+            raise SystemExit(f"R3 is EMPTY, so there is no traverse subject and the "
+                             f"stages {', '.join(need)} have nothing to render. "
+                             f"--stage panels renders the panels, R3's stating that "
+                             f"it is empty.")
+        if "panels" in want:
+            print("\npanels: the executive on two instances, and all twelve epochs")
+            render_panels(sel, None)
+        import datetime as _dt
+        (OUT / "sidecar.json").write_text(json.dumps(dict(
+            head_commit=head_commit(),
+            generated_utc=_dt.datetime.now(_dt.timezone.utc).isoformat(),
+            subject=None, selection=sel), indent=1))
+        print(f"\nsidecar {OUT / 'sidecar.json'}")
+        return 0
     tag, plan_index = subject["tag"], subject["plan_index"]
     rep = replay_out(tag, "td")
     plan, _, dep = plan_at(rep, plan_index)
@@ -1350,21 +1469,7 @@ def main():
 
     if "panels" in want:
         print("\npanels: the executive on two instances, and all twelve epochs")
-        b = sel["r2"]["choice"]
-        render_exec_panel(b["tag"], b["plan_index"],
-                          [("none", "bounded rule, no correction stream")],
-                          f"R2, a bust: {b['tag']} plan{b['plan_index']:03d}. "
-                          f"The control fires and the correction must not stop it.",
-                          OUT / "panel_r2_bust.png")
-        render_exec_panel(tag, plan_index,
-                          [("none", "bounded rule, no correction stream: fires"),
-                           ("lit", "with the B3b-lit correction: does not fire")],
-                          f"R3, a false alarm removed: {tag} plan{plan_index:03d}, "
-                          f"1 of the 11 the lit direction removes at p = 0.0005",
-                          OUT / "panel_r3_false_alarm.png")
-        render_epoch_panel(select_r4(), OUT / "panel_r4_epochs.png")
-        print(f"  wrote panel_r2_bust.png, panel_r3_false_alarm.png, "
-              f"panel_r4_epochs.png")
+        render_panels(sel, subject)
 
     if "video" in want:
         print("\nvideo")
